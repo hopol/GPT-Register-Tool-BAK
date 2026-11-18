@@ -1,0 +1,650 @@
+"""accounts submodule of the former storage.py (mechanical split, bodies unchanged)."""
+
+from collections.abc import Mapping
+from pathlib import Path
+import json
+import time
+
+from ..accounts.account_models import AccountSessionModel
+from ..config import ConfigInput
+
+from .connection import _connect, init_database
+from .normalize import (
+    _account_type,
+    _as_bool,
+    _as_float,
+    _as_int,
+    _find_existing_account_email,
+    _get,
+    _is_http_url,
+    _nested,
+    _normalize_account_email,
+    _oauth_refresh_token,
+    _payment_method,
+    _paypal_status,
+    _refresh_token_status,
+    _resolve_account_email,
+    _status,
+    _success_value,
+)
+
+
+def _terminal_state_from(status: str, error: str, raw_json: str) -> str:
+    """Derive the indexed terminal_state from the same three deactivated signals
+    used by the list_terminal_remail_accounts backfill (item #15). Kept in sync
+    with the SQL CASE in connection._ensure_extra_columns."""
+    s = status.lower()
+    e = error.lower()
+    r = raw_json.lower()
+    if (
+        s in ("account_deactivated", "account_deatived")
+        or "account_deactivated" in e
+        or "account_deatived" in e
+        or "account_deactivated" in r
+        or "account_deatived" in r
+    ):
+        return "account_deactivated"
+    return "active"
+
+
+# Columns where a BLANK incoming value means "this round did not touch it", not
+# "the value is gone" -- so the stored value must survive.
+#
+# The rule is deliberately narrow, because a blanket "blank never overwrites"
+# is wrong.  ``error`` / ``status`` / ``success`` must keep overwriting: a fresh
+# round is *entitled* to say "there is no error any more", and
+# ``test_upsert_reuses_existing_email_case_insensitively`` pins exactly that
+# (``error`` goes "first" -> "").  The token columns overwrite for the mirror
+# reason: a stale token is worse than a missing one.  Only facts that are minted
+# once and cannot be re-fetched belong in this table:
+#
+#   password / totp_secret -- OpenAI-side persistent state.  A re-run that lands
+#       on the passwordless branch never sets ``password``, and a re-run of an
+#       already-enrolled account never re-binds 2FA, so both arrive blank.  The
+#       blind ``col=excluded.col`` then erased them.  ``totp_secret`` is the
+#       worst case: it is issued once and the server cannot return it, so losing
+#       it locks that account's 2FA permanently.
+#   twofa_enrolled_at      -- companion of ``totp_secret``; it must follow the
+#       secret rather than be blanked while the secret stays.
+#   mailbox_* / purchase_* -- the mailbox is consumed at registration and is
+#       absent from every later relogin/scan round.  Erasing ``mailbox_provider``
+#       or ``mailbox_token`` makes ``account_recovery._has_relogin_material()``
+#       answer False, i.e. a recoverable account gets marked 掉号.
+#   registration_country   -- ``billing_country_for()`` silently falls back to
+#       "US" when it is empty, which would aim the billing-country catalog at
+#       the wrong country.
+#   batch_id / json_path   -- provenance, and the pointer to the session file.
+#
+# ``mailbox_refresh_token`` is NOT here: it is not an ``accounts`` column (it
+# lives in the session JSON only), so the SQL never sees it.
+#
+# In-repo precedent: ``scripts/batch_enable_2fa.persist_twofa`` already coalesces
+# ``totp_secret`` / ``twofa_enrolled_at`` this exact way -- and its docstring
+# says it bypasses ``upsert_account`` *because* that "would rewrite unrelated
+# columns".  This table is what removes the reason to bypass it.
+#
+# Known trade-off: an explicit ``twofa_enrolled_at=0`` cannot clear the column.
+# Nothing wants that -- the column only ever moves with ``totp_secret``, which
+# has its own guard.
+_COALESCE_IF_BLANK = {
+    "password": "excluded.password <> ''",
+    "totp_secret": "excluded.totp_secret <> ''",
+    "twofa_enrolled_at": "excluded.twofa_enrolled_at <> 0",
+    "mailbox_provider": "excluded.mailbox_provider <> ''",
+    "mailbox_source": "excluded.mailbox_source <> ''",
+    "mailbox_token": "excluded.mailbox_token <> ''",
+    "purchase_id": "excluded.purchase_id <> ''",
+    "project_name": "excluded.project_name <> ''",
+    "price": "excluded.price <> ''",
+    "purchase_total_cost": "excluded.purchase_total_cost <> ''",
+    "balance_after": "excluded.balance_after <> ''",
+    "registration_country": "excluded.registration_country <> ''",
+    "batch_id": "excluded.batch_id <> ''",
+    "json_path": "excluded.json_path <> ''",
+}
+
+
+def upsert_account(
+    data: AccountSessionModel | Mapping[str, object],
+    json_path="",
+    *,
+    runtime_config: ConfigInput = None,
+):
+    model = AccountSessionModel.from_value(data)
+    data = model.to_storage_mapping()
+    init_database(runtime_config=runtime_config)
+    paypal = _nested(data, "paypal")
+    auth_session = _nested(data, "auth_session")
+    quota = _nested(data, "quota")
+    email = _normalize_account_email(model.email)
+    if not email:
+        return False
+
+    now = int(time.time())
+    created_at = _as_int(_get(data, "created_at")) or now
+    access_token = model.credentials.access_token
+    paypal_status = _paypal_status(data, paypal)
+    payment_method = _payment_method(data, paypal)
+    oauth_refresh_token = _oauth_refresh_token(data, auth_session)
+    refresh_token_status = _refresh_token_status(data, auth_session)
+    workspace = _nested(data, "workspace_scan")
+    has_refresh_token = refresh_token_status in {"oauth_present", "legacy_present"}
+    status = _status(data, paypal, access_token, has_refresh_token=has_refresh_token)
+    safe_snapshot = model.safe_snapshot()
+    if has_refresh_token and status not in {"at_invalid", "account_deactivated"}:
+        safe_snapshot["error"] = ""
+    raw_json = json.dumps(safe_snapshot, ensure_ascii=False, separators=(",", ":"))
+    error_value = "" if has_refresh_token and status != "account_deactivated" else model.error
+    terminal_state = _terminal_state_from(status, error_value, raw_json)
+
+    row = {
+        "email": email,
+        "source": model.source,
+        "register_method": model.register_method,
+        "session_type": model.session_type,
+        "plan_type": model.plan_type,
+        "password": model.password,
+        "success": _as_bool(_success_value(data, access_token)),
+        "status": status,
+        "error": error_value,
+        "terminal_state": terminal_state,
+        "session_token": model.credentials.session_token,
+        "access_token": access_token,
+        "refresh_token": oauth_refresh_token or model.credentials.refresh_token,
+        "cookie_header": model.credentials.cookie_header,
+        "device_id": model.device_id,
+        "paypal_ok": _as_bool(model.payment.ok),
+        "payment_method": payment_method,
+        "paypal_url": model.payment.url,
+        "paypal_status": paypal_status,
+        "paypal_updated_at": _as_int(_get(data, "paypal_updated_at")) or now,
+        "paypal_cs_id": model.payment.cs_id,
+        "paypal_pm_id": model.payment.pm_id,
+        "paypal_currency": model.payment.currency,
+        "paypal_amount_due": model.payment.amount_due,
+        "paypal_has_paypal": _as_bool(model.payment.has_paypal),
+        "refresh_token_status": refresh_token_status,
+        "refresh_token_updated_at": _as_int(_get(data, "refresh_token_updated_at"))
+        or (now if oauth_refresh_token else 0),
+        "oauth_refresh_token": oauth_refresh_token,
+        "workspace_status": str(_get(data, "workspace_status") or _get(workspace, "status")),
+        "workspace_id": ""
+        if str(_get(data, "account_type") or _get(workspace, "account_type_after")).strip().lower() == "free"
+        else str(_get(data, "workspace_id") or _get(workspace, "actual_workspace_id")),
+        "workspace_name": ""
+        if str(_get(data, "account_type") or _get(workspace, "account_type_after")).strip().lower() == "free"
+        else str(
+            _get(data, "workspace_name")
+            or _get(workspace, "workspace_name")
+            or _get(workspace, "actual_workspace_name")
+        ),
+        "workspace_switch_result": str(
+            _get(data, "workspace_switch_result") or _get(workspace, "switch_status") or _get(workspace, "switch_error")
+        ),
+        "workspace_updated_at": _as_int(_get(data, "workspace_updated_at")) or _as_int(_get(workspace, "updated_at")),
+        "account_type": _account_type(data, auth_session, workspace, access_token),
+        "quota_status": str(_get(data, "quota_status") or quota.get("status", "")),
+        "batch_id": str(_get(data, "batch_id")),
+        "registration_state": str(
+            _get(data, "registration_state") or ("active" if _get(data, "success") else "failed")
+        ),
+        "registration_country": str(_get(data, "registration_country")),
+        "totp_secret": model.credentials.totp_secret,
+        "twofa_enrolled_at": _as_int(_get(data, "twofa_enrolled_at")) or (now if model.credentials.totp_secret else 0),
+        "twofa_enroll_error": str(_get(data, "twofa_enroll_error")),
+        "auth_session_logging_id": str(_get(data, "auth_session_logging_id")),
+        "device_id_generated_at": _as_int(_get(data, "device_id_generated_at"))
+        or (now if _get(data, "device_id") else 0),
+        "mailbox_provider": model.mailbox.provider,
+        "mailbox_source": model.mailbox.source,
+        "mailbox_token": model.mailbox.token,
+        "purchase_id": model.mailbox.purchase_id,
+        "project_name": model.mailbox.project_name,
+        "price": model.mailbox.price,
+        "purchase_total_cost": model.mailbox.purchase_total_cost,
+        "balance_after": model.mailbox.balance_after,
+        "json_path": str(json_path or _get(data, "json_path")),
+        "timing_total_seconds": _as_float(_get(model.timing, "total_seconds")),
+        "pipeline_total_seconds": _as_float(_get(model.pipeline_timing, "total_seconds")),
+        "created_at": created_at,
+        "updated_at": now,
+        "raw_json": raw_json,
+    }
+
+    columns = list(row)
+    placeholders = ", ".join(":" + column for column in columns)
+    # Guarded columns keep their stored value when this round has nothing to say
+    # (see _COALESCE_IF_BLANK).  The coalesce lives in the write statement
+    # itself, so it is atomic with the insert: no extra read, no read-then-write
+    # window, and the implicit transaction that `_resolve_account_email`'s
+    # rename UPDATE opens still covers everything (tests/accounts/test_store_transaction.py).
+    updates = ", ".join(
+        (f"{column}=CASE WHEN {_COALESCE_IF_BLANK[column]} THEN excluded.{column} ELSE accounts.{column} END")
+        if column in _COALESCE_IF_BLANK
+        else f"{column}=excluded.{column}"
+        for column in columns
+        if column not in {"email", "created_at"}
+    )
+    sql = f"""
+        INSERT INTO accounts ({", ".join(columns)})
+        VALUES ({placeholders})
+        ON CONFLICT(email) DO UPDATE SET {updates}
+    """
+    conn = _connect(runtime_config=runtime_config)
+    try:
+        row["email"] = _resolve_account_email(conn, email)
+        conn.execute(sql, row)
+        conn.commit()
+    finally:
+        conn.close()
+    if status == "account_deactivated":
+        from ..accounts.account_events import notify_account_deactivated
+
+        notify_account_deactivated(row)
+    return True
+
+
+def record_registration_audit(data, *, batch_id="", state="", runtime_config: ConfigInput = None):
+    """Persist a token-free registration candidate/failure audit event."""
+    if not isinstance(data, (AccountSessionModel, Mapping)):
+        return False
+    data = AccountSessionModel.from_value(data).to_storage_mapping()
+    _raw_response: object = data.get("response")
+    response: dict = _raw_response if isinstance(_raw_response, dict) else {}
+    _raw_probe: object = response.get("access_token_probe")
+    probe: dict = _raw_probe if isinstance(_raw_probe, dict) else {}
+    _raw_telemetry: object = data.get("access_token_telemetry")
+    telemetry: dict = _raw_telemetry if isinstance(_raw_telemetry, dict) else {}
+    _raw_geo: object = data.get("fingerprint_geo_audit")
+    geo: Mapping = _raw_geo if isinstance(_raw_geo, Mapping) else {}
+    geo_status = str(geo.get("status") or "")
+    registration_state = str(state or data.get("registration_state") or ("active" if data.get("success") else "failed"))
+    email = _normalize_account_email(data.get("email") or "")
+    error = str(data.get("error") or "")[:800]
+    detail = {
+        "registration_warning": str(data.get("registration_warning") or "")[:500],
+        "probe_error": str(probe.get("error") or "")[:500],
+        "probe_status": str(probe.get("status") or "")[:80],
+        "registration_attempts": _as_int(data.get("registration_attempts")),
+        "terminal": "account_deactivated" in error.lower(),
+        # The re-login lane's cause, carried because ``error`` cannot show it:
+        # ``_registration_outcome`` prefers ``user_already_exists``, so for an
+        # already-registered address this is the *only* record of whether that
+        # lane ran and whether it spent an email code.  Measured 2026-09-15:
+        # ``existing_login`` appeared in 0 of 4377 rows before this field
+        # existed, which is why the question could not be answered from storage.
+        # Already sanitized by the caller (``_sanitize_text`` at the assignment
+        # site) and token-free: the values are lane error codes and server
+        # messages.
+        "existing_login_error": str(data.get("existing_login_error") or "")[:300],
+        # 方案 B (2026-09-16).  ``registration_state='partial_registered'`` already
+        # says "the server has this address", but it does *not* say whether we can
+        # still get a session for it: the half-registered rows whose password we
+        # hold are recoverable by the password login lane, the rest are not.  This
+        # is the boolean that separates them, so a panel can show "waiting for one
+        # manual login" instead of another wall of errors.
+        #
+        # 🔴 This dict is a **closed whitelist**: a key that is not listed here is
+        # silently dropped, which is how ``existing_login`` stayed at 0 rows out of
+        # 4377 before its entry was added.  Any new result key that the audit row
+        # needs has to be added here in the same change.
+        "needs_manual_session_recovery": bool(data.get("needs_manual_session_recovery")),
+        # Store only the closed verdict, never a caller-supplied nested mapping.
+        "fingerprint_geo_status": geo_status if geo_status in {"matched", "mismatch", "unknown"} else "unknown",
+    }
+    init_database(runtime_config=runtime_config)
+    conn = _connect(runtime_config=runtime_config)
+    try:
+        conn.execute(
+            """
+            INSERT INTO registration_audit (
+                batch_id,email,state,error,failure_class,at_status_code,token_hash,
+                token_iat,token_exp,token_age_seconds,registration_country,
+                fingerprint_profile,sentinel_version,created_at,detail_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                str(batch_id or data.get("batch_id") or "")[:100],
+                email,
+                registration_state,
+                error,
+                str(data.get("failure_class") or "")[:80],
+                _as_int(probe.get("status_code")),
+                str(telemetry.get("token_hash") or "")[:32],
+                _as_int(telemetry.get("iat")),
+                _as_int(telemetry.get("exp")),
+                _as_int(telemetry.get("age_seconds")),
+                str(data.get("registration_country") or "")[:8],
+                str(data.get("auth_fingerprint_profile") or "")[:80],
+                str(data.get("sentinel_version") or "")[:80],
+                int(time.time()),
+                json.dumps(detail, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def list_paypal_accounts(email="", *, runtime_config: ConfigInput = None):
+    init_database(runtime_config=runtime_config)
+    query = """
+        SELECT email,access_token,payment_method,paypal_url,paypal_status,paypal_updated_at,refresh_token_status,json_path,updated_at
+        FROM accounts
+    """
+    params = []
+    if email:
+        query += " WHERE email=?"
+        params.append(email)
+    query += " ORDER BY updated_at DESC"
+    conn = _connect(runtime_config=runtime_config)
+    try:
+        if email:
+            params[0] = _find_existing_account_email(conn, email) or _normalize_account_email(email)
+        return [dict(row) for row in conn.execute(query, params)]
+    finally:
+        conn.close()
+
+
+def get_paypal_url(email, *, runtime_config: ConfigInput = None):
+    rows = list_paypal_accounts(email, runtime_config=runtime_config)
+    for row in rows:
+        url = str(row.get("paypal_url") or "").strip()
+        if _is_http_url(url):
+            return url
+    return ""
+
+
+def get_account_record(email, *, runtime_config: ConfigInput = None):
+    init_database(runtime_config=runtime_config)
+    conn = _connect(runtime_config=runtime_config)
+    try:
+        lookup_email = _find_existing_account_email(conn, email) or _normalize_account_email(email)
+        row = conn.execute(
+            "SELECT * FROM accounts WHERE email=?",
+            (lookup_email,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else {}
+
+
+def get_account_payload(email, *, runtime_config: ConfigInput = None) -> dict:
+    """Account row with its ``raw_json`` payload merged in.
+
+    ``identity_context`` has no column of its own -- it lives inside ``raw_json``
+    (see ``store/connection.py``'s ``accounts`` DDL and ``EXTRA_COLUMNS``). Any
+    caller that *probes* a saved account (liveness, promotion, recovery) must
+    read this form, because a bare :func:`get_account_record` row silently loses
+    the saved ``fingerprint_key``, ``device_id``, ``proxy_affinity`` and
+    ``browser_identity``. Probing with those missing presents the access token
+    under a different identity than the one registration used: no proxy affinity,
+    a default TLS fingerprint, and no browser fallback. That was measured as the
+    single-row 账号测活 (``--quota-usage``) disagreeing with the batch scan about
+    the same account.
+
+    Row columns win over the payload on conflict, and empty columns do not
+    overwrite a payload value -- the same merge order as
+    ``accounts.account_recovery._local_account_data`` and
+    ``accounts.promotion_batch.refresh_promotion_statuses``.
+    """
+    record = get_account_record(email, runtime_config=runtime_config)
+    if not record:
+        return {}
+    data: dict = {}
+    raw_json = str(record.get("raw_json") or "").strip()
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            data.update(parsed)
+    for key, value in record.items():
+        if value not in (None, ""):
+            data[key] = value
+    return data
+
+
+def get_account_record_by_id(account_id, *, runtime_config: ConfigInput = None):  # noqa: E302
+    init_database(runtime_config=runtime_config)
+    digits = str(account_id or "").strip()
+    if not digits.isdigit():
+        return {}
+    conn = _connect(runtime_config=runtime_config)
+    try:
+        row = conn.execute("SELECT * FROM accounts WHERE id=?", (int(digits),)).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else {}
+
+
+def get_account_records(emails, *, runtime_config: ConfigInput = None):
+    """Batch form of :func:`get_account_record`.
+
+    One ``WHERE lower(email) IN (...)`` query replaces N single-row lookups, so
+    callers that resolve a list of accounts (batch refresh, import, health
+    scans) no longer pay per-email round-tips. Results are keyed by the exact
+    email string passed in, so callers can map back to their input.
+
+    Emails are matched case-insensitively, matching the single-row lookup.
+    Unknown/empty entries are simply absent from the returned dict.
+    """
+    init_database(runtime_config=runtime_config)
+    wanted = [_normalize_account_email(e) for e in (emails or []) if e]
+    if not wanted:
+        return {}
+    conn = _connect(runtime_config=runtime_config)
+    try:
+        placeholders = ",".join("?" for _ in wanted)
+        rows = conn.execute(
+            f"SELECT * FROM accounts WHERE lower(email) IN ({placeholders})",
+            tuple(e.lower() for e in wanted),
+        ).fetchall()
+    finally:
+        conn.close()
+    by_lower = {row["email"].lower(): dict(row) for row in rows}
+    result: dict[str, dict] = {}
+    for original in wanted:
+        hit = by_lower.get(original.lower())
+        if hit:
+            result[original] = hit
+    return result
+
+
+def list_account_records(*, runtime_config: ConfigInput = None):
+    init_database(runtime_config=runtime_config)
+    conn = _connect(runtime_config=runtime_config)
+    try:
+        rows = conn.execute("SELECT * FROM accounts ORDER BY updated_at DESC").fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_device_context(email, *, runtime_config: ConfigInput = None):
+    """Return persisted {device_id, auth_session_logging_id} for an existing account.
+
+    Used by registration to reuse the SAME device fingerprint across re-runs,
+    preventing "same account, multiple unrelated devices" correlation signals.
+    Returns {} if no stored record exists.
+    """
+    row = get_account_record(email, runtime_config=runtime_config)
+    if not row:
+        return {}
+    device_id = str(row.get("device_id") or "").strip()
+    logging_id = str(row.get("auth_session_logging_id") or "").strip()
+    if not device_id and not logging_id:
+        return {}
+    return {
+        "device_id": device_id,
+        "auth_session_logging_id": logging_id,
+    }
+
+
+def migrate_account_email(old_email, new_email, verified_data, *, runtime_config: ConfigInput = None):
+    """Atomically move one account row to a new email after verified relogin.
+
+    The destination is never overwritten.  The database update and session-file
+    replacement are prepared before the transaction; a failed destination
+    conflict or malformed account leaves the original row untouched.
+    """
+    old = _normalize_account_email(old_email)
+    new = _normalize_account_email(new_email)
+    if not old or not new or old == new or not isinstance(verified_data, Mapping):
+        return False
+    if not str(verified_data.get("access_token") or verified_data.get("cookie_header") or "").strip():
+        return False
+    init_database(runtime_config=runtime_config)
+    conn = _connect(runtime_config=runtime_config)
+    session_path = ""
+    session_payload = None
+    session_target = None
+    session_backup = None
+    session_existed = False
+    session_replaced = False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        source = conn.execute("SELECT * FROM accounts WHERE lower(email)=lower(?)", (old,)).fetchone()
+        if source is None:
+            conn.rollback()
+            return False
+        destination = conn.execute("SELECT 1 FROM accounts WHERE lower(email)=lower(?)", (new,)).fetchone()
+        if destination is not None:
+            conn.rollback()
+            return False
+        row = dict(source)
+        session_path = str(row.get("json_path") or verified_data.get("json_path") or "").strip()
+        session_payload = dict(verified_data)
+        session_payload["email"] = new
+        if session_path:
+            target = Path(session_path)
+            if target.exists():
+                try:
+                    existing_session = json.loads(target.read_text(encoding="utf-8"))
+                    if isinstance(existing_session, dict):
+                        merged = dict(existing_session)
+                        merged.update(session_payload)
+                        session_payload = merged
+                except Exception:
+                    pass
+        model = AccountSessionModel.from_value(session_payload)
+        mailbox = model.mailbox
+        safe = model.safe_snapshot()
+        safe["email"] = new
+        raw_existing = {}
+        try:
+            raw_existing = json.loads(row.get("raw_json") or "{}")
+        except Exception:
+            raw_existing = {}
+        if isinstance(raw_existing, dict):
+            raw_existing.update(safe)
+            raw_json = json.dumps(raw_existing, ensure_ascii=False, separators=(",", ":"))
+        else:
+            raw_json = json.dumps(safe, ensure_ascii=False, separators=(",", ":"))
+        now = int(time.time())
+        updates = {
+            "email": new,
+            "password": model.password or row.get("password", ""),
+            "success": _as_bool(_success_value(session_payload, model.credentials.access_token)),
+            "status": _status(
+                session_payload,
+                _nested(session_payload, "paypal"),
+                model.credentials.access_token,
+                has_refresh_token=bool(model.credentials.refresh_token or model.credentials.oauth_refresh_token),
+            ),
+            "error": model.error,
+            "session_token": model.credentials.session_token or row.get("session_token", ""),
+            "access_token": model.credentials.access_token or row.get("access_token", ""),
+            "refresh_token": model.credentials.refresh_token or row.get("refresh_token", ""),
+            "cookie_header": model.credentials.cookie_header or row.get("cookie_header", ""),
+            "device_id": model.device_id or row.get("device_id", ""),
+            "mailbox_provider": mailbox.provider,
+            "mailbox_source": mailbox.source,
+            "mailbox_token": mailbox.token,
+            "purchase_id": mailbox.purchase_id,
+            "project_name": mailbox.project_name,
+            "price": mailbox.price,
+            "purchase_total_cost": mailbox.purchase_total_cost,
+            "balance_after": mailbox.balance_after,
+            "json_path": session_path,
+            "updated_at": now,
+            "raw_json": raw_json,
+        }
+        if session_path:
+            session_target = Path(session_path)
+            session_target.parent.mkdir(parents=True, exist_ok=True)
+            session_existed = session_target.exists()
+            session_backup = session_target.read_bytes() if session_existed else None
+            temp = session_target.with_name(session_target.name + ".email-change.tmp")
+            temp.write_text(json.dumps(session_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp.replace(session_target)
+            session_replaced = True
+        cursor = conn.execute(
+            "UPDATE accounts SET " + ", ".join(f"{key}=:{key}" for key in updates) + " WHERE lower(email)=lower(:old)",
+            {**updates, "old": old},
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return False
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        if session_replaced and session_target is not None:
+            try:
+                if session_existed and session_backup is not None:
+                    session_target.write_bytes(session_backup)
+                elif session_target.exists():
+                    session_target.unlink()
+            except Exception:
+                pass
+        return False
+    finally:
+        conn.close()
+    return True
+
+
+def rebuild_from_session_dir(session_dir, *, runtime_config: ConfigInput = None):
+    init_database(runtime_config=runtime_config)
+    count = 0
+    for path in sorted(Path(session_dir).glob("session_*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[!] Skip bad session JSON: {path} {e}")
+            continue
+        if upsert_account(data, json_path=str(path), runtime_config=runtime_config):
+            count += 1
+    return count
+
+
+def list_terminal_remail_accounts(*, runtime_config: ConfigInput = None):
+    init_database(runtime_config=runtime_config)
+    conn = _connect(runtime_config=runtime_config)
+    try:
+        rows = conn.execute(
+            """
+            SELECT email,purchase_id,raw_json
+            FROM accounts
+            WHERE lower(mailbox_provider)='remail'
+              AND terminal_state='account_deactivated'
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    results = []
+    for row in rows:
+        item = {"email": row["email"], "purchase_id": row["purchase_id"]}
+        try:
+            raw = json.loads(row["raw_json"] or "{}")
+            _mailbox_raw: object = raw.get("mailbox") if isinstance(raw, dict) else None
+            mailbox: dict = _mailbox_raw if isinstance(_mailbox_raw, dict) else {}
+            item["order_no"] = str(mailbox.get("order_no") or "")
+        except Exception:
+            item["order_no"] = ""
+        results.append(item)
+    return results

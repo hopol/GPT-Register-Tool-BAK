@@ -1,0 +1,290 @@
+"""Release payload gate — run this AFTER staging the installer payload, BEFORE signing.
+
+Why this exists
+---------------
+On 2026-08-31 the v2026.08.31 assets were published carrying
+`scripts/pick_final_replacements.py` (a local diagnostic script that had been
+git-ignored and deleted from git, but was still on disk at build time) inside both
+the zip and the setup exe. The git history had been purged, the release assets
+had not — two independent leak channels.
+
+The rule that would have caught it: **anything .gitignore rejects must not ship.**
+`git ls-files` collects the payload, but the build runs against the working tree,
+so ignored-but-on-disk files can slip in.
+
+Checks
+------
+1. Payload file paths that are git-ignored. Only genuine build output is skipped
+   (.dll/.exe/.pdb and the build directories); everything else is asked about,
+   including suffixes nobody anticipated — a positive allowlist here is
+   fail-open and let a credential snapshot through on 2026-09-11.
+2. Credential regexes over payload text files (reuses sensitive_field_scan).
+3. Known-bad name patterns from past incidents (`scripts/_*.py`, `pick_final*`).
+
+Usage
+-----
+    python scripts/scan_release_payload.py <payload_dir> [<payload_dir> ...]
+    python scripts/scan_release_payload.py dist/installer/package
+
+Exit code 0 = clean, 1 = blocked.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+# `_foo.py` scratch scripts are git-ignored and must never ship — but `__init__.py`
+# and `__main__.py` are dunder modules, not scratch files. Excluding them is the
+# single most important false-positive filter here.
+_SCRATCH_SCRIPT = re.compile(r"(^|[\\/])_(?!_)[^\\/]*\.py$")
+
+# Build output that is git-ignored *by design* and is the whole point of the
+# payload.
+#
+# This used to be a positive allowlist of "source-ish" suffixes. That is
+# **fail-open**, and it hid a real file: `proxy.json.bak-vn-migration` has the
+# suffix `.bak-vn-migration`, so it was never handed to git at all — the gate
+# stayed blind to it even after .gitignore began rejecting it (2026-09-11,
+# caught by mutation testing: the "force the snapshot into a payload dir" probe
+# came back clean). A security gate must fail closed: anything not recognised
+# as build output gets asked about.
+BUILD_OUTPUT_SUFFIXES = {
+    ".dll",
+    ".exe",
+    ".pdb",
+    ".so",
+    ".dylib",
+    ".pyd",
+    ".pyc",
+    ".lib",
+    ".exp",
+    ".obj",
+    ".ilk",
+    ".nupkg",
+    ".snupkg",
+}
+
+# Directories whose contents are build output, not source. They are git-ignored by
+# design and shipping them is the whole point of the payload.
+BUILD_OUTPUT_PREFIXES = ("dist/", "scripts/installer/bin/", "scripts/installer/obj/")
+
+# The self-contained installer ships a pinned CPython (see
+# ``scripts/runtime_manifest.json`` and ``scripts/stage_python_runtime.ps1``).
+# Those files are git-ignored build output, so the .gitignore check above would
+# reject every one of them; scanning thousands of stdlib files for credential
+# regexes would also be noise. They are exempt **only** as one verified
+# artifact: the stamp written at staging time must match the manifest digest.
+PINNED_RUNTIME_PREFIX = "runtime/python/"
+PINNED_RUNTIME_STAMP = "runtime/python/RUNTIME-STAMP.json"
+
+# Past incidents, kept explicit so the failure message names the reason.
+BAD_NAME_PATTERNS = (
+    (_SCRATCH_SCRIPT, "underscore-prefixed local scratch script"),
+    (re.compile(r"pick_final|final_replacement", re.I), "credential-purge helper script"),
+    (re.compile(r"_diag_", re.I), "local diagnostic script"),
+)
+
+
+def _git(*args: str, stdin_data: str | None = None) -> tuple[int, str]:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=str(ROOT),
+        input=stdin_data,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return result.returncode, result.stdout
+
+
+def check_ignored(payload: Path, rel_paths: list[str]) -> list[str]:
+    """Batch-ask git which payload paths are ignored by .gitignore."""
+    if not rel_paths:
+        return []
+    proc = subprocess.run(
+        ["git", "check-ignore", "--stdin", "-z"],
+        cwd=str(ROOT),
+        input="\0".join(rel_paths),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    # check-ignore exits 1 when nothing matched — that is the good case.
+    if proc.returncode not in (0, 1):
+        return [f"git check-ignore failed (rc={proc.returncode}): {proc.stderr.strip()}"]
+    ignored = [p for p in proc.stdout.split("\0") if p]
+    return [f"{p} is git-ignored but present in the payload (ignored files must never ship)" for p in ignored]
+
+
+def check_names(rel_path: str, exempt: frozenset[str] | set[str] = frozenset()) -> list[str]:
+    """Flag payload paths whose *name* marks them as local scratch/incident files.
+
+    ``exempt`` carries the paths ``.gitignore`` deliberately re-includes with a
+    leading ``!`` (``_gitignore_exceptions``).  Without it the scratch pattern
+    fires on ``sms_tool/upi_link/_extract.py`` — a tracked module the ignore file
+    explicitly un-ignores because ``upi_link/__init__.py`` imports it — and the
+    gate would refuse a release that contains no scratch file at all.
+    """
+    if rel_path in exempt:
+        return []
+    out = []
+    for pattern, reason in BAD_NAME_PATTERNS:
+        if pattern.search(rel_path):
+            out.append(f"{rel_path} matches a known-bad name pattern: {reason}")
+    return out
+
+
+def _gitignore_exceptions() -> set[str]:
+    """Repo-relative paths ``.gitignore`` re-includes with a leading ``!``.
+
+    That list is the repository's own declaration of "this underscore-prefixed
+    file is a real module, not scratch": ``.gitignore`` says so next to the
+    pattern it excepts, so the gate reads the same source instead of keeping a
+    second hand-maintained allowlist that would drift.
+    """
+    ignore_file = ROOT / ".gitignore"
+    try:
+        lines = ignore_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    excepts: set[str] = set()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("!") or not stripped.endswith(".py"):
+            continue
+        excepts.add(stripped[1:].lstrip("/"))
+    return excepts
+
+
+def check_pinned_runtime(payload: Path) -> list[str]:
+    """Verify the bundled interpreter is the manifest's pinned artifact.
+
+    Exempting ``runtime/python/`` from the .gitignore gate would otherwise be a
+    hole: anything could be dropped there and ship. The stamp is written only
+    after the archive matched its SHA-256, so comparing it with the manifest is
+    the substitute for hashing every file in the runtime.
+    """
+    stamp_path = payload / PINNED_RUNTIME_STAMP
+    manifest_path = ROOT / "scripts" / "runtime_manifest.json"
+    if not stamp_path.is_file():
+        return [f"{PINNED_RUNTIME_STAMP} is missing; the bundled runtime was not staged"]
+    if not manifest_path.is_file():
+        return ["scripts/runtime_manifest.json is missing"]
+    try:
+        stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [f"cannot read the runtime stamp/manifest: {exc}"]
+    problems = []
+    if stamp.get("sha256") != manifest.get("sha256"):
+        problems.append(
+            f"{PINNED_RUNTIME_STAMP} sha256 {stamp.get('sha256')!r} does not match "
+            f"the manifest {manifest.get('sha256')!r}"
+        )
+    if stamp.get("release") != manifest.get("release"):
+        problems.append(
+            f"{PINNED_RUNTIME_STAMP} release {stamp.get('release')!r} does not match "
+            f"the manifest {manifest.get('release')!r}"
+        )
+    return problems
+
+
+def check_artifact_regexes(payload: Path) -> list[str]:
+    """Reuse the credential regexes that CI already trusts.
+
+    Deliberately limited to *artifact* extensions. Running these over .py/.cs/.md
+    flags ordinary source such as `access_token = example` in docs and sample code
+    — that is what scan_hardcoded_secrets and the pre-commit guard are for, and
+    mixing the two turns this gate into noise that people learn to bypass.
+    """
+    sys.path.insert(0, str(ROOT / "scripts"))
+    try:
+        import sensitive_field_scan as sfs
+    except ImportError as exc:
+        return [f"cannot import sensitive_field_scan: {exc}"]
+
+    failures: list[str] = []
+    text_re = (
+        (sfs.ARTIFACT_SECRET, "sensitive artifact value"),
+        (sfs.ARTIFACT_CARD_FRAGMENT, "card fragment artifact"),
+    )
+    for path in payload.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in {
+            ".json",
+            ".jsonl",
+            ".log",
+            ".txt",
+        }:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            for pattern, label in text_re:
+                if pattern.search(line):
+                    rel = path.relative_to(payload).as_posix()
+                    failures.append(f"{rel}:{number}: {label}")
+    return failures
+
+
+def main(argv: list[str]) -> int:
+    targets = [a for a in argv if not a.startswith("-")]
+    if not targets:
+        print((__doc__ or "").strip().split("Usage")[-1], file=sys.stderr)
+        return 2
+
+    failures: list[str] = []
+    for raw in targets:
+        payload = Path(raw)
+        if not payload.is_absolute():
+            payload = ROOT / payload
+        if not payload.is_dir():
+            failures.append(f"payload directory does not exist: {payload}")
+            continue
+
+        rel_paths: list[str] = []
+        ignore_exceptions = _gitignore_exceptions()
+        for path in payload.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(payload).as_posix()
+            if rel.startswith(BUILD_OUTPUT_PREFIXES) or rel.startswith(PINNED_RUNTIME_PREFIX):
+                continue
+            if path.suffix.lower() in BUILD_OUTPUT_SUFFIXES:
+                continue
+            rel_paths.append(rel)
+            failures.extend(check_names(rel, ignore_exceptions))
+
+        if (payload / PINNED_RUNTIME_PREFIX).is_dir():
+            failures.extend(check_pinned_runtime(payload))
+        print(f"[{payload.name}] {len(rel_paths)} files to verify against .gitignore")
+        failures.extend(check_ignored(payload, rel_paths))
+        failures.extend(check_artifact_regexes(payload))
+
+    if failures:
+        print("\nRELEASE PAYLOAD BLOCKED", file=sys.stderr)
+        for item in failures:
+            print(f"  - {item}", file=sys.stderr)
+        print(
+            "\nFix: remove the offending files, then re-run the payload staging step."
+            "\nDo not bypass this gate — the release channel is the one exit with no"
+            " other defence.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("release payload scan passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

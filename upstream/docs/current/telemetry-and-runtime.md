@@ -1,0 +1,187 @@
+# Telemetry And Runtime Data
+
+## Correlation contract, version 1
+
+### Log destinations
+
+- `runtime/logs/processes/<pid>/sms_tool.log`: Python operator log. Human-readable, sanitized,
+  rotated; use for registration, liveness, promotion, mailbox and one-click SMS
+  stage messages.
+- `runtime/logs/processes/<pid>/sms_tool.jsonl`: Python machine log. One sanitized JSON record
+  per event with `command_id`, `run_id`, `account_ref`, stage and failure class.
+- `runtime/logs/processes/<pid>/backend_stdout.jsonl`: sanitized stdout/stderr
+  mirror with UTC timestamp, command ID and run ID, including ordinary `print`
+  diagnostics. Only the disk copy is structured; desktop IPC bytes are unchanged.
+- `runtime/app_*.log`: WPF host lifecycle and backend-process correlation log.
+  It records task start/exit, command ids and UI-side diagnostics, but not the
+  full Python event stream.
+- `runtime/ui_errors.log`: WPF crash-only compatibility log. It is reserved for
+  unhandled dispatcher/domain/task exceptions and is sanitized before writing.
+- `runtime/cache/config_usage.json`: derived cache for the `--doctor` unread-key
+  scan. Keyed by `(path, mtime_ns, size)` over the scanned source and config
+  files, so any edit invalidates it without a TTL; deleting it only makes the
+  next probe rescan (~3 s instead of ~0.1 s). It contains config **key paths**,
+  never values, and is gitignored with the rest of `runtime/`.
+
+The WPF panel is an ephemeral operator view, not an audit store. It folds JSON,
+shows stage summaries, and keeps a bounded in-memory buffer. For post-run
+diagnosis, use the two Python files plus `runtime/app_*.log` and correlate on
+`command_id`/`run_id`.
+
+New processes own separate log files so the desktop read server and registration
+workers no longer hold each other's rotation targets open on Windows. Existing
+shared files under `runtime/logs/` remain historical evidence and are not moved or
+deleted. Each file has bounded rotation; old process directories still require
+explicit retention review. Custom `log_path` overrides keep their chosen location.
+
+Python file logs rotate under `runtime/logs/processes/<pid>/`:
+
+- `sms_tool.log` — the operator log, one normalized line per record:
+  `HH:MM:SS [*] [模块] 消息 · account_ref=<hash>`. Level markers are
+  `[*] [!] [x] [.]`, logger names map to module labels (注册 / 浏览器注册 /
+  账号测活 / 优惠检测 / 一键接码 / 邮箱 / 代理…), and registration stage
+  records render as `阶段 · 中文名 (code) — 状态`. The trailing `account_ref`
+  is the same 16-hex-character SHA-256 prefix carried by `sms_tool.jsonl` and
+  the WPF `[后端进度]` lines, so a single account can be grepped across all
+  three channels; the suffix is omitted for records that have no account.
+  Envelope metadata and raw JSON never appear here.
+- `sms_tool.jsonl` — the machine log, rotating JSON lines with `schema_version`,
+  `source`, `command_id`, `task_name`, `run_id`, UTC `timestamp`, `level`,
+  `logger`, and sanitized `message` for tooling and audits.
+
+Both channels are opened by `configure_logging` through
+`ResilientRotatingFileHandler`, which degrades a failed rotation to plain
+appends instead of losing records. `RotatingFileHandler.emit` hands a rotation
+error to `logging.Handler.handleError`, which only writes to stderr and then
+**discards the record**; on Windows a log file held by another process cannot be
+renamed, so the file stays above `maxBytes` and every later record fails — the
+channel stops writing silently while the other keeps going. The resilient
+handler swallows the `OSError`, warns **once per failure streak** through
+logging (not stderr, which the desktop host does not capture), and retries the
+rotation every 200 records. Each channel is opened in its own `try`, so one
+unopenable file cannot silence the other.
+
+`configure_logging` also routes the Python `warnings` module through logging
+(`captureWarnings`), so library warnings render as `[!] [告警] <Category>: <text>`
+in the operator log instead of raw `path:line:` stderr noise that would bypass
+the formatter and leak into the WPF output panel.
+
+WPF assigns `SMS_TOOL_COMMAND_ID` per backend process and logs `command_id` on
+start/exit. Each registration creates a separate `run_id`; progress records and
+Python logs carry both IDs. WPF remains text-formatted and correlates through
+`command_id`, rather than pretending every legacy producer shares a JSON schema.
+
+Registration JSONL rows also include driver, batch, attempt, failure class and
+retryability. `proxy_pool_index=-1` means no pool index was supplied. Explicit
+`source=test` rows are excluded by `registration_quality_metrics`; legacy rows
+without a source remain ambiguous and need review before business reporting.
+
+The registration ledger counts attempts, not batch accounts. Use the final IPC
+result's `total`, `success` and `failed` for batch account counts; retries and
+deferred accounts must not be silently folded into an attempt success rate.
+
+The registration `run_id` is bound before the first `started` event. Stage
+duration is settled when leaving the current stage. `completed` is a **stage
+name, not a verdict**: `RegistrationStateMachine.transition(COMPLETED)` does not
+emit a stage event, and the terminal outcome of a run is published only by
+`registration_progress.persist()`. A run can therefore reach the `completed`
+stage and still end as `failed`, so an operator line reading "完成 — 成功" must
+never be derived from the transition alone. Account identifiers in progress and
+IPC records use stable hashes; operator-facing email labels are masked.
+
+`runtime/registration_progress.jsonl` rotates by size under a cross-process
+write lock. Quality metrics read both the active ledger and its rotated backup,
+so rotation does not create an artificial reporting gap. Persisted text and
+JSON logs apply log-specific email masking in addition to credential
+sanitization.
+
+Tests set `SMS_TOOL_EVENT_SOURCE=test` and redirect runtime paths to temporary
+storage. Runtime paths hardcoded in older fixtures are not automatically
+redirected by this environment variable.
+
+Email references in the local progress ledger are still operational identity
+data. Do not publish raw logs or ledgers. The count-only inventory below emits
+neither identities nor credential values.
+
+## In-memory caches
+
+The resident desktop channel and long batch runs keep a few process-lifetime
+caches. Each is bounded; the bound is a safety valve, not a tuning knob.
+
+| Cache | Key | Bound | On overflow |
+| --- | --- | ---: | --- |
+| `geo.resolver.GeoResolver` (`_cache`) | normalized proxy URL | 512 (`max_entries`) | expired entries first, then the oldest expiry |
+| `desktop_read._SESSION_PARSE_CACHE` | 16-byte blake2b digest of `raw_json` | 4096 | oldest entry evicted (LRU); a miss costs one `json.loads` |
+| `desktop_read._SESSION_SANITIZE_CACHE` | same digest | 4096 | oldest entry evicted; a miss costs one `sanitize()` |
+| `desktop_read._SESSION_STATE_CACHE` | session-file path | 4096 | oldest entry evicted; a miss costs one file read |
+| `payment_egress._probe_cache` | (proxy, expected country) | 512 | expired outcomes first, then the oldest probe |
+| `auth_state._SEEN_DUMP_SHAPES` | stage | 64 shapes per stage | one arbitrary shape dropped; worst case is one extra diff line |
+| `browser_fingerprint_pool._GEO_CACHE` | normalized proxy URL | 512 | cleared; it is a compatibility mirror, the resolver holds the answer |
+
+They were unbounded before 2026-10-18: expiry was only applied when the *same*
+key was looked up again, so a proxy-rotating run kept every exit it had ever
+measured, and the desktop channel kept one state dict per session file it had
+ever read. Dropping an entry never changes behaviour -- a geo/egress answer is
+re-measured, a session state is re-read, a dump shape reprints its diff.
+
+**2026-10-21 -- the two row caches were the heaviest and were missing here.**
+`_SESSION_PARSE_CACHE` / `_SESSION_SANITIZE_CACHE` were bounded by entry count
+but keyed on the raw `raw_json`, so a full cache pinned a second copy of every
+session string (5-20 KB each) on top of the parsed trees; overflow called
+`clear()`, re-parsing the whole pool on the next refresh. Keys are now digests
+and overflow evicts the oldest entry. The resident path was measured at **37 MB**
+after 795 rows plus ten deltas, and `tests/governance/test_performance_budget.py`
+ceils it at 150 MB.
+
+## Sentinel runtime self-check
+
+`check_node_runner_readiness()` (called by `batch_runner` before a batch) answers
+two questions: is there a `node` binary, and do the vendored `sdk.js` /
+`sentinel-runner.js` still hash to their pinned digests. That catches a corrupt
+checkout — the 2026-09-17 incident — but not a runner that loads and then fails to
+mint, and not a Node release that broke something the runner relies on. Both of
+those land at `create_account`, after the mailbox and its OTP are spent.
+
+`sms_tool/sentinel/selfcheck.py` adds the missing third check, offline:
+
+| Check | Failure token |
+| --- | --- |
+| pinned bundle digests | `failed:<ExceptionType>` |
+| `node` present and `>= 18` | `sentinel_selfcheck_node_missing` / `_too_old:<major>` |
+| one real mint against a synthetic challenge | `sentinel_selfcheck_mint:<reason>` |
+
+Run it directly (`python -m sms_tool.sentinel.selfcheck [--json] [--no-mint]`) or
+through `--doctor`, which reports it as the `sentinel_runtime` probe next to
+`node`. The mint is local: `OFFLINE_CHALLENGE` declares no PoW / Turnstile / SO
+work, so the token's `p` and `t` are legitimately `null` — presence of the keys,
+not their truthiness, is what proves the runner assembled a token.
+
+## Read-only inventory
+
+```powershell
+python scripts/registration_inventory.py
+```
+
+Reports Gmail/ReMail records matching the explicit root mailbox-pool import
+format and runtime root file counts/sizes by category. It does not verify
+credentials, query providers, inspect registration history, discover other
+configured mailbox files or create accounts. It does not recurse into browser
+profiles or modify files.
+
+`review_debug_artifacts` means **review**, not safe-to-delete. Database backups,
+session data, provider state, logs and OTP artifacts may contain the only
+recovery evidence. Inventory never moves or deletes anything.
+
+## Live comparison prerequisites
+
+1. Supply authorized Gmail and ReMail samples through ignored local input.
+2. Verify provider credentials separately; never print them in the report.
+3. Confirm sample size, any provider spending cap and stop conditions.
+4. Record driver/config/version and observation windows, including post-create
+   liveness at agreed times. Separate registration failure from later revocation.
+5. Stop at human verification or invalid credentials. Do not substitute new
+   providers, purchase mailboxes or retry indefinitely.
+
+No live comparison was run during this implementation. The default root pool
+had no explicit Gmail/ReMail candidates at inventory time; other configured
+sources were not inferred or contacted.

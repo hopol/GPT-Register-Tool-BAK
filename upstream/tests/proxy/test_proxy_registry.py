@@ -1,0 +1,255 @@
+"""Tests for the unified proxy-pool registry (``sms_tool.proxy.registry``).
+
+The registry fronts three resolvers that are deliberately different (Rule 19);
+what these tests pin is the *facade* contract:
+
+* canonical ``proxy.lanes`` wins when declared, and is invisible otherwise;
+* the legacy path is used unchanged when canonical is absent;
+* the census reports every lane, including pools declared inside a payment
+  method's own section (which ``payment_routing`` does not know about).
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from sms_tool.proxy import registry as pr
+
+
+def test_endpoints_of_dedupes_and_keeps_non_proxy_entries():
+    pool = ["http://u:p@Host.Example:8080", "http://x:y@host.example:8080", "127.0.0.1:7897"]
+    assert pr.endpoints_of(pool) == ["127.0.0.1:7897", "host.example:8080"]
+
+
+def test_resolve_registration_uses_legacy_pool_when_no_canonical():
+    config = {"proxy": {"pool": ["http://u:p@h.example:1"]}}
+    assert pr.resolve_registration(config) == ["http://u:p@h.example:1"]
+
+
+def test_resolve_registration_prefers_canonical_lane():
+    config = {
+        "proxy": {
+            "pool": ["http://u:p@legacy.example:1"],
+            "lanes": {"protocol_registration": ["http://u:p@canon.example:2"]},
+        }
+    }
+    assert pr.resolve_registration(config) == ["http://u:p@canon.example:2"]
+
+
+def test_resolve_mailbox_prefers_canonical_lane():
+    config = {"proxy": {"lanes": {"mailbox": ["http://u:p@mail.example:3"]}}}
+    assert pr.resolve_mailbox(config) == ["http://u:p@mail.example:3"]
+
+
+def test_resolve_mailbox_canonical_appends_operation_proxy():
+    config = {"proxy": {"lanes": {"mailbox": ["http://u:p@mail.example:3"]}}}
+    assert pr.resolve_mailbox(config, operation_proxy="http://u:p@op.example:4") == [
+        "http://u:p@mail.example:3",
+        "http://u:p@op.example:4",
+    ]
+
+
+def test_resolve_payment_legacy_reads_named_regions_and_method_local_pools():
+    config = {
+        "protocol_payments": {"proxy_pools": {"US": ["http://u:p@us.example:5"]}},
+        "upi": {"stage_proxies": {"checkout": "http://u:p@upi.example:6"}},
+    }
+    resolved = pr.resolve_payment(config, method="upi")
+    assert resolved["regions"] == {"US": ["http://u:p@us.example:5"]}
+    assert resolved["regions_source"] == "protocol_payments.proxy_pools"
+    assert resolved["stages"]["upi.stage_proxies.checkout"] == ["http://u:p@upi.example:6"]
+
+
+def test_resolve_payment_prefers_canonical_regions():
+    config = {
+        "protocol_payments": {"proxy_pools": {"US": ["http://u:p@legacy.example:7"]}},
+        "proxy": {
+            "lanes": {
+                "payment": {"pools": {"JP": ["http://u:p@canon.example:8"]}, "default": ["http://u:p@def.example:9"]}
+            }
+        },
+    }
+    resolved = pr.resolve_payment(config, method="paypal")
+    assert resolved["regions"]["JP"] == ["http://u:p@canon.example:8"]
+    assert resolved["regions"]["default"] == ["http://u:p@def.example:9"]
+    assert resolved["regions_source"] == "proxy.lanes.payment"
+
+
+def test_resolve_dispatches_and_rejects_unknown_lane():
+    config = {"proxy": {"lanes": {"mailbox": ["http://u:p@mail.example:3"]}}}
+    assert pr.resolve(config, "mailbox") == ["http://u:p@mail.example:3"]
+    with pytest.raises(ValueError):
+        pr.resolve(config, "not-a-lane")
+
+
+def test_census_shape_and_union():
+    config = {
+        "proxy": {
+            "pool": ["http://u:p@reg.example:1"],
+            "lanes": {"mailbox": ["http://u:p@mail.example:2"]},
+        },
+        "protocol_payments": {"proxy_pools": {"US": ["http://u:p@pay.example:3"]}},
+    }
+    report = pr.census(config, methods=("paypal",))
+    assert report[pr.REGISTRATION]["endpoints"] == ["reg.example:1"]
+    assert report[pr.MAILBOX]["endpoints"] == ["mail.example:2"]
+    assert "pay.example:3" in report["union_endpoints"]
+    assert report["local_endpoints"] == []
+    text = pr.format_census(report)
+    assert "registration" in text and "mailbox" in text and "payment" in text
+
+
+def test_census_flags_local_listener():
+    config = {"proxy": {"pool": ["127.0.0.1:7897"]}}
+    report = pr.census(config, methods=())
+    assert report["local_endpoints"] == ["127.0.0.1:7897"]
+
+
+def test_census_reports_lane_isolation_ok_when_pools_are_disjoint():
+    config = {
+        "proxy": {"pool": ["http://u:p@reg.example:1"]},
+        "protocol_payments": {"proxy_pools": {"US": ["http://u:p@pay.example:2"]}},
+    }
+    report = pr.census(config, methods=("paypal",))
+    assert report["lane_isolation_ok"] is True
+    assert report["cross_lane_overlaps"] == {pr.MAILBOX: [], pr.PAYMENT: [], pr.QUALIFICATION: []}
+
+
+def test_census_reports_the_payment_qualification_lane():
+    """The qualification pool must be visible, or the batch aborts unexplained.
+
+    ``qualification_batch`` aborts with ``abort_reason=stripe_unreachable`` when
+    no candidate exit reaches ``api.stripe.com``; before this the census -- the
+    operator's first diagnostic step -- did not list the pool at all, so an
+    unset dedicated exit looked identical to a broken one.
+    """
+    config = {
+        "proxy": {
+            "pool": ["http://u:p@reg.example:1"],
+            "lanes": {"payment_qualification": {"pool": ["http://u:p@stripe.example:9"]}},
+        }
+    }
+    report = pr.census(config, methods=())
+
+    assert report[pr.QUALIFICATION]["endpoints"] == ["stripe.example:9"]
+    assert report[pr.QUALIFICATION]["source"] == "proxy.lanes"
+    assert "stripe.example:9" in report["union_endpoints"]
+    assert "payment_qualification" in pr.format_census(report)
+
+
+def test_census_falls_back_to_the_legacy_qualification_key():
+    config = {"payment_qualification": {"proxy_pool": ["http://u:p@legacy-stripe.example:7"]}}
+    report = pr.census(config, methods=())
+
+    assert report[pr.QUALIFICATION]["endpoints"] == ["legacy-stripe.example:7"]
+    assert report[pr.QUALIFICATION]["source"] == "payment_qualification.proxy_pool"
+
+
+def test_census_marks_an_unset_qualification_lane_as_a_fallback():
+    report = pr.census({"proxy": {"pool": ["http://u:p@reg.example:1"]}}, methods=())
+
+    assert report[pr.QUALIFICATION]["count"] == 0
+    assert report[pr.QUALIFICATION]["source"] == "unset (promotion fallback)"
+
+
+def test_census_flags_a_qualification_pool_that_reuses_the_registration_exit():
+    """The documented trap: qualification pointed at the ChatGPT-only signup pool."""
+    cred = "http://u:p@shared.example:1"
+    config = {
+        "proxy": {"pool": [cred], "lanes": {"payment_qualification": [cred]}},
+    }
+    report = pr.census(config, methods=())
+
+    assert report["lane_isolation_ok"] is False
+    assert report["cross_lane_overlaps"][pr.QUALIFICATION] == ["shared.example:1"]
+
+
+def test_census_reports_registration_payment_overlap():
+    cred = "http://u:p@shared.example:1"
+    config = {
+        "proxy": {"pool": [cred]},
+        "protocol_payments": {"proxy_pools": {"US": [cred]}},
+    }
+    report = pr.census(config, methods=("paypal",))
+    assert report["lane_isolation_ok"] is False
+    assert report["cross_lane_overlaps"][pr.PAYMENT] == ["shared.example:1"]
+    assert "CROSS-LANE OVERLAP" in pr.format_census(report)
+
+
+def test_census_reports_registration_mailbox_overlap():
+    cred = "http://u:p@shared.example:1"
+    config = {"proxy": {"pool": [cred], "lanes": {"mailbox": [cred]}}}
+    report = pr.census(config, methods=())
+    assert report["lane_isolation_ok"] is False
+    assert report["cross_lane_overlaps"][pr.MAILBOX] == ["shared.example:1"]
+
+
+def test_lane_isolation_separates_conflicts_from_declared_overlaps():
+    """``proxy.allow_lane_overlap`` records a decision; it does not hide it.
+
+    The live configuration reuses one residential pool for registration and for
+    the qualification probe. Whether that is a mistake or a deliberate choice is
+    the operator's call, so the key exists to record the call -- and the overlap
+    stays in the payload either way, because the next person to read the config
+    needs to know the two lanes share an exit.
+    """
+    cred = "http://u:p@shared.example:1"
+    base = {"proxy": {"pool": [cred], "lanes": {"payment_qualification": [cred]}}}
+
+    undeclared = pr.lane_isolation(base)
+    assert undeclared["ok"] is False
+    assert undeclared["conflicts"] == {pr.QUALIFICATION: ["shared.example:1"]}
+    assert undeclared["overlaps"][pr.QUALIFICATION] == ["shared.example:1"]
+    assert undeclared["acknowledged"] == []
+
+    declared = pr.lane_isolation({**base, "proxy": {**base["proxy"], "allow_lane_overlap": ["payment_qualification"]}})
+    assert declared["ok"] is True
+    assert declared["conflicts"] == {}
+    assert declared["acknowledged"] == [pr.QUALIFICATION]
+    assert declared["overlaps"][pr.QUALIFICATION] == ["shared.example:1"]
+
+
+def test_acknowledging_one_lane_does_not_excuse_another():
+    cred = "http://u:p@shared.example:1"
+    config = {
+        "proxy": {
+            "pool": [cred],
+            "lanes": {"mailbox": [cred], "payment_qualification": [cred]},
+            "allow_lane_overlap": ["mailbox"],
+        }
+    }
+    report = pr.lane_isolation(config)
+
+    assert report["ok"] is False
+    assert set(report["conflicts"]) == {pr.QUALIFICATION}
+    assert report["acknowledged"] == [pr.MAILBOX]
+
+
+def test_census_keeps_a_declared_overlap_visible_but_not_fatal():
+    cred = "http://u:p@shared.example:1"
+    config = {
+        "proxy": {
+            "pool": [cred],
+            "lanes": {"payment_qualification": [cred]},
+            "allow_lane_overlap": ["payment_qualification"],
+        },
+    }
+    report = pr.census(config, methods=())
+
+    assert report["lane_isolation_ok"] is True
+    assert report["lane_isolation"]["acknowledged"] == [pr.QUALIFICATION]
+    assert report["cross_lane_overlaps"][pr.QUALIFICATION] == ["shared.example:1"]
+    rendered = pr.format_census(report)
+    assert "CROSS-LANE OVERLAP" in rendered
+    assert "[declared in proxy.allow_lane_overlap]" in rendered
+
+
+def test_acknowledged_lane_names_are_validated_and_normalised():
+    assert pr.acknowledged_lane_overlaps({}) == frozenset()
+    assert pr.acknowledged_lane_overlaps({"proxy": {"allow_lane_overlap": "Mailbox, nonsense"}}) == frozenset(
+        {pr.MAILBOX}
+    )
+    assert pr.acknowledged_lane_overlaps({"proxy": {"allow_lane_overlap": {"payment": "deliberate"}}}) == frozenset(
+        {pr.PAYMENT}
+    )
+    assert pr.acknowledged_lane_overlaps({"proxy": {"allow_lane_overlap": 7}}) == frozenset()

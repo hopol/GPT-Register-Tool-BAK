@@ -1,0 +1,148 @@
+# 仓库根的本地配置（用户态，不入库）。**必须带前导 `/`**：不加锚点时
+# `payment.json` 会把 `scripts/move_specs/payment.json`（P2-7 的迁移 spec）一起吞掉，
+# `proxy.json` 同理吞掉 P2-4 的 spec。
+/config.json
+/proxy.json
+/runtime.json
+/payment.json
+.env
+.env.*
+!.env.example
+.agents/
+.claude/
+.codex/
+sms_tool/config.json
+services/mail-otp-web/config.json
+dist/
+sessions/
+/runtime/
+.dotnet/
+sms_tool/sentinel_cache.json
+mailbox_tokens.txt
+hotmail*.txt
+*_tokens.txt
+/session.json
+skills-lock.json
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# Ruff's cache writes its own inner .gitignore; pin it at the repo level so a
+# tool-side cache wipe cannot turn the directory into untracked state.
+.ruff_cache/
+
+# === 一次性诊断/探测脚本（常内联明文凭据，禁止入库）===
+# 忽略**任意目录**下以 _ 开头的 .py，再用 ! 把 __init__.py 放行。
+# 切勿写成裸 "_*.py" 而不加例外：那会连带忽略所有 __init__.py（同样以 _ 开头），
+# 导致新建的包无法入库、无法导入。
+# 2026-08-31 补过一次 scripts/_*.py（此前只挡根目录，scripts/pick_final_replacements.py
+# 带着 3 个真实凭据前缀进了公开仓库）。2026-09-01 实测发现按目录枚举仍漏
+# services/ tests/ sms_tool/ —— 枚举是补不完的，改成全局规则 + 单点例外。
+_*.py
+!__init__.py
+# 已跟踪的合法模块，不能被上面的规则吃掉（否则对它的修改会静默停止入库）
+!/sms_tool/__main__.py
+!/sms_tool/registration_drivers/_platform_patches.py
+# upi_link/__init__.py imports this pure extractor; without the exception the
+# package would commit without it and fail at import time.
+!/sms_tool/upi_link/_extract.py
+# The config split (2026-10-21) put module-level state in ``config/_state.py``;
+# the rule above silently dropped it from that commit, so the committed tree
+# could not import ``sms_tool.config`` at all. Caught 2026-10-22 by diffing the
+# tracked module list against the working tree.
+!/sms_tool/config/_state.py
+build_log.txt
+*~
+*.bak
+*.bak_before_*
+*.bak_*
+*.bak-*
+# 池 / 数据库清理脚本写出的凭据备份。三个工具各用一种后缀：
+#   cleanup_invalid_accounts.py -> <file>.pre_cleanup_<stamp>
+#   mailbox_pool_liveness.py    -> <file>.pre_liveness_<stamp>
+#   mailbox_pool_orphans.py     -> <file>.pre_orphan_prune_<stamp>
+# `mailbox_tokens.txt`（第 20 行）与 `*_tokens.txt`（第 22 行）都挡不住**带后缀**的形式
+# —— `.txt` 后面还有内容就不再匹配。2026-10-06 实测：`mailbox_tokens.txt.pre_cleanup_*`
+# 以未跟踪状态躺在仓库根目录，内含整池凭据，只差一次 `git add -A`。
+*.pre_cleanup_*
+*.pre_liveness_*
+*.pre_orphan_prune_*
+runtime/*.log
+runtime/**/*.log
+
+# === 凭据型本地配置的整族快照（2026-09-11）===
+# 上面那批 `*.bak` / `*.bak_*` 挡不住**连字符**形式。实测：`proxy.json.bak-vn-migration`
+# （100 条代理账密 + smsbower api_key）以未跟踪状态躺在公开仓库根目录，
+# `git check-ignore` 判定为"未忽略"——于是 release payload gate 那条
+# "被 .gitignore 拒绝的文件绝不能出货"的规则对它完全失效（闸门是问 git 的，
+# git 说没忽略，闸门就放行）。这里按**家族**忽略，而不是枚举后缀：
+# 枚举是补不完的，`proxy.json.old` / `proxy.json.save` 还会漏。
+#
+# 2026-10-21 第二次踩坑：这几条原来没有前导 `/`，于是 `proxy.json*` 连
+# `scripts/move_specs/proxy.json`（`module_move.py` 的迁移输入 spec，是**仓库产物**
+# 而不是用户配置）一起吞了 —— P2-4 的 spec 因此从未入库，`git ls-files
+# scripts/move_specs/` 只剩 `mailbox.json`，而 `module_move.py` 自己的 docstring
+# 示例就是 `--spec scripts/move_specs/proxy.json`。要挡的是仓库根的用户配置，
+# 所以事故的载体是**位置**而不是后缀：家族规则按根锚定。
+/proxy.json*
+/config.json*
+/runtime.json*
+/payment.json*
+/session.json*
+# 例外：示例模板只有占位符，允许入库（沿用 config.example.json 的命名习惯）。
+# 少了这两行，将来新建 proxy.json.example 会被上面的家族规则静默吃掉 ——
+# 既不入库、也不进发布载荷，且不报错。
+!/proxy.json.example
+!/config.json.example
+# `scripts/move_specs/*.json` 是 `module_move.py` 的迁移输入 spec（仓库产物，按目标包
+# 命名：proxy / mailbox / paypal / payment …），不是用户配置。上面两处家族规则
+# 挡的是仓库根的用户态文件，它们唯一合法的例外就是这组 spec；少了这行，
+# `payment.json` 与 `proxy.json` 会把 P2-7 / P2-4 的 spec 静默吞掉。
+!scripts/move_specs/*.json
+
+SmsWorkbench/bin/
+SmsWorkbench/obj/
+SmsWorkbench/*_wpftmp.csproj
+tests/**/bin/
+tests/**/obj/
+SmsWorkbench.Contracts/bin/
+SmsWorkbench.Contracts/obj/
+
+.vs/
+.idea/
+.vscode/
+.workbuddy-ai/
+.workbuddy/
+.pi/
+# ThinkRail chat context (tool-owned, self-ignored via context/.gitignore).
+.thinkrail/
+/.zcode/
+/gates/
+TestResults/
+*.trx
+.coverage
+coverage.xml
+htmlcov/
+scripts/installer/bin/
+scripts/installer/obj/
+scripts/installer/payload.zip
+
+/.retention.*.log
+/nul
+
+# === 本地虚拟环境（359M，禁止入库）===
+.venv/
+
+# === 本地日志（不入库）===
+logs/
+
+# Optional local workspace for operator-only state; keep its guide tracked.
+local/*
+!local/README.md
+
+# pyright ratchet scratch output
+.pyright-work/
+
+# 迁移进 sms_tool/paypal/ 后，PROJECT_ROOT 少一层时默认的 runtime/ 状态文件
+# 会落到这里。它既不是 runtime/ 那份活状态，也不该被提交。
+/sms_tool/runtime/

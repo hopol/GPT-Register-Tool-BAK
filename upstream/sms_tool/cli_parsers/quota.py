@@ -1,0 +1,90 @@
+"""quota flags for ``cli.build_parser``."""
+
+import argparse
+
+
+def register(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--refresh-cpa-quota",
+        action="store_true",
+        help="Refresh quota status and update SQLite; defaults to local access_token probing",
+    )
+    parser.add_argument(
+        "--refresh-local-quota",
+        action="store_true",
+        help="Refresh quota status locally with saved access_token and update SQLite",
+    )
+    parser.add_argument(
+        "--quota-usage",
+        action="store_true",
+        help="Fetch wham/usage 5h/7d quota for a single account and return structured JSON (no SQLite write)",
+    )
+    parser.add_argument(
+        "--check-promotion",
+        action="store_true",
+        help="Probe accounts/check plan and Plus-trial/discount (优惠) eligibility and persist promotion_status",
+    )
+    parser.add_argument(
+        "--check-payment-qualification",
+        action="store_true",
+        help="Probe each account's zero-due checkout capability (支付资格) and persist payment_qualification",
+    )
+    parser.add_argument(
+        "--payment-qualification-method",
+        default="",
+        help=(
+            "Payment method(s) for --check-payment-qualification: 'auto' (methods for the exit country, "
+            "default) or a comma list such as 'gcash,momo'"
+        ),
+    )
+    parser.add_argument(
+        "--payment-qualification-country",
+        default="",
+        help=(
+            "Force the ISO country used as billing/request country (default: measure the exit, "
+            "then fall back to the account's registration_country)"
+        ),
+    )
+    parser.add_argument(
+        "--payment-qualification-all-methods",
+        action="store_true",
+        help=(
+            "Probe every candidate method instead of stopping at the first eligible one. "
+            "Each candidate is its own Checkout create, so this is a diagnostic mode."
+        ),
+    )
+    parser.add_argument(
+        "--check-promotion-after-registration",
+        action="store_true",
+        help="After registration, probe saved successful accounts for Plus trial/discount eligibility",
+    )
+    parser.add_argument(
+        "--quota-mode",
+        choices=["local", "cpa", "auto"],
+        default="local",
+        help="Quota refresh mode: local direct probe, cpa management API, or local with CPA fallback",
+    )
+    parser.add_argument(
+        "--quota-auto-relogin",
+        action="store_true",
+        help="When local quota probe returns 401/token_invalidated, retry login with saved mailbox credentials and persist the new AT",
+    )
+    parser.add_argument(
+        "--quota-relogin-timeout",
+        type=int,
+        default=None,
+        help="Timeout in seconds for --quota-auto-relogin (defaults to account_health config)",
+    )
+    parser.add_argument(
+        "--quota-batch-timeout",
+        type=int,
+        default=None,
+        help="Maximum total seconds for a local quota batch (defaults to account_health config)",
+    )
+    parser.add_argument(
+        "--quota-account-timeout",
+        type=int,
+        default=None,
+        help="Maximum seconds allowed per local quota account (defaults to account_health config)",
+    )
+    parser.add_argument("--quota-workers", type=int, default=4, help="Concurrent workers for quota refresh")

@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <!-- Nullable is on project-wide since 2026-11. The historical note said a
+         wholesale flip reported 147 findings across ~25 files (measured
+         2026-09-02); those were paid off file-by-file with `#nullable enable`
+         directives, and re-measuring with this setting flipped reported
+         0 warnings on `dotnet build -t:Rebuild`. New files need no directive;
+         the retained per-file directives are provenance, not exemptions.
+         `scripts/dotnet_warning_ratchet.py` keeps the build at a zero-warning
+         baseline, so a nullable regression fails CI. -->
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>SmsWorkbench</AssemblyName>
+    <RootNamespace>SmsWorkbench</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\app-icon.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <Resource Include="Assets\app-icon.ico" />
+    <Resource Include="Assets\black-kitten.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\SmsWorkbench.Contracts\SmsWorkbench.Contracts.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="CommunityToolkit.Mvvm" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Serilog" />
+    <PackageReference Include="Serilog.Extensions.Hosting" />
+    <PackageReference Include="Serilog.Sinks.Async" />
+    <PackageReference Include="Serilog.Sinks.File" />
+    <PackageReference Include="WPF-UI" />
+  </ItemGroup>
+</Project>

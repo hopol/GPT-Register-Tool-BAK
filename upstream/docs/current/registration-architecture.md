@@ -1,0 +1,256 @@
+# Registration Architecture
+
+> **Scope.** Owns the stage order, runtime state groups, session ownership and
+> the error/retry vocabulary. Endpoints live in
+> [protocol-registration.md](protocol-registration.md), proxy lanes in
+> [registration-and-proxy-architecture.md](registration-and-proxy-architecture.md),
+> post-failure handling in [registration-recovery.md](registration-recovery.md).
+
+## Protocol workflow
+
+`registration/orchestrator.py` binds an immutable `RegistrationOperations` per call. Existing
+facade patches made before `run_email` are respected; changing a facade symbol
+mid-run no longer changes an already bound workflow. Isolated tests may inject
+a fake operations object.
+The OTP mailbox polling stage consumes a small immutable
+`RegistrationOtpPollingOperations` group (subject keywords, poll and resend),
+bound from the facade on each invocation. Other `RegistrationOperations`
+dependencies remain flat; this is an incremental interface change, not a new
+workflow or a change to persisted state.
+
+`registration/runtime.py` separates mutable state into resources, identity,
+auth, OTP, account and outcome groups. Flat field access is a transitional
+compatibility view of the same storage, not a second copy. Checkpoint schemas
+remain unchanged. New stage code should consume the smallest group it
+needs. Full immutable stage input/output migration remains future work.
+
+`RegistrationStageRunner.run_stage` is the only stage execution Seam. Each stage
+mutates the same `RegistrationRuntimeState`; there is no test-only dict-delta
+stage framework or parallel cleanup lifecycle.
+The auth-session/AT-probe stage stays behind the per-invocation bound
+`RegistrationOperations` Interface. An offline test exercises that real facade
+binding and the resumable non-200 checkpoint, without changing stage order.
+
+Batch reports include a token-free `funnel` summary from
+`registration/funnel.py`. `registered_per_attempted` uses eligible attempted
+mailboxes, after the already-registered/dead-end filter. Promotion is a
+separate measurement: `successful_per_registered` reports promotion coverage,
+and `eligible_per_successful_probe` divides Plus-trial eligibility by
+successful `accounts/check` probes, **not** by registrations or Checkout
+requests. If promotion checks are disabled or all probes fail, the trial rate
+is `null`, not zero. Failures are grouped by allow-listed stage and
+failure class; identity checks count matches, mismatches and unknowns without
+persisting device IDs, proxy credentials, tokens or raw upstream errors. A
+target-AT200 report combines only these safe per-round counts. The report
+cannot infer why the server did or did not offer a trial.
+
+Before protocol batches touch the mailbox pool or proxy preflight, a local
+Sentinel readiness check verifies the pinned runner bundle and Node
+availability. It does not run Node, contact a vendor or consume a mailbox.
+Without a configured legacy fallback it fails with a path-free reason code;
+with fallback enabled it warns that fallback remains available, but does not
+claim the fallback has succeeded.
+
+The email-registration path is AT-only. Its impossible OAuth/phone readiness
+branches have been removed. The separate SMS entry point, account recovery,
+payment authentication and OAuth export still use phone/OAuth modules, so those
+modules must not be deleted as dead code.
+
+`registration_handlers.RegistrationEmailWorkflow` keeps thin delegates, and the
+extracted stage modules (`registration_bootstrap_stages`,
+`registration_identity_stages`, `registration_auth_stages`,
+`registration_register_stages`, `registration_otp_stages`,
+`registration_account_stages`, `registration_edge_challenge`,
+`registration_resume`, `registration_sentinel_stages`, `registration_warmup`,
+`registration_reference_lane`, `registration_finalize`) take the workflow
+instance as a first positional parameter named `workflow`. It used to be named
+`self`, which read as a method on an object the module does not own; the
+parameter is annotated with `RegistrationEmailWorkflow` under `TYPE_CHECKING`,
+so a type-only import avoids the runtime cycle while the type checker still
+validates every attribute and delegate the stage touches. The bootstrap/identity/auth/register split (2026-10-24) moved their bodies —
+and `_apply_protocol_fingerprint` with them — into those four modules;
+`handlers.py` keeps the stage order, the lifecycle and thin delegates, plus a
+re-export of the fingerprint helper for its historical import path.
+
+## Browser drivers
+
+`base.py` remains the driver registry. `external_sessions/__init__.py` preserves
+the existing import/factory Interface; `managed.py` owns engine/API lifecycle,
+`profiles.py` owns persistence configuration, and `probe.py` owns egress audits.
+Per-engine implementations remain together in `managed.py`; extracting each
+engine separately is not required for the current Interface.
+
+The process-wide browser pool key includes a hash of the injected runtime
+configuration. Changing driver credentials or process launch settings rebuilds
+the pool; a resident relaunch never falls back to the first invocation's stale
+configuration.
+
+Browser hardware fingerprints come from the built-in
+`BROWSER_PROFILE_POOL`. `registration.browser_profile_pool` is rejected rather
+than accepted as a configuration value that has no runtime effect.
+
+Both registration paths now expose a token-free `fingerprint_geo_audit` result:
+`status` (`matched` / `mismatch` / `unknown`), `fingerprint_country`,
+`exit_country`, `source` (`preflight` / `geo_probe` / `browser_probe` /
+`unknown`), and `allowed_status` (`matched` / `mismatch` /
+`not_configured` / `unknown`). Countries must be two-letter codes; no proxy
+URL, IP, token or provider response enters this result. A mismatch adds
+`fingerprint_geo_mismatch` or `fingerprint_allowed_country_mismatch` to
+`registration_warning` and logs only safe codes/countries. Progress rows carry
+the safe result; SQLite registration audits keep only its verdict.
+Protocol fingerprint selection still **continues** after an allowed-country
+mismatch. Browser provider drivers retain their existing blocking proxy-country
+check; local drivers retain their diagnostic check. Provider-managed browser
+fingerprints report `unknown` rather than claiming to know the provider's
+locale. Local drivers report the requested locale, not a measurement of the
+browser's emitted fingerprint. A preflight observation is a sample of the
+pool slot, not proof of this attempt's rotated exit. A missing fingerprint
+on a resumed post-create checkpoint also remains `unknown`. A country match
+does not establish that timezone or language matches.
+
+Camoufox removes only a profile created by its own `mkdtemp`. User-supplied
+profile directories are never removed. A successful `keep_browser_open` run
+retains its profile for operator inspection; failed launch always attempts
+cleanup. Windows file-lock failures emit a warning and retain ownership for a
+later close attempt.
+
+`platform_patches.py` constructs the child process environment. It preserves
+the existing `disable_content_sandbox` option without modifying `os.environ` or
+the process-wide asyncio policy. This option reduces Firefox sandbox protection;
+disable the workaround where the host supports normal sandboxed operation.
+
+## Error and retry policy
+
+Protocol bootstrap reads a post-create checkpoint before saving any early-stage
+state. SQLite rejects early-stage overwrites of post-create checkpoints, including
+across processes. A saved AT resumes at the AT probe without mailbox reads or OTP.
+
+Candidate selection bulk-reads post-create checkpoints before batch sizing.
+An expired, exhausted or malformed `auth_session_pending` checkpoint is written
+to the retry guard and excluded before it can claim a worker/proxy slot. A valid
+checkpoint remains eligible for the recovery path.
+
+A successful create response without an AT saves `auth_session_pending` with
+private, scoped session cookies. Recovery fetches the session and probes the AT;
+it never repeats signup or sends another OTP. Recovery is limited to two attempts
+within fifteen minutes of account creation. Missing/expired context or an exhausted
+budget is a terminal recovery result, not permission to start signup again.
+
+`user_already_exists` is persisted immediately as `partial_registered` in the
+registration retry guard. The desktop displays this as **半注册** and excludes it
+from unused-mailbox registration. This label means the server has an account but
+this registration has not established a usable local account; it is not a claim
+that the server account was only partially created. Legacy `dead_end` records are
+read as the same state. A failed recovery retains it; a successful recovery clears
+the guard, and verified account data takes precedence in the desktop grid.
+
+`registration/policy.py` owns retry classification, disposition and actionable
+advice. Its pure `RetryDecision` separates three questions:
+
+- `attempt_retryable`: may this account retry immediately inside the same batch;
+- `future_batch_eligible`: may a later batch reconsider the mailbox;
+- `guard_action`: retain no state, cooldown, escalate OTP pending, or mark a
+  permanent dead end.
+
+The historical result key `retryable` remains an alias for
+`attempt_retryable`. `email_otp_send_stuck` never retries immediately: the first
+cross-batch observation enters `registration.retry_policy.cross_batch_cooldown_seconds`,
+and the second (configurable threshold) enters OTP-pending quarantine. This
+quarantine is not `partial_registered`; it makes no claim that an account exists.
+A success clears either state.
+
+OTP timeouts and stuck sends carry a **root-cause suffix** so the pulse scheduler
+can tell an egress block from a mailbox-side miss. `email_otp_poll_timeout`
+appends `mailbox_side_no_code` when the `after_otp_send` dump is readable and
+carries no pending key (the server finished its dispatch; the code never reached
+us), optionally followed by `no_resend_for_channel` when the provider has no
+resend capability. `email_otp_send_stuck` appends `arm_mismatch` when the run is
+on the password lane and the same dump shows `email_verification_mode` armed on a
+`passwordless_*` value: the server picked a different transaction arm, which no
+egress change can affect, so `registration_pulse._is_otp_ban_signal`
+short-circuits on that suffix before the `otp_send_stuck` substring it contains.
+The suffix never changes the failure class — the marker it rides on is still
+`email_otp_send_stuck`.
+
+Pulse scheduling starts with a one-account canary when
+`registration.pulse.canary_enabled` is true. A blocked canary or unanimously
+blocked full wave advances the proxy-pool cursor for accounts not yet started,
+cools down, and keeps the next wave as a canary. With only one pool slot the log
+reports cooldown only. `FailureClass.rotate_egress` is the registry's single
+declaration of which failure classes make an egress change a plausible remedy,
+and the blocked-dispatch verdict consults it. It is deliberately **not** the same
+axis as the classes that verdict must ignore: `rate_limit` rotates egress yet
+must never be read as an OTP dispatch block, because the batch circuit breaker
+already owns 429, while `account` is neither — its address is consumed, so no
+exit helps. Protocol and browser results both carry the same
+allow-listed `proxy_audit` fields: pool index, countries, scheme, and rotation
+generation. No proxy URL, host, credential, or session ID is included.
+Sentinel prewarm for a future account is reused only if its prepared base
+proxy still equals that account's selected slot. A blocked canary can rotate
+the cursor before that account starts; it then gets a fresh proxy session and
+discards the prewarm result instead of mixing an old exit with a new pool index.
+
+Session-level HTTP circuits, stage admission, persistent mailbox cooldown and
+stage time budgets keep distinct state owners. HTTP backoff and admission
+cooldown use shared bounds. Challenges, explicit credential failures, rate-limit
+circuits and exceeded stage budgets must not become transport retries merely
+because the error text also includes `timeout` or `proxy`.
+
+`registration.stage_timeouts.<state>` is a **post-hoc budget, not a preemptive
+cancel** (`registration/state.py::RegistrationStage.run`). The handler runs to
+completion on the calling thread, the elapsed time is compared afterwards, and
+only then does an overrun fail the state machine with
+`<state>_stage_budget_exceeded`. That ordering is deliberate: cleanup stays on the
+calling thread and no worker thread is orphaned. Read it as "this stage is
+reported as late", never as "this stage stops after N seconds". The stages that
+can legitimately block hand the smaller of their own operation timeout and the
+budget to the blocking call (`_otp_poll_timeout` for the email OTP wait); every
+other stage is bounded from outside by the desktop task timeout. Do not convert
+this into mid-stage cancellation without moving cleanup off the calling thread and
+re-pinning `tests/registration/test_registration_state.py`.
+
+iCloud inbox 404/410 stops the current OTP poll and opens a five-minute cooldown.
+The pre-OTP baseline propagates this error too, stopping before authorization or
+OTP dispatch. Explicit mailbox credential failures also stop at this boundary.
+An explicit credential failure remains quarantined until repaired. An empty
+inbox or HTTP 503 is not treated as invalid credentials. Reads check quarantine
+before contacting a provider.
+
+### Identity-context post-condition (`IDENTITY_READY`)
+
+`prepare_identity` is the only writer of `runtime.context`. From that stage on,
+`_run_stage` hands the `RegistrationContext` to every handler; before it — and on
+a post-create resume, which skips identity entirely — handlers receive the
+mutable `RegistrationRuntimeState` instead. Every stage body currently closes
+over `self` and ignores the parameter, so the distinction is unobservable until
+the first handler that actually reads its context.
+
+`identity_stages.verify_identity_context` (called by `_run_stage` after
+`IDENTITY_READY`) makes the drift visible. It logs, and does not abort:
+
+| Marker | Meaning |
+| --- | --- |
+| `registration_identity_context_missing` | the stage finished without creating a context; every later stage gets the mutable runtime |
+| `registration_identity_context_without_device_id` | the context carries no `device_id`, so the `oai-did` / header / cookie trio cannot be verified consistent |
+
+A hard failure was rejected on purpose: `IDENTITY_READY` is legitimately driven
+with a no-op handler by `tests/registration/test_registration_bootstrap_timing.py`
+to pin the timing rows, and killing a live registration because a stub did not
+build a context is a worse trade than a greppable operator-log line. The markers
+are stable so they can be grepped and alerted on; the delegate stays two lines in
+`handlers.py` and the body lives in `identity_stages.py`
+(`tests/registration/test_handlers_module_ownership.py` enforces both).
+
+## Validation limits
+
+Offline regressions cover disabled/read-only email selection, bounded fill
+timeouts, fallback-selector budgets, terminal mailbox failures and session
+cleanup. They do not establish live registration success rates or explain
+provider-side account revocation.
+
+Do not use historical mixed test/live progress rows to claim a success-rate
+trend. A Gmail/ReMail comparison requires explicit sample and budget approval,
+valid owned mailbox credentials, matched conditions and separate run IDs.
+Changing passwordless/password registration, proxy affinity or fingerprint
+selection requires the same approval and controlled comparison; offline
+transaction tests alone do not establish a higher Plus-trial offer rate.

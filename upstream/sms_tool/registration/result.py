@@ -1,0 +1,396 @@
+"""注册结果契约的单一装配点。
+
+协议路径（``registration_handlers.RegistrationEmailWorkflow.finalize``）与浏览器
+路径（``registration_drivers/browser_flow/orchestrator.run_browser_registration``）
+产出的 result dict 共享同一批核心键。历史上这 25 个键在两条路径里各手写一份，
+键集合只靠注释保持同步（orchestrator 的注释原话是"mirror the protocol path"），
+漂移只能靠测试兜底。
+
+本模块把共享核心收拢到 :func:`build_registration_result`：
+
+* ``COMMON_RESULT_KEYS`` 是两条路径都必须提供的核心键契约，供契约测试断言；
+* 两条路径各自的专有键（协议的 ``quota``/``timing``/``sentinel_version`` 等，
+  浏览器的 ``registration_driver``/``browser_diagnostics`` 等）通过 ``extra``
+  合入，不进入共享契约。
+
+判定逻辑（成功/失败/何种错误）仍归 :mod:`sms_tool.registration.outcome` 的
+``_registration_outcome`` / ``_probe_registration_access_token``，本模块只负责
+装配，不重复判定。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+import logging
+import re
+
+from ..kernel.sanitizer import mask_account, sanitize_text
+from .policy import registration_retry_decision
+
+logger = logging.getLogger(__name__)
+
+
+# 两条路径共有的核心键。契约测试（tests/registration/test_registration_result_contract.py）
+# 断言两条路径产出的 result 都覆盖这一集合；新增共有键时先改这里再改两条路径。
+COMMON_RESULT_KEYS = frozenset(
+    {
+        "access_token",
+        "auth_fingerprint_profile",
+        "auth_session",
+        "birthdate",
+        "cookie_header",
+        "device_id",
+        "email",
+        "error",
+        "identity_context",
+        "mailbox",
+        "name",
+        "password",
+        "plan_type",
+        "proxy_audit",
+        "fingerprint_geo_audit",
+        "post_registration_ready",
+        "quota_status",
+        "register_method",
+        "registration_country",
+        "registration_mode",
+        "registration_state",
+        "registration_success_basis",
+        "registration_warning",
+        "response",
+        "session_type",
+        "source",
+        "success",
+        "totp_secret",
+        "twofa_enrollment",
+        "id_token",
+    }
+)
+
+
+def _dynamic_generation(value: object) -> dict[str, object]:
+    """Sanitize the dynamic-generation status: ``used`` / ``count`` / ``reason``."""
+    _raw: object = value
+    section = _raw if isinstance(_raw, Mapping) else {}
+    try:
+        count = max(0, int(section.get("count", 0) or 0))
+    except (TypeError, ValueError):
+        count = 0
+    reason = str(section.get("reason") or "")[:60]
+    return {"used": bool(section.get("used")), "count": count, "reason": reason}
+
+
+def safe_proxy_audit(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Allow-list non-sensitive registration egress facts.
+
+    ``edge_challenge_*`` are the in-flow Cloudflare-challenge counters from
+    ``plan-2026-10-05-inflow-challenge-handoff.md`` §4.  They are **counts, not
+    identities**: the before/after exit is a sticky-session credential and must
+    never be audited, so "the exit actually moved" is expressed as
+    ``edge_challenge_rotations`` (and its failure counterpart) instead.  The
+    A/B's manipulation check reads exactly those two fields to decide whether a
+    ``rotate`` arm really rotated or is an ``observe`` arm wearing a label.
+    """
+    _raw_value: object = metadata
+    value: Mapping = _raw_value if isinstance(_raw_value, Mapping) else {}
+    try:
+        pool_index = int(value.get("pool_index", -1))
+    except (TypeError, ValueError):
+        pool_index = -1
+    try:
+        rotation_generation = max(0, int(value.get("rotation_generation", 0)))
+    except (TypeError, ValueError):
+        rotation_generation = 0
+
+    def _count(key: str) -> int:
+        try:
+            return max(0, int(value.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "pool_index": pool_index if pool_index >= 0 else -1,
+        "expected_country": str(value.get("expected_country") or "").strip().upper(),
+        "actual_country": str(value.get("actual_country") or "").strip().upper(),
+        "scheme": str(value.get("scheme") or "").strip().lower(),
+        "rotation_generation": rotation_generation,
+        "edge_challenge_hits": _count("edge_challenge_hits"),
+        "edge_challenge_unknown": _count("edge_challenge_unknown"),
+        "edge_challenge_rotations": _count("edge_challenge_rotations"),
+        "edge_challenge_rotate_failed": _count("edge_challenge_rotate_failed"),
+        # P1-1 follow-up (2026-10-24): how often the pooled fingerprint lookup
+        # failed and the run fell back to the proxy-country hint.  Counted for
+        # the same reason as the edge-challenge counters -- the fallback used to
+        # be silent, so "the pool worked" and "the pool failed every time"
+        # produced identical audits.
+        "fingerprint_pool_failures": _count("fingerprint_pool_failures"),
+        # P2 (2026-11-11): did the opt-in dynamic generator actually supply this
+        # batch's exits, or did it fall back?  Three primitives only -- the proxy
+        # strings it produced are never part of the audit (same rule as the
+        # before/after exits above).
+        "dynamic_generation": _dynamic_generation(value.get("dynamic_generation")),
+    }
+
+
+DEVICE_IDENTITY_SEEDS = frozenset({"none", "email"})
+
+
+def safe_device_identity(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Token-free record of where this attempt's ``oai-did`` came from.
+
+    ``oai-did`` is a credential-level identifier, so only its first 8 characters
+    survive.  ``reused`` is ``None`` (not ``False``) when nothing was recorded:
+    the funnel must be able to tell "a fresh id was minted" from "not measured".
+    ``seeded`` names the derivation (``none`` = random per run, ``email`` = a pure
+    function of the address); anything else reads as ``unknown`` rather than
+    being echoed back into a report.
+    """
+    _raw_value: object = metadata
+    value: Mapping = _raw_value if isinstance(_raw_value, Mapping) else {}
+    reused = value.get("reused")
+    seeded = str(value.get("seeded") or "").strip().lower()
+    did = str(value.get("oai_did") or value.get("device_id") or "").strip()
+    return {
+        "oai_did": did[:8],
+        "reused": reused if isinstance(reused, bool) else None,
+        "seeded": seeded if seeded in DEVICE_IDENTITY_SEEDS else "unknown",
+    }
+
+
+def safe_fingerprint_geo_audit(metadata: Mapping[str, Any] | None = None, **fields: Any) -> dict[str, str]:
+    """Compare a selected locale with an independently observed exit, without proxy data."""
+    value = dict(metadata) if isinstance(metadata, Mapping) else {}
+    value.update(fields)
+
+    def country(raw: Any) -> str:
+        text = str(raw or "").strip().upper()
+        return text if re.fullmatch(r"[A-Z]{2}", text) else ""
+
+    fingerprint = country(value.get("fingerprint_country"))
+    exit_country = country(value.get("exit_country"))
+    source = str(value.get("source") or "")
+    if source not in {"preflight", "browser_probe", "geo_probe"}:
+        source = "unknown"
+    if not exit_country:
+        source = "unknown"
+    allowed = value.get("allowed_countries")
+    if isinstance(allowed, (list, tuple, set, frozenset)) and allowed:
+        countries = {country(item) for item in allowed} - {""}
+        allowed_status = (
+            ("matched" if fingerprint in countries else "mismatch") if fingerprint and countries else "unknown"
+        )
+    else:
+        allowed_status = str(value.get("allowed_status") or "not_configured")
+        if allowed_status not in {"matched", "mismatch", "not_configured", "unknown"}:
+            allowed_status = "unknown"
+    return {
+        "status": ("matched" if fingerprint == exit_country else "mismatch")
+        if fingerprint and exit_country
+        else "unknown",
+        "fingerprint_country": fingerprint,
+        "exit_country": exit_country,
+        "source": source,
+        "allowed_status": allowed_status,
+    }
+
+
+def attach_fingerprint_geo_audit(result: dict[str, Any], metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Attach a token-free verdict to either a complete or early-failure result."""
+    geo = safe_fingerprint_geo_audit(metadata)
+    result["fingerprint_geo_audit"] = geo
+    warnings = []
+    if geo["status"] == "mismatch":
+        warnings.append("fingerprint_geo_mismatch")
+    if geo["allowed_status"] == "mismatch":
+        warnings.append("fingerprint_allowed_country_mismatch")
+    if warnings:
+        logger.warning(
+            "registration fingerprint country warning: %s (fingerprint=%s exit=%s source=%s)",
+            ",".join(warnings),
+            geo["fingerprint_country"],
+            geo["exit_country"],
+            geo["source"],
+        )
+        current_warning = sanitize_text(result.get("registration_warning"))
+        result["registration_warning"] = "; ".join(
+            [current_warning, *(code for code in warnings if code not in current_warning)]
+        ).strip("; ")
+    return result
+
+
+def record_failed_mailbox_purchase(workflow: Any, result: Mapping[str, Any] | None = None) -> str:
+    """Keep a failed run's **purchased** mailbox reusable (see ``mailbox.reclaim``).
+
+    A ReMail order is charged before registration starts, so a run that dies
+    after claiming the mailbox (``create_account`` 409 ``invalid_state``, a
+    proxy drop during OTP, an internal abort) used to leave the credential only
+    in memory and in the supplier panel -- re-running bought a second mailbox
+    for the same slot. Measured 2026-10-26: 3 bought, 2 accounts, and the third
+    could not be retried for free.
+
+    Called from both terminal paths (``_abort_result`` and ``finalize``) because
+    either can be the last word on a run.
+
+    The mailbox comes from the **workflow runtime**, not from ``result``: the
+    failure result is sanitized by ``outcome._failure_result``, so its
+    ``mailbox.token`` is already ``[REDACTED]`` and a record built from it would
+    carry a placeholder credential. Reading the runtime object is what makes the
+    line replayable.
+
+    Never raises: losing a bookkeeping line must not fail the run.
+    """
+    try:
+        runtime = getattr(workflow, "runtime", None)
+        mailbox = getattr(runtime, "mailbox", None)
+        payload = result if isinstance(result, Mapping) else {}
+        from ..mailbox.reclaim import STATUS_RECORDED, record_reclaimable_mailbox
+
+        status = record_reclaimable_mailbox(
+            mailbox,
+            failure_class=str(payload.get("failure_class") or ""),
+            error=str(payload.get("error") or ""),
+            config=getattr(workflow, "config", None),
+        )
+        if status == STATUS_RECORDED:
+            logger.warning(
+                "kept purchased mailbox for a free retry: %s (ledger=runtime/mailbox_reclaim.txt)",
+                mask_account(str(getattr(mailbox, "email", "") or "")),
+            )
+        return status
+    except Exception as exc:  # broad-except: compat  # pragma: no cover - bookkeeping only
+        logger.warning("failed to record the purchased mailbox: %s", type(exc).__name__)
+        return "error"
+
+
+def build_registration_result(
+    *,
+    success: bool,
+    registration_mode: str,
+    registration_state: str,
+    email: str = "",
+    error: Any = "",
+    register_method: str = "email",
+    session_type: str = "web",
+    password: str = "",
+    name: str = "",
+    birthdate: str = "",
+    access_token: str = "",
+    id_token: str = "",
+    auth_session: Any = None,
+    cookie_header: str = "",
+    device_id: str = "",
+    identity_context: Mapping[str, Any] | None = None,
+    auth_fingerprint_profile: str = "",
+    response: Mapping[str, Any] | None = None,
+    quota_status: str = "",
+    totp_secret: str = "",
+    twofa_enrollment: Mapping[str, Any] | None = None,
+    registration_success_basis: str = "",
+    registration_country: str = "",
+    registration_warning: Any = "",
+    post_registration_ready: bool = False,
+    mailbox_snapshot: Mapping[str, Any] | None = None,
+    proxy_audit: Mapping[str, Any] | None = None,
+    fingerprint_geo_audit: Mapping[str, Any] | None = None,
+    device_identity: Mapping[str, Any] | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble one registration result dict from already-computed values.
+
+    The caller owns every decision (success, state classification, password
+    redaction); this function only fixes the shared key set and the redaction
+    of free-text fields. ``extra`` merges path-specific keys last.
+    """
+    result: dict[str, Any] = {
+        "success": bool(success),
+        "error": sanitize_text(error),
+        "email": email,
+        "source": "register",
+        "register_method": register_method,
+        "session_type": session_type,
+        "plan_type": "unknown",
+        "password": password,
+        "name": name,
+        "birthdate": birthdate,
+        "response": dict(response or {}),
+        "auth_session": auth_session,
+        "access_token": access_token or "",
+        "id_token": id_token,
+        "quota_status": quota_status,
+        "totp_secret": totp_secret or "",
+        "twofa_enrollment": twofa_enrollment or {"ok": False, "reason": "skipped"},
+        "registration_success_basis": registration_success_basis,
+        "registration_state": registration_state,
+        "registration_country": registration_country,
+        "registration_warning": sanitize_text(registration_warning),
+        "post_registration_ready": bool(post_registration_ready),
+        "cookie_header": cookie_header,
+        "registration_mode": registration_mode,
+        "device_id": device_id,
+        "identity_context": identity_context,
+        "auth_fingerprint_profile": auth_fingerprint_profile,
+        "mailbox": mailbox_snapshot or {},
+        "proxy_audit": safe_proxy_audit(proxy_audit),
+        "fingerprint_geo_audit": safe_fingerprint_geo_audit(fingerprint_geo_audit),
+        "device_identity": safe_device_identity(device_identity),
+    }
+    if extra:
+        result.update(extra)
+    result["proxy_audit"] = safe_proxy_audit(result.get("proxy_audit"))
+    attach_fingerprint_geo_audit(result, result.get("fingerprint_geo_audit"))
+    decision = registration_retry_decision(result.get("error"))
+    result.setdefault("failure_class", "" if success else decision.failure_class)
+    result.setdefault("retryable", not success and decision.retryable)
+    result.setdefault("future_batch_eligible", not success and decision.future_batch_eligible)
+    result.setdefault("retry_disposition", "" if success else decision.guard_action)
+    result.setdefault("error_advice", "" if success else decision.advice)
+    missing = COMMON_RESULT_KEYS - result.keys()
+    if missing:  # pragma: no cover - guards future edits to this function
+        raise ValueError(f"registration result missing common keys: {sorted(missing)}")
+    return result
+
+
+def build_registration_failure_result(
+    *,
+    error: Any,
+    failure_class: str = "",
+    registration_mode: str = "browser",
+    registration_state: str = "failed",
+    email: str = "",
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Failure half of the shared result contract (ADR-0008).
+
+    The browser path used to hand-build failure dicts with per-site key sets
+    that drifted (one omitted ``email``, another omitted ``failure_class`` and
+    ``mailbox``), so consumers could not rely on the common keys regardless of
+    where the attempt died. Every failure now goes through the same assembly
+    as a success: the full common key set is present, path-specific keys ride
+    in ``extra``, and the retry decision is derived from ``error`` unless the
+    caller pins ``failure_class`` explicitly (``extra`` merges first, so an
+    explicit class wins over the derived one).
+    """
+    merged: dict[str, Any] = dict(extra or {})
+    if failure_class:
+        merged.setdefault("failure_class", failure_class)
+    return build_registration_result(
+        success=False,
+        registration_mode=registration_mode,
+        registration_state=registration_state,
+        email=email,
+        error=error,
+        extra=merged,
+    )
+
+
+__all__ = [
+    "COMMON_RESULT_KEYS",
+    "build_registration_result",
+    "build_registration_failure_result",
+    "record_failed_mailbox_purchase",
+    "safe_proxy_audit",
+    "safe_device_identity",
+    "safe_fingerprint_geo_audit",
+    "attach_fingerprint_geo_audit",
+]

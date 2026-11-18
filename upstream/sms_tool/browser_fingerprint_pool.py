@@ -1,0 +1,673 @@
+"""Browser fingerprint pool for the headless-browser registration path.
+
+This module is the browser-path counterpart of :mod:`fingerprint_pool`
+(which only serves the protocol / curl_cffi registration path).  It mirrors
+the approach used by ``turb-gpt-free-register`` (``config/browser.py`` +
+``core/session.py``):
+
+1. **Browser profile rotation pool** (``BROWSER_PROFILE_POOL``) — a list of
+   desktop browser hardware profiles (screen, hardware_concurrency,
+   device_memory, …).  Each registration draws one profile, either round-robin
+   or deterministically seeded by the account ``device_id`` so the same
+   account reproduces the same profile on relogin.
+2. **Exit-IP geo detection** (``detect_proxy_exit_geo``) — queries public IP
+   geo endpoints *through the registration proxy* and derives the real egress
+   country + IANA timezone.  Result is cached per proxy and degrades to ``{}``
+   on any failure so registration never blocks on it.
+3. **Geo-consistent locale / timezone** — the detected country selects a
+   ``BROWSER_LOCALE_PROFILE`` (language + accept-language + timezone) which is
+   then aligned to the proxy egress.  ``build_browser_environment`` returns the
+   merged, single-source-of-truth fingerprint that ``run_browser_registration``
+   injects into the browser session (locale + timezone_id) and records on the
+   account identity.
+
+The protocol path already aligns its TLS fingerprint geo via
+``set_fingerprint_geo(infer_proxy_country(s.proxy))``.  This module gives the
+browser path the same geo-consistency plus per-account profile rotation, so a
+headless registration no longer silently defaults to one fixed environment.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import threading
+import time
+from collections.abc import Mapping
+from datetime import datetime
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from . import geo as _geo
+from .geo import clock as _clock
+from .geo.profiles import MARKET_PROFILES, WINDOWS_TIMEZONE_BY_IANA
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Chrome desktop reference UA (used only as the geo-probe request header).
+# ---------------------------------------------------------------------------
+CHROME_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+)
+
+# ---------------------------------------------------------------------------
+# Geo detection config (modeled on turb's AUTO_BROWSER_LOCALE_FROM_IP).
+# ---------------------------------------------------------------------------
+AUTO_BROWSER_LOCALE_FROM_IP = True
+IP_GEO_TIMEOUT = 6.0
+# Legacy: the probe now walks ``sms_tool.geo.GEO_ENDPOINTS`` (which puts
+# ``cloudflare.com/cdn-cgi/trace`` first — plain text, no rate limit, and a
+# success there is also a reachability signal for OpenAI, which sits behind
+# Cloudflare).  Kept because config docs and external callers reference it.
+IP_GEO_ENDPOINTS = [
+    "https://ipinfo.io/json",
+    "https://ipapi.co/json",
+    "https://ipwho.is/",
+]
+
+# Country (ISO-3166 alpha-2) -> locale profile key.  每个市场一个独立档案
+# （CA/AU 不再别名到 us/gb，时区与出口严格一致），键即小写国家码。
+#
+# 2026-10-26：改为从 ``geo/profiles.MARKET_PROFILES`` **生成**。手写表在
+# 原 15 个市场时还能靠 parity 测试兜住，扩到 50 个市场后漏一行就是「出口国家
+# 正确、指纹回退 us 档案」的静默降级（``locale_profile_key_from_geo`` 的
+# ``.get(country, DEFAULT_LOCALE_PROFILE)`` 不报错）。生成式表结构上不可能漏。
+COUNTRY_LOCALE_PROFILE_MAP = {country: country.lower() for country in MARKET_PROFILES}
+DEFAULT_LOCALE_PROFILE = "us"
+
+# 浏览器路径地理档案 = geo/profiles.MARKET_PROFILES 的渲染视图（单一事实源，
+# 与 auth_headers._GEO_PROFILES 同源派生）。timezone_offset_minutes 只是
+# _offset_minutes_for_timezone 的回退值（P1-4：运行时按 IANA 名重算）；用
+# zoneinfo 在导入时求当前偏移，避免 DST 硬编码半年错一小时。
+TIMEZONE_NAME_BY_IANA = dict(WINDOWS_TIMEZONE_BY_IANA)
+
+# The three commentary blocks below are kept verbatim from the hand-written
+# table this dict replaced: they record *why* VN/PH/IN entries exist, which is
+# still the reason a new market must register every IANA it can return.
+_TIMEZONE_NAME_NOTES = {
+    "Asia/Ho_Chi_Minh": "Indochina Time",
+    # 2026-09-16 实测补充：VN 出口的 geo 库常把越南 IP 归到 ``Asia/Bangkok``
+    # （rola 新池 10 条里 7 条、旧 9http 池也出现过）。CLDR 里
+    # ``Asia/Bangkok`` 的 long name **就是** "Indochina Time"（与
+    # ``Asia/Ho_Chi_Minh`` 同值、同 UTC+7），所以这里补上**不改变任何输出**。
+    # 补的理由是去掉对 ``build_browser_environment`` 那个隐式回退的依赖：
+    # ``TIMEZONE_NAME_BY_IANA.get(tz, locale.get("timezone_name", ""))`` 会保留
+    # 国家档案的名字 —— 只要国家档案本身不是 VN（例如实测 Bangkok 却选了 us 档案），
+    # 就会产出 ``timezone_iana=Asia/Bangkok`` + ``timezone_name=Pacific Daylight Time``
+    # 这种自相矛盾的指纹，而且**不报错**。
+    "Asia/Bangkok": "Indochina Time",
+    "Asia/Saigon": "Indochina Time",
+    # Windows 没有菲律宾专属时区；CLDR 把 Asia/Manila 映射到
+    # "Singapore Standard Time"（实测该 ID 存在，UTC+08:00），与上面的
+    # Asia/Singapore 同值。写成别的名字会让浏览器报一个不存在的时区名。
+    "Asia/Manila": "Singapore Standard Time",
+    # 2026-09-18（第二供应商 9http ``geo-IN``）：Windows 有印度专属时区
+    # ``India Standard Time``（UTC+05:30，无 DST），所以这里**不需要**像 VN/PH
+    # 那样借用别国时区名 —— 直接用真名。``Asia/Calcutta`` 是
+    # ``Asia/Kolkata`` 的 IANA 历史别名，geo 库偶尔返回别名；两者同区同值，
+    # 登记两条只为去掉对 ``build_browser_environment`` 那个隐式回退的依赖
+    # （回退会保留**国家档案**的 timezone_name，实测别名 + 选错档案时会产出
+    # 自相矛盾的指纹且不报错）。
+    "Asia/Kolkata": "India Standard Time",
+    "Asia/Calcutta": "India Standard Time",
+}
+# Old table declared three names the canonical CLDR map does not use as its
+# territory-001 answer (Hong Kong and the US DST names). They are display-only
+# values, so the canonical map wins; the retired ones stay documented above.
+# ``Asia/Calcutta`` is an IANA alias for ``Asia/Kolkata`` and geo libraries
+# still return it, so both keys must resolve.
+TIMEZONE_NAME_BY_IANA.setdefault("Asia/Calcutta", "India Standard Time")
+
+
+def _fallback_offset_minutes(tz_iana: str) -> int:
+    """Current UTC offset for ``tz_iana`` in minutes (import-time fallback).
+
+    The runtime path recomputes this per registration via
+    ``_offset_minutes_for_timezone`` (P1-4); this only replaces the old
+    hard-coded DST values the table used to carry.
+    """
+    try:
+        offset = datetime.now(ZoneInfo(tz_iana)).utcoffset()
+        return int(offset.total_seconds() // 60) if offset else 0
+    except Exception:
+        return 0
+
+
+# Locale profile key -> browser language / accept-language / timezone.
+BROWSER_LOCALE_PROFILES: dict[str, dict[str, Any]] = {
+    country.lower(): {
+        "navigator_language": profile["lang"],
+        # ``navigator.languages`` is the ordered preference list; a real
+        # browser reports more than one entry and the first must equal
+        # ``navigator.language`` (``validate_browser_profile`` enforces that).
+        # Using only ``[lang]`` made every profile look like a single-language
+        # install, which is itself a fingerprint signal.
+        "navigator_languages": list(profile["languages"]),
+        "accept_language": profile["lang_full"],
+        "timezone_iana": profile["timezone_iana"],
+        "timezone_offset_minutes": _fallback_offset_minutes(profile["timezone_iana"]),
+        "timezone_name": TIMEZONE_NAME_BY_IANA.get(profile["timezone_iana"], ""),
+    }
+    for country, profile in MARKET_PROFILES.items()
+}
+
+# Common macOS Chrome desktop hardware profiles.  One is drawn per registration
+# (round-robin or seed-stable); the HAR capture baseline is only one candidate.
+BROWSER_PROFILE_POOL = [
+    {
+        "screen_width": 1680,
+        "screen_height": 1050,
+        "hardware_concurrency": 6,
+        "device_memory": 8,
+        "js_heap_size_limit": 4395630592,
+        "device_pixel_ratio": 2,
+    },
+    {
+        "screen_width": 1440,
+        "screen_height": 900,
+        "hardware_concurrency": 8,
+        "device_memory": 8,
+        "js_heap_size_limit": 4294967296,
+        "device_pixel_ratio": 2,
+    },
+    {
+        "screen_width": 1512,
+        "screen_height": 982,
+        "hardware_concurrency": 8,
+        "device_memory": 8,
+        "js_heap_size_limit": 4294967296,
+        "device_pixel_ratio": 2,
+    },
+    {
+        "screen_width": 1680,
+        "screen_height": 1050,
+        "hardware_concurrency": 8,
+        "device_memory": 8,
+        "js_heap_size_limit": 4294967296,
+        "device_pixel_ratio": 2,
+    },
+    {
+        "screen_width": 1728,
+        "screen_height": 1117,
+        "hardware_concurrency": 10,
+        "device_memory": 8,
+        "js_heap_size_limit": 4294967296,
+        "device_pixel_ratio": 2,
+    },
+    {
+        "screen_width": 1800,
+        "screen_height": 1169,
+        "hardware_concurrency": 10,
+        "device_memory": 8,
+        "js_heap_size_limit": 4294967296,
+        "device_pixel_ratio": 2,
+    },
+    {
+        "screen_width": 2056,
+        "screen_height": 1329,
+        "hardware_concurrency": 12,
+        "device_memory": 8,
+        "js_heap_size_limit": 4294967296,
+        "device_pixel_ratio": 2,
+    },
+]
+
+# Stable label per pool index, so the chosen profile is human-readable in logs
+# and in the persisted identity context.
+BROWSER_PROFILE_LABELS = [
+    "desktop-1680x1050-hw6",
+    "desktop-1440x900-hw8",
+    "desktop-1512x982-hw8",
+    "desktop-1680x1050-hw8",
+    "desktop-1728x1117-hw10",
+    "desktop-1800x1169-hw10",
+    "desktop-2056x1329-hw12",
+]
+
+
+def _offset_minutes_for_timezone(tz_name: str, default: int) -> int:
+    """UTC offset in minutes for ``tz_name`` right now (DST-aware).
+
+    Delegates to :func:`sms_tool.geo.clock.offset_minutes_for_timezone` — the
+    same function the Sentinel payload uses, so the browser clock and the PoW
+    clock can no longer disagree.
+    """
+    return _clock.offset_minutes_for_timezone(tz_name, int(default))
+
+
+def _label_for_index(index: int) -> str:
+    if not BROWSER_PROFILE_LABELS:
+        return "browser-profile-0"
+    return BROWSER_PROFILE_LABELS[index % len(BROWSER_PROFILE_LABELS)]
+
+
+def _stable_index(seed: str, n: int) -> int:
+    """Deterministic pool index from a seed (e.g. device_id)."""
+    if n <= 0:
+        return 0
+    digest = hashlib.sha256(str(seed).encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") % n
+
+
+# ---------------------------------------------------------------------------
+# Browser profile rotation pool
+# ---------------------------------------------------------------------------
+class BrowserProfilePool:
+    """Thread-safe rotation over the built-in browser hardware profiles."""
+
+    def __init__(self) -> None:
+        # ``Any`` values: the built-in profiles carry numbers, and the selector
+        # adds the label strings into the same dict (``browser_profile_index`` /
+        # ``browser_fingerprint_profile``), so a narrower value type is wrong.
+        self._profiles: list[dict[str, Any]] = list(BROWSER_PROFILE_POOL)
+        self._index = 0
+        self._lock = threading.Lock()
+
+    def size(self) -> int:
+        return len(self._profiles)
+
+    def next(self) -> dict[str, Any]:
+        """Round-robin: next profile (wraps)."""
+        with self._lock:
+            index = self._index % len(self._profiles)
+            profile = dict(self._profiles[index])
+            self._index += 1
+        profile["browser_profile_index"] = index
+        profile["browser_fingerprint_profile"] = _label_for_index(index)
+        return profile
+
+    def select(self, seed: str | None = None) -> dict[str, Any]:
+        """Deterministic pick by seed; falls back to round-robin if no seed."""
+        if not seed:
+            return self.next()
+        idx = _stable_index(seed, len(self._profiles) or 1)
+        profile = dict(self._profiles[idx % len(self._profiles)])
+        profile["browser_profile_index"] = idx
+        profile["browser_fingerprint_profile"] = _label_for_index(idx)
+        return profile
+
+
+_SHARED_POOL: BrowserProfilePool | None = None
+_SHARED_POOL_LOCK = threading.Lock()
+
+
+def shared_browser_profile_pool(config: Mapping[str, Any] | None = None) -> BrowserProfilePool:
+    """Return the process-lifetime built-in pool.
+
+    ``config`` remains accepted while callers migrate, but profile contents are
+    intentionally not configurable. Static config validation rejects the
+    retired ``registration.browser_profile_pool`` key instead of pretending to
+    apply it.
+    """
+    del config
+    global _SHARED_POOL
+    with _SHARED_POOL_LOCK:
+        if _SHARED_POOL is None:
+            _SHARED_POOL = BrowserProfilePool()
+        return _SHARED_POOL
+
+
+# ---------------------------------------------------------------------------
+# Exit-IP geo detection (mirrors turb's _detect_exit_geo)
+# ---------------------------------------------------------------------------
+# The cache, the endpoint list and the precedence chain now live in
+# ``sms_tool.geo`` (P0-1): the browser path, the protocol path and the payment
+# preflight all resolve through one resolver, so a country measured during
+# preflight is reused here instead of being re-guessed from the credential
+# template, and a failed probe expires after NEGATIVE_TTL instead of poisoning
+# the process forever.
+#
+# ``_GEO_CACHE`` / ``_GEO_CACHE_LOCK`` are no longer the source of truth but are
+# kept: external callers and tests import them, and removing a module-level
+# name would break the patch seams. Keeping the name must not mean keeping every
+# exit forever, so the mirror is bounded like the resolver's own cache.
+_GEO_CACHE: dict[str, dict[str, Any]] = {}
+_GEO_CACHE_LIMIT = 512
+_GEO_CACHE_LOCK = threading.Lock()
+
+
+def _geo_probe_adapter(
+    proxy: str,
+    *,
+    timeout: float,
+    endpoints: Any,
+    need_timezone: bool,
+) -> "_geo.ProxyGeo":
+    """Expose the legacy ``_query_geo_endpoints`` seam to the resolver.
+
+    ``_query_geo_endpoints`` stays module-level and stays the function tests
+    patch; this adapter is what lets the resolver call it without knowing about
+    the browser module.
+    """
+    return _geo.normalize_geo_response(_query_geo_endpoints(proxy, float(timeout)))
+
+
+def _query_geo_endpoints(proxy: str, timeout: float) -> dict[str, Any]:
+    """Query geo endpoints through the proxy; return first usable result.
+
+    Delegates to :func:`sms_tool.geo.probe_exit_geo` so the browser path uses
+    the same endpoint list (and the same curl_cffi-then-urllib transport) as
+    every other caller.  Kept as a module-level function purely because it is
+    the documented patch seam for geo tests.
+    """
+    geo = _geo.probe_exit_geo(proxy, timeout=float(timeout), need_timezone=True)
+    return geo.to_dict() if geo.known else {}
+
+
+def _proxy_cache_key(proxy: str) -> str:
+    """Canonical cache key — ``scheme://user:pass@host:port``.
+
+    Proxy pools arrive in many shapes (including the common
+    ``host:port:user:pass`` form); without normalization geo detection silently
+    fails and the fingerprint falls back to the default US locale, defeating
+    the whole geo-alignment optimization.
+    """
+    from .phone_proxy import normalize_proxy_url
+
+    return normalize_proxy_url(proxy) or str(proxy or "")
+
+
+def detect_proxy_exit_geo(
+    proxy: str | None,
+    *,
+    timeout: float = IP_GEO_TIMEOUT,
+    enabled: bool = AUTO_BROWSER_LOCALE_FROM_IP,
+) -> dict[str, Any]:
+    """Detect the proxy's real exit geo. Never raises; returns ``{}`` on miss.
+
+    Resolves through the process-wide :class:`sms_tool.geo.GeoResolver`, so a
+    geo already measured by the payment preflight is reused instead of being
+    re-probed.  Disabled (or direct/unproxied) calls return ``{}`` so the
+    caller keeps using the configured locale/timezone.
+    """
+    if not enabled or not proxy:
+        return {}
+    key = _proxy_cache_key(proxy)
+    try:
+        geo = _geo.shared_geo_resolver().resolve(
+            key,
+            timeout=float(timeout),
+            need_timezone=True,
+            probe=_geo_probe_adapter,
+        )
+    except Exception:
+        geo = _geo.ProxyGeo()
+    data = geo.to_dict() if geo.known else {}
+    with _GEO_CACHE_LOCK:
+        if len(_GEO_CACHE) >= _GEO_CACHE_LIMIT:
+            _GEO_CACHE.clear()
+        _GEO_CACHE[key] = dict(data)
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Cloud / datacenter ASN detection (mirrors turb's REJECT_CLOUD_PROXY)
+# ---------------------------------------------------------------------------
+# Opt-in only.  A user may legitimately pin a fixed cloud egress to reproduce a
+# captured HAR, so the default must never reject anything — turb ships the same
+# default (``REJECT_CLOUD_PROXY = False``).
+REJECT_CLOUD_PROXY = False
+
+# Keyword list taken from turb-gpt-free-register ``config/browser.py``.  Kept
+# verbatim for traceability.  The generic tails ("hosting", "server", "cloud")
+# can false-positive on some ISP org strings, which is acceptable only because
+# this is diagnostic: enabling it logs a warning, it never blocks a run.
+CLOUD_PROXY_ORG_KEYWORDS = [
+    "amazon",
+    "aws",
+    "google cloud",
+    "google llc",
+    "microsoft",
+    "azure",
+    "digitalocean",
+    "linode",
+    "akamai",
+    "ovh",
+    "hetzner",
+    "oracle",
+    "tencent",
+    "alibaba",
+    "aliyun",
+    "huawei cloud",
+    "vultr",
+    "contabo",
+    "data center",
+    "datacenter",
+    "hosting",
+    "server",
+    "cloud",
+]
+
+
+def classify_proxy_org(value: Any) -> str:
+    """Classify an egress org as ``cloud`` / ``residential`` / ``unknown``.
+
+    Accepts either a full geo mapping (as returned by
+    :func:`detect_proxy_exit_geo`) or a bare org string.
+    """
+    if isinstance(value, Mapping):
+        org = str(value.get("org") or "")
+    else:
+        org = str(value or "")
+    org = org.strip().lower()
+    if not org:
+        return "unknown"
+    if any(keyword in org for keyword in CLOUD_PROXY_ORG_KEYWORDS):
+        return "cloud"
+    return "residential"
+
+
+def is_cloud_proxy(geo: Any, *, enabled: bool = REJECT_CLOUD_PROXY) -> bool:
+    """True when the egress org looks like a cloud/datacenter ASN.
+
+    Returns ``False`` whenever detection is disabled or the org is unknown, so
+    an opt-in caller is never blocked by missing geo data.
+    """
+    if not enabled:
+        return False
+    return classify_proxy_org(geo) == "cloud"
+
+
+# ---------------------------------------------------------------------------
+# Locale / timezone alignment
+# ---------------------------------------------------------------------------
+def locale_profile_key_from_geo(geo: Mapping[str, Any] | None) -> str:
+    if not geo or not AUTO_BROWSER_LOCALE_FROM_IP:
+        return DEFAULT_LOCALE_PROFILE
+    country = str(geo.get("country") or "").upper()
+    return COUNTRY_LOCALE_PROFILE_MAP.get(country, DEFAULT_LOCALE_PROFILE)
+
+
+def build_browser_environment(
+    geo: Mapping[str, Any] | None = None,
+    base_profile: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Single source of truth for one browser registration's fingerprint.
+
+    Merges the chosen hardware ``base_profile`` with the geo-aligned locale /
+    timezone.  Returns a flat dict consumed by ``run_browser_registration``.
+    """
+    key = locale_profile_key_from_geo(geo)
+    locale = dict(BROWSER_LOCALE_PROFILES.get(key, BROWSER_LOCALE_PROFILES[DEFAULT_LOCALE_PROFILE]))
+    if geo and AUTO_BROWSER_LOCALE_FROM_IP:
+        tz = str(geo.get("timezone") or "").strip()
+        if tz:
+            locale["timezone_iana"] = tz
+            locale["timezone_name"] = TIMEZONE_NAME_BY_IANA.get(tz, locale.get("timezone_name", ""))
+    # P1-4: the offset is *always* recomputed from the IANA name, never taken
+    # from the table.  The table's values were written down during DST
+    # ("us" = -7h Pacific Daylight, "gb" = +1h British Summer) and are an hour
+    # wrong for half the year.  A browser reporting -0700 in January next to a
+    # Pacific timezone is a free contradiction for any server-side check.
+    locale["timezone_offset_minutes"] = _offset_minutes_for_timezone(
+        str(locale.get("timezone_iana") or ""),
+        int(locale.get("timezone_offset_minutes", 0)),
+    )
+    profile = dict(base_profile or {})
+    profile.update(
+        {
+            "locale_profile": key,
+            "geo": dict(geo or {}),
+            "navigator_language": locale["navigator_language"],
+            "navigator_languages": list(locale["navigator_languages"]),
+            "accept_language": locale["accept_language"],
+            "timezone_iana": locale["timezone_iana"],
+            "timezone_offset_minutes": int(locale["timezone_offset_minutes"]),
+            "timezone_name": locale.get("timezone_name", ""),
+            "fingerprint_seed": str(profile.get("fingerprint_seed") or ""),
+            # P4 diagnostic: the egress org/ASN class is always carried through so
+            # it shows up in logs and persisted identity even when rejection is off.
+            "proxy_org": str((geo or {}).get("org") or ""),
+            "proxy_org_class": classify_proxy_org(geo),
+        }
+    )
+    return profile
+
+
+# ---------------------------------------------------------------------------
+# Profile consistency self-check
+# ---------------------------------------------------------------------------
+# Mirrors turb-gpt-free-register's ``validate_browser_profile`` (config/browser.py)
+# and aBaiFreeGPT's ``ProtocolEnvironmentProfile.validate()``.  The browser path
+# deliberately does NOT own the UA / client-hints / platform — the anti-detect
+# provider (Roxy, Cloak, Camoufox) does — so turb's UA/Client-Hints cross-checks
+# are intentionally skipped here.  Every field the browser path actually emits is
+# verified instead.
+#
+# Plausible ranges follow aBaiFreeGPT: screen 640..7680 x 480..4320,
+# hardware_concurrency 1..128.
+_SCREEN_WIDTH_RANGE = (640, 7680)
+_SCREEN_HEIGHT_RANGE = (480, 4320)
+_HARDWARE_CONCURRENCY_RANGE = (1, 128)
+_DEVICE_MEMORY_RANGE = (1, 128)
+_DEVICE_PIXEL_RATIO_RANGE = (1.0, 4.0)
+
+
+def _range_issue(profile: Mapping[str, Any], key: str, bounds: tuple[float, float]) -> list[str]:
+    """Return an issue for ``key`` when it is present but out of range.
+
+    Absent keys are ignored on purpose: the browser path lets the anti-detect
+    provider own whatever it does not emit (screen size for Roxy/Cloak/Camoufox,
+    for example), so a missing field is normal here, not a contradiction.
+    """
+    value = profile.get(key)
+    if value is None or value == "":
+        return []
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return [f"{key} must be numeric, got {value!r}"]
+    lo, hi = bounds
+    if not (lo <= number <= hi):
+        return [f"{key}={value!r} is outside the plausible range [{lo}, {hi}]"]
+    return []
+
+
+def validate_browser_profile(profile: Any) -> list[str]:
+    """Return internal contradictions of a browser fingerprint profile.
+
+    An empty list means the profile is internally consistent.  Uses the same
+    contract as :meth:`sms_tool.fingerprint_pool.Fingerprint.validate` on the
+    protocol side, so both paths can be asserted identically in tests.
+    """
+    if not isinstance(profile, Mapping):
+        return [f"profile must be a mapping, got {type(profile).__name__}"]
+    issues: list[str] = []
+
+    language = str(profile.get("navigator_language") or "").strip()
+    if not language:
+        issues.append("navigator_language must not be blank")
+    languages = [str(item) for item in (profile.get("navigator_languages") or [])]
+    if not languages:
+        issues.append("navigator_languages must not be empty")
+    elif language and language not in languages:
+        issues.append(f"navigator_language {language!r} is not in navigator_languages {languages!r}")
+
+    accept_language = str(profile.get("accept_language") or "").strip()
+    if not accept_language:
+        issues.append("accept_language must not be blank")
+    elif language and not accept_language.lower().startswith(language.lower()):
+        issues.append(f"accept_language {accept_language!r} does not start with navigator_language {language!r}")
+
+    timezone = str(profile.get("timezone_iana") or "").strip()
+    if not timezone:
+        issues.append("timezone_iana must not be blank")
+    elif "/" not in timezone:
+        issues.append(f"timezone_iana {timezone!r} is not an IANA name (expected Area/City)")
+
+    # aBaiFreeGPT: hardware_concurrency must be a curated constant (never
+    # os.cpu_count()) and must sit inside a plausible range.
+    issues.extend(_range_issue(profile, "screen_width", _SCREEN_WIDTH_RANGE))
+    issues.extend(_range_issue(profile, "screen_height", _SCREEN_HEIGHT_RANGE))
+    issues.extend(_range_issue(profile, "hardware_concurrency", _HARDWARE_CONCURRENCY_RANGE))
+    issues.extend(_range_issue(profile, "device_memory", _DEVICE_MEMORY_RANGE))
+    issues.extend(_range_issue(profile, "device_pixel_ratio", _DEVICE_PIXEL_RATIO_RANGE))
+    return issues
+
+
+def select_browser_profile(
+    geo: Mapping[str, Any] | None = None,
+    *,
+    seed: str | None = None,
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Pick a browser profile (rotation), then align its locale/tz to geo."""
+    pool = shared_browser_profile_pool(config)
+    base = pool.select(seed) if seed else pool.next()
+    env = build_browser_environment(geo, base)
+    # Carry the rotation metadata through.
+    env["browser_profile_index"] = base.get("browser_profile_index", 0)
+    env["browser_fingerprint_profile"] = base.get(
+        "browser_fingerprint_profile", _label_for_index(base.get("browser_profile_index", 0))
+    )
+    env["fingerprint_seed"] = str(seed or "")
+    # Self-check: surface internal contradictions (locale/timezone mismatch,
+    # out-of-range hardware values, …) without ever blocking registration.
+    # Validation here is diagnostic only — the same non-fatal contract turb uses.
+    issues = validate_browser_profile(env)
+    if issues:
+        logger.debug(
+            "[browser-fingerprint] profile %s has internal contradictions: %s",
+            env.get("browser_fingerprint_profile"),
+            issues,
+        )
+    # P4: opt-in cloud/datacenter egress warning.  Diagnostic only — it never
+    # blocks, because a user may intentionally pin a fixed cloud egress.
+    reject_cloud = False
+    if isinstance(config, Mapping):
+        reg = config.get("registration")
+        if isinstance(reg, Mapping):
+            reject_cloud = bool(reg.get("reject_cloud_proxy", False))
+    if reject_cloud and is_cloud_proxy(env.get("geo"), enabled=True):
+        logger.warning(
+            "[browser-fingerprint] proxy egress looks like a cloud/datacenter ASN "
+            "(org=%r class=%s); OpenAI may de-prioritize this account",
+            env.get("proxy_org"),
+            env.get("proxy_org_class"),
+        )
+    return env
+
+
+__all__ = [
+    "AUTO_BROWSER_LOCALE_FROM_IP",
+    "IP_GEO_TIMEOUT",
+    "IP_GEO_ENDPOINTS",
+    "COUNTRY_LOCALE_PROFILE_MAP",
+    "BROWSER_LOCALE_PROFILES",
+    "TIMEZONE_NAME_BY_IANA",
+    "BROWSER_PROFILE_POOL",
+    "BrowserProfilePool",
+    "shared_browser_profile_pool",
+    "detect_proxy_exit_geo",
+    "REJECT_CLOUD_PROXY",
+    "CLOUD_PROXY_ORG_KEYWORDS",
+    "classify_proxy_org",
+    "is_cloud_proxy",
+    "locale_profile_key_from_geo",
+    "build_browser_environment",
+    "validate_browser_profile",
+    "select_browser_profile",
+]

@@ -1,0 +1,83 @@
+#!/bin/sh
+# Refuse commits that would add credentials or runtime state dumps to git.
+#
+# Installed by scripts/install_git_hooks.py, which sets:
+#     git config core.hooksPath .githooks
+#
+# Background: on 2026-08-30 the config was sharded into proxy.json /
+# runtime.json / payment.json.  config.json was gitignored, the three new
+# filenames were not, and eight plaintext credentials were committed.  A
+# filename-based .gitignore cannot catch the next new filename, so this gate
+# inspects content as well.  See docs/security-exposure-assessment-2026-08-31.md
+#
+# The guard only uses the Python standard library, so any interpreter works.
+# Override with: PYTHON=/path/to/python git commit ...
+# Bypass entirely with: git commit --no-verify  (you own the consequences)
+
+set -e
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+PYTHON_BIN="${PYTHON:-}"
+if [ -z "$PYTHON_BIN" ]; then
+    for candidate in python3 python py; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            PYTHON_BIN="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -z "$PYTHON_BIN" ]; then
+    echo "pre-commit: no python interpreter found on PATH." >&2
+    echo "pre-commit: refusing to commit without the credential guard." >&2
+    echo "pre-commit: set PYTHON=/path/to/python, or use --no-verify to bypass." >&2
+    exit 1
+fi
+
+# Seven gates, all must pass:
+#   1. precommit_guard   -- credentials / runtime state dumps (content-based)
+#   2. line_ending_guard -- a file that mixes CRLF and LF internally.
+#      Added 2026-09-17: 18 of 499 .py files were mixed, which made `git diff`
+#      show whole-file changes and broke byte-exact baseline reconciliation.
+#      See .gitattributes for the storage policy (LF in the index).
+#   3. mailbox_private_import_ratchet -- a new cross-module reach into a hub
+#      module's `_`-prefixed surface. Added 2026-09-17 alongside the line-ending
+#      gate; extended the same day from `mailbox` to six hubs (session_refresh,
+#      mail_otp, sentinel_tokens, http_utils, utils). Fails only when a
+#      per-module consumer set GROWS -- lowering a baseline stays a deliberate,
+#      reviewed act via --update-baseline.
+#   4. sentinel_asset_guard -- a vendored Sentinel asset whose content no longer
+#      matches the SHA256 pin that validate_runtime_bundle() enforces.
+#      Added 2026-09-18 after sentinel-runner.js was rewritten uniformly from
+#      CRLF to LF: gate 2 passed it (the file was uniform, not mixed) and
+#      `git status` could not see it (the index entry was already LF), yet the
+#      raw digest moved, every Sentinel issue call raised, issuance silently
+#      degraded to the legacy issuer, and 126/126 accounts failed.
+#      See docs/audits/scans/scan-2026-09-18-sentinel-runner-hash-mismatch.md
+#   5. format_guard -- the protocol-registration lane must stay
+#      `ruff format`-clean. Added 2026-10-08 after a mangled tuple survived in
+#      auth_flow/otp.py: it was syntactically valid, so ruff check (E9/F63/F7/
+#      F82), compileall and the whole pytest suite were all blind to it. Scope
+#      is the lane (auth_flow/ + registration_*.py), not the whole package, so
+#      the diff stays reviewable. Requires ruff (pinned in constraints-tools.txt).
+#   6. result_schema_check -- the cross-language result-payload contract: the
+#      keys a Python builder returns must equal `result_schema.json`, and every
+#      key a declared C# reader claims must still be read. Added 2026-11-01:
+#      `BackendResultInterpreter` defaults a missing key to 0, so a rename on
+#      the Python side reached the operator as "完成 0/0", not as an error.
+#      Stdlib only, so it runs before dependencies are installed.
+#   7. experiment_ratchet -- every `registration.*` A/B toggle has a recorded
+#      decision in `scripts/experiment_ledger.json`: kind, default, status,
+#      runbook id, and (while it is still read) a keep reason. Added 2026-11-01
+#      because the only record used to be a prose table nothing verified, so a
+#      switch could be added without a hypothesis and removed without a verdict.
+"$PYTHON_BIN" scripts/precommit_guard.py || exit 1
+"$PYTHON_BIN" scripts/line_ending_guard.py || exit 1
+"$PYTHON_BIN" scripts/mailbox_private_import_ratchet.py || exit 1
+"$PYTHON_BIN" scripts/sentinel_asset_guard.py || exit 1
+"$PYTHON_BIN" scripts/format_guard.py || exit 1
+"$PYTHON_BIN" scripts/result_schema_check.py || exit 1
+"$PYTHON_BIN" scripts/experiment_ratchet.py || exit 1
+exit 0

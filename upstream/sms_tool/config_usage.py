@@ -1,0 +1,377 @@
+# -*- coding: utf-8 -*-
+"""Detect configuration keys that nothing in the code ever reads.
+
+Why this exists
+---------------
+Round 6 found 51 keys sitting in the live config shards that no code path
+reads. They are not "set but defaulting" -- the leaf names never appear as a
+string literal anywhere in ``sms_tool`` or ``services``. A one-off audit list
+would go stale the moment somebody wires one up, so the check is a module:
+
+* ``unread_config_keys()`` recomputes the set from source, so the answer is
+  always "as of right now" rather than "as of the last audit".
+* ``--doctor`` reports them, so a config value that silently does nothing is
+  visible instead of assumed working.
+* ``tests/config/test_config_usage.py`` pins the known list, so wiring a key up (or
+  adding a new dead one) fails loudly instead of drifting.
+
+How a key is judged
+-------------------
+A key counts as read when its **leaf name appears as a string literal** in the
+sources. That deliberately ignores identifiers: ``run_single_link_mode()``
+contains ``link_mode`` as part of a function name, and an early draft of this
+check counted that as a hit for the ``paypal.link_mode`` / ``upi.link_mode``
+config keys. Both are genuinely dead.
+
+A key is also treated as read when its full dotted path appears literally,
+which covers table-driven lookups such as ``get("paypal.link_mode")``.
+
+Scope: Python production source only
+------------------------------------
+``SOURCE_DIRS`` is ``sms_tool/`` + ``services/``. The desktop half
+(``SmsWorkbench/``, C#) is **deliberately not scanned**, and the reason is a
+measured one rather than an oversight:
+
+* The criterion is coarse on purpose -- *any* string literal counts, so a key
+  the code only **writes** counts as read. Adding C# to the roots would move
+  ``phone_reuse.smsbower.service_name`` and ``...country_name_zh`` out of the
+  dead set, because ``MainWindow.SmsProvider.cs`` **writes** both
+  (``providerSection["service_name"] = ...``). Nothing reads them back, in
+  either language. Extending the scan would therefore trade **1 fixed false
+  positive for 2 new false negatives**.
+* What C# *does* read is handled explicitly instead, by
+  :data:`CSHARP_CONSUMED_KEYS`: a cited, test-verified exception list. A key
+  belongs there only if a named C# file reads it, and
+  ``tests/config/test_config_usage.py`` fails when a citation stops resolving or stops
+  containing the key -- so the list cannot rot into an excuse.
+
+⇒ Read the report as "no **Python** code path reads this". For the desktop
+half, :data:`CSHARP_CONSUMED_KEYS` is the complete accounting.
+"""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import io
+import json
+import os
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Iterable, NamedTuple
+
+from .config import CFG
+from .kernel.paths import config_dir, runtime_file
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+#: Config shards that make up the runtime configuration.
+SHARD_NAMES = ("config.json", "proxy.json", "runtime.json", "payment.json")
+
+#: Directories holding production source. ``dist/`` and ``runtime/`` contain
+#: source *copies* and must stay excluded or every count comes out wrong.
+SOURCE_DIRS = ("sms_tool", "services")
+SKIP_DIRS = frozenset({"__pycache__", ".venv", "dist", "runtime", ".git", "logs", "sessions"})
+
+#: Keys the Python-only scan would report as dead, but which a **named C# file
+#: actually reads**. Value = repo-relative files that read the key.
+#:
+#: Two rules keep this from becoming a dumping ground:
+#:
+#: * the cited file must exist and must contain the key as a literal --
+#:   ``tests/config/test_config_usage.py::CSharpConsumerTests`` fails otherwise, so a
+#:   citation that stops being true turns the suite red instead of silently
+#:   suppressing a real finding;
+#: * the key must be **read** there, not written. A write is not a consumer --
+#:   that distinction is exactly why C# is not scanned wholesale (see the module
+#:   docstring, and ``phone_reuse.smsbower.service_name`` as the counter-example).
+#:
+#: 2026-09-23: ``runtime.python_path`` added. ``SmsWorkbench/Interop/PythonBackendClient.cs``
+#: resolves the interpreter from it (``_settings.GetString("runtime.python_path", "python")``)
+#: and ``DesktopReadClient.cs`` does the same for the resident read transport, so
+#: ``doctor`` was telling the operator that a working setting had no effect.
+CSHARP_CONSUMED_KEYS: dict[str, tuple[str, ...]] = {
+    "runtime.python_path": (
+        "SmsWorkbench/Interop/PythonBackendClient.cs",
+        "SmsWorkbench/Interop/DesktopReadClient.cs",
+    ),
+}
+
+
+class UnreadKey(NamedTuple):
+    path: str
+    shards: tuple[str, ...]
+    in_example: bool
+
+    @property
+    def leaf(self) -> str:
+        return self.path.rsplit(".", 1)[-1]
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    try:
+        with io.open(str(path), "r", encoding="utf-8-sig", errors="replace") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def iter_leaf_paths(obj: Any, prefix: str = "") -> Iterable[tuple[str, Any]]:
+    """Yield ``(dotted.path, value)`` for every scalar leaf of a nested mapping.
+
+    Keys that themselves contain a dot are skipped: those are mappings keyed by
+    *data* rather than by config names, e.g.
+    ``email_registration.smailr.domain_ids."smailr.com"``. Their values are
+    looked up dynamically, so a literal check would flag every one of them and
+    say nothing actionable.
+    """
+    if not isinstance(obj, dict):
+        return
+    for key, value in obj.items():
+        if "." in str(key):
+            continue
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            yield from iter_leaf_paths(value, path)
+        else:
+            yield path, value
+
+
+def shard_leaf_paths(root: Path | str | None = None) -> dict[str, list[str]]:
+    """Map every config leaf path to the shards that define it."""
+    root = Path(root) if root else config_dir()
+    found: dict[str, list[str]] = {}
+    for name in SHARD_NAMES:
+        path = root / name
+        if not path.is_file():
+            continue
+        for leaf, _value in iter_leaf_paths(_load_json(path)):
+            found.setdefault(leaf, []).append(name)
+    return found
+
+
+def example_leaf_paths(root: Path | str | None = None) -> set[str]:
+    root = Path(root) if root else PROJECT_ROOT
+    return {leaf for leaf, _ in iter_leaf_paths(_load_json(root / "config.example.json"))}
+
+
+def _iter_source_files(root: Path) -> Iterable[Path]:
+    for name in SOURCE_DIRS:
+        base = root / name
+        if not base.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(str(base)):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for filename in filenames:
+                if filename.endswith(".py"):
+                    yield Path(dirpath) / filename
+
+
+@lru_cache(maxsize=1)
+def source_string_literals(root: str | None = None) -> frozenset[str]:
+    """Every string literal that appears in production source.
+
+    Cached: ``--doctor`` calls this once, and re-parsing the whole tree on every
+    lookup would be pointless work. The cache is per-process, which is the
+    lifetime that matters for a CLI invocation.
+    """
+    root_path = Path(root) if root else PROJECT_ROOT
+    literals: set[str] = set()
+    for path in _iter_source_files(root_path):
+        try:
+            with io.open(str(path), "r", encoding="utf-8-sig", errors="replace") as handle:
+                source = handle.read()
+            tree = ast.parse(source, filename=str(path))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                literals.add(node.value)
+    return frozenset(literals)
+
+
+def unread_config_keys(root: Path | str | None = None) -> list[UnreadKey]:
+    """Config keys that are defined but never read as a literal in source.
+
+    Covers two populations, because both are misleading in different ways:
+
+    * keys in the live shards -- they look like active settings and quietly do
+      nothing;
+    * keys documented only in ``config.example.json`` -- nobody's runtime is
+      affected, but anyone copying the template inherits dead settings.
+
+    Both are returned with ``shards`` telling them apart (empty for the
+    example-only ones).
+
+    Keys in :data:`CSHARP_CONSUMED_KEYS` are removed from the live-shard
+    population: the scan sees Python only, and those keys have a cited C#
+    reader, so reporting them would be a false positive.
+    """
+    shard_root = Path(root) if root else None
+    root = Path(root) if root else PROJECT_ROOT
+    literals = source_string_literals(str(root))
+    example = example_leaf_paths(root)
+    shard_paths = shard_leaf_paths(shard_root)
+
+    def is_read(path: str) -> bool:
+        return path.rsplit(".", 1)[-1] in literals or path in literals
+
+    unread: list[UnreadKey] = [
+        UnreadKey(path, tuple(shards), path in example)
+        for path, shards in sorted(shard_paths.items())
+        if not is_read(path) and path not in CSHARP_CONSUMED_KEYS
+    ]
+    documented_only = [UnreadKey(path, (), True) for path in sorted(example - set(shard_paths)) if not is_read(path)]
+    return unread + documented_only
+
+
+CACHE_SCHEMA = "config_usage_cache.v1"
+
+
+def _fingerprint_paths(root: Path, *, explicit_root: bool) -> Iterable[Path]:
+    """Files whose content decides whether the unread-key answer is still valid.
+
+    Mirrors :func:`unread_config_keys`' own scope exactly: production source and
+    ``config.example.json`` under ``root``, plus the config shards -- which live
+    at ``config_dir()`` for the default root but at ``root`` for an explicit one
+    (that is how the test fixtures build their tree).
+    """
+    yield from _iter_source_files(root)
+    yield root / "config.example.json"
+    shard_base = root if explicit_root else config_dir()
+    for name in SHARD_NAMES:
+        yield shard_base / name
+
+
+def _cache_fingerprint(root: Path, *, explicit_root: bool) -> str:
+    digest = hashlib.sha256()
+    for path in _fingerprint_paths(root, explicit_root=explicit_root):
+        try:
+            stat = path.stat()
+        except OSError:
+            digest.update(f"{path}|missing\n".encode("utf-8", "replace"))
+            continue
+        digest.update(f"{path}|{stat.st_mtime_ns}|{stat.st_size}\n".encode("utf-8", "replace"))
+    return digest.hexdigest()
+
+
+def _default_cache_path() -> Path:
+    # The cache is a runtime artifact next to the other generated state, so it
+    # follows the same runtime directory the logs and SQLite index use.
+    return runtime_file(CFG, "cache/config_usage.json")
+
+
+def _read_cache(path: Path, fingerprint: str) -> list[UnreadKey] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or raw.get("schema") != CACHE_SCHEMA:
+        return None
+    if raw.get("fingerprint") != fingerprint:
+        return None
+    entries = raw.get("keys")
+    if not isinstance(entries, list):
+        return None
+    keys: list[UnreadKey] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return None
+        path_value = entry.get("path")
+        shards = entry.get("shards") or []
+        if not isinstance(path_value, str) or not isinstance(shards, list):
+            return None
+        keys.append(UnreadKey(path_value, tuple(str(s) for s in shards), bool(entry.get("in_example"))))
+    return keys
+
+
+def _write_cache(path: Path, fingerprint: str, keys: list[UnreadKey]) -> None:
+    payload = {
+        "schema": CACHE_SCHEMA,
+        "fingerprint": fingerprint,
+        "keys": [{"path": key.path, "shards": list(key.shards), "in_example": key.in_example} for key in keys],
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        # Advisory data: a read-only runtime directory must not turn --doctor
+        # into a failure. The next run simply recomputes.
+        return
+
+
+def cached_unread_config_keys(
+    root: Path | str | None = None,
+    cache_path: Path | str | None = None,
+) -> list[UnreadKey]:
+    """``unread_config_keys`` with a cross-process, mtime-keyed cache.
+
+    The scan parses every production source file (~750 files, ~3 s) and
+    ``--doctor`` runs on the desktop first launch, so recomputing it on every
+    invocation is the difference between a 3.6 s and a sub-second probe. The
+    cache key is a fingerprint of ``(path, mtime_ns, size)`` over exactly the
+    files the answer depends on; any edit, add or delete invalidates it without
+    a TTL.
+
+    Every cache failure (missing, corrupt, unwritable, schema drift) degrades to
+    a fresh scan -- this probe is advisory and must never make ``--doctor``
+    fail.
+    """
+    root_path = Path(root) if root else PROJECT_ROOT
+    explicit_root = root is not None
+    cache_file = Path(cache_path) if cache_path is not None else _default_cache_path()
+    try:
+        fingerprint = _cache_fingerprint(root_path, explicit_root=explicit_root)
+    except OSError:
+        return unread_config_keys(root)
+    cached = _read_cache(cache_file, fingerprint)
+    if cached is not None:
+        return cached
+    keys = unread_config_keys(root)
+    _write_cache(cache_file, fingerprint, keys)
+    return keys
+
+
+def format_unread_report(keys: list[UnreadKey]) -> str:
+    """Human-readable block for ``--doctor``. ASCII only: the CI runner's
+    stdout is cp1252 and a non-Latin-1 print aborts the step.
+
+    The wording says **Python** on purpose. The detector scans ``sms_tool/`` and
+    ``services/``, so "no code reads this" would be an overclaim -- see the
+    module docstring and :data:`CSHARP_CONSUMED_KEYS`.
+
+    The exclusion note is emitted **unconditionally**, including when nothing is
+    unread. It describes what the detector refused to judge, which is just as
+    true for an empty result -- and the empty result is precisely what CI sees,
+    because its ``config.json`` is a copy of ``config.example.json``. Until
+    2026-09-23 this returned early on the empty case and dropped the note, so
+    ``--doctor`` silently failed to say which keys it was not judging; that is
+    the "silent exclusion" this report exists to prevent, and it stayed
+    invisible locally because a real operator config is never empty.
+    """
+    live = [k for k in keys if k.shards]
+    documented = [k for k in keys if not k.shards]
+    lines: list[str] = []
+    if live:
+        lines.append(f"  {len(live)} live-shard key(s) set but never read by Python source:")
+        for key in live:
+            marker = "  <- also in config.example.json" if key.in_example else ""
+            lines.append(f"    - {key.path}  [{', '.join(key.shards)}]{marker}")
+    if documented:
+        lines.append(f"  {len(documented)} key(s) documented in config.example.json only:")
+        for key in documented:
+            lines.append(f"    - {key.path}")
+    if keys:
+        lines.append("  These values have no effect. Remove them or wire them up.")
+    else:
+        lines.append("  (none - every configured key is read by Python source or a cited C# consumer)")
+    if CSHARP_CONSUMED_KEYS:
+        lines.append(
+            f"  (excluded: {len(CSHARP_CONSUMED_KEYS)} key(s) read by the desktop -- "
+            + ", ".join(sorted(CSHARP_CONSUMED_KEYS))
+            + ")"
+        )
+    return "\n".join(lines)

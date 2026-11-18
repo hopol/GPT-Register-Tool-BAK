@@ -1,0 +1,1064 @@
+"""Async proxy pool server with upstream rotation and health checks.
+
+Zero external dependencies -- pure asyncio + struct + socket.
+Clients always speak SOCKS5 to the listener; upstreams may be reached either
+over SOCKS5 (``socks5`` / ``socks5h`` -- remote DNS by passing hostnames
+un-resolved) or over an HTTP CONNECT tunnel (``http`` / ``https``).
+
+The HTTP side matters because every residential provider we buy hands out
+``http://`` endpoints: a pool that only spoke SOCKS5 upstream had nothing to
+dial and exited with "no upstreams configured" on a perfectly good pool file.
+
+Usage:
+    from sms_tool.proxy.pool import Socks5Server, UpstreamProxy
+    server = Socks5Server("127.0.0.1", 18080, upstreams)
+    asyncio.run(server.run())
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import ipaddress
+import json
+import logging
+import socket
+import struct
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, TYPE_CHECKING
+
+# ``entry`` is stdlib-only and imports nothing from this package, so the
+# single-authority parser/masker can be imported eagerly: a function-level
+# import here would be one more edge for the delayed-import ratchet to carry.
+from .entry import _mask_credentials, parse_proxy
+
+if TYPE_CHECKING:
+    from .health import ProxyHealthTracker
+
+logger = logging.getLogger("proxy_pool")
+
+# ──────────────────── SOCKS5 protocol constants ────────────────────
+
+_SOCKS5_VER = 0x05
+_NO_AUTH = 0x00
+_USERPASS = 0x02
+_NO_ACCEPTABLE = 0xFF
+
+# RFC 1929 username/password sub-negotiation: version byte and success status.
+_USERPASS_VER = 0x01
+_AUTH_SUCCESS = 0x00
+
+_CMD_CONNECT = 0x01
+_ATYP_IPV4 = 0x01
+_ATYP_DOMAIN = 0x03
+_ATYP_IPV6 = 0x04
+
+_REP_SUCCEEDED = 0x00
+_REP_GENERAL_FAILURE = 0x01
+_REP_CONN_REFUSED = 0x05
+_REP_CMD_NOT_SUPPORTED = 0x07
+_REP_ADDR_NOT_SUPPORTED = 0x08
+
+# Upstream schemes reached with an RFC 7231 CONNECT tunnel instead of SOCKS5.
+HTTP_UPSTREAM_SCHEMES = ("http", "https")
+SOCKS5_UPSTREAM_SCHEMES = ("socks5", "socks5h")
+UPSTREAM_SCHEMES = SOCKS5_UPSTREAM_SCHEMES + HTTP_UPSTREAM_SCHEMES
+
+
+# ──────────────────── Credential-safe display ────────────────────
+
+
+def _redact_label(value: str) -> str:
+    """Mask any inline credentials in a human-facing upstream label.
+
+    ``from_url`` defaults the label to the caller's raw URL, and a residential
+    provider hands out ``scheme://user:pass@host:port``. That label is printed
+    by the health/relay logs, returned by :meth:`UpstreamProxy.to_dict` and
+    served verbatim by the HTTP stats endpoint -- so keeping the raw URL there
+    published the password to every one of those sinks. Measured 2026-10-25: a
+    pool entry written in URL form produced a label carrying the password in
+    full, and that label reached ``/stats`` and the log sinks unchanged.
+
+    The masking rules are the single-authority ones from ``proxy.entry``
+    (``_mask_credentials``); re-implementing the regexes here is how the two
+    drift apart. Called at construction *and* at serialisation so an explicit
+    label that carries a URL is masked too.
+    """
+    text = str(value or "")
+    if not text:
+        return ""
+    return _mask_credentials(text)
+
+
+# ──────────────────── Data classes ────────────────────
+
+
+#: One dialled route: ``(scheme, host, port, username, password)``.
+#: Used as the failover exclusion key -- see ``UpstreamProxy.identity``.
+UpstreamIdentity = tuple[str, str, int, str, str]
+
+
+@dataclass
+class UpstreamProxy:
+    host: str
+    port: int
+    username: str = ""
+    password: str = ""
+    label: str = ""
+    priority: int = 0  # lower = higher priority; highest-priority tier selected first
+    # How *this process* dials the upstream: socks5/socks5h use the SOCKS5
+    # handshake, http/https use an HTTP CONNECT tunnel.  Clients always speak
+    # SOCKS5 to our listener regardless.
+    scheme: str = "socks5"
+    healthy: bool = True
+    last_check: float = 0.0
+    fail_count: int = 0
+    success_count: int = 0
+    total_connections: int = 0
+
+    @property
+    def addr(self) -> str:
+        return f"{self.host}:{self.port}"
+
+    @property
+    def identity(self) -> UpstreamIdentity:
+        """Exclusion key for the failover loop — the whole dialled route.
+
+        Deliberately **not** ``addr``. A rotating provider exposes many sticky
+        sessions through one ``host:port``: the live registration pool is ten
+        lajiao ``region-VN`` entries on ``us.lajiaohttp.net:2000`` that differ
+        only in the sid suffix. Excluding by address therefore made the *first*
+        failed session exclude all ten, so ``_pick_upstream`` returned ``None``
+        on the first retry and the pool refused the connection instead of
+        moving to the next sid. Measured 2026-10-26: with that pool shape the
+        retry loop tried exactly one upstream.
+
+        The password is part of the key because two sessions on one account
+        can differ only in the Kookeey-style ``BASE-CC-SESSION-TTL`` password.
+        The tuple is process-local and never printed.
+        """
+        return (self.scheme, self.host.lower(), self.port, self.username, self.password)
+
+    @property
+    def proxy_url(self) -> str:
+        """Reconstruct a ``scheme://[user:pass@]host:port`` URL for this upstream.
+
+        P1-2: this is the string fed into ``ProxyHealthTracker`` so the SOCKS5
+        pool's health (which lives only in this process's memory) becomes visible to
+        the registration/remail paths that consume the same egress proxies via the
+        shared on-disk tracker. ``ProxyHealthTracker.key()`` derives the same
+        ``host:port#sid-hash`` it would from a raw proxy URL, so the scheme has to
+        be the entry's own -- reporting an ``http://`` upstream as ``socks5://``
+        would still key correctly but would lie to anything that reads the URL.
+        """
+        auth = ""
+        if self.username:
+            pwd = f":{self.password}" if self.password else ""
+            auth = f"{self.username}{pwd}@"
+        return f"{self.scheme}://{auth}{self.host}:{self.port}"
+
+    @classmethod
+    def from_url(cls, url: str, label: str = "", priority: int = 0) -> UpstreamProxy:
+        """Parse a proxy URL into UpstreamProxy.
+
+        Delegates to the single-authority ``proxy_entry`` parser: standard
+        ``scheme://user:pass@host:port``, the Kookeey / ippeak non-standard
+        4-segment ``host:port:user:pass`` format, IPv6 literals and no-auth
+        forms. Malformed input raises ``ValueError`` -- a garbage URL used to
+        fall through to a permissive ``urlparse`` fallback and become a live
+        ``127.0.0.1:1080`` upstream, which is exactly the failure a pool
+        server must refuse loudly instead of serving.
+        """
+        entry = parse_proxy(url, default_scheme="socks5")
+        if entry is None:
+            # The raw URL is part of the message, and the caller logs it
+            # (``start_proxy_pool`` does), so it is masked here as well.
+            raise ValueError(f"unparseable proxy url: {_redact_label(url)!r}")
+        if not label:
+            # Keep the legacy label convention: URL form -> raw URL;
+            # bare 4-segment form -> user@host:port. Both are masked before
+            # they can reach a log line or the stats payload.
+            label = url if "://" in url else f"{entry.username}@{entry.host}:{entry.port}"
+        return cls(
+            host=entry.host,
+            port=entry.port,
+            username=entry.username,
+            password=entry.password,
+            label=_redact_label(label),
+            priority=priority,
+            scheme=entry.scheme or "socks5",
+        )
+
+    def __repr__(self) -> str:  # dataclass repr would print the password
+        return (
+            f"UpstreamProxy(label={self.label!r}, addr={self.addr!r}, scheme={self.scheme!r}, "
+            f"priority={self.priority}, healthy={self.healthy})"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            # Serialisation is a second gate on purpose: an UpstreamProxy built
+            # directly (tests, a future loader) never went through ``from_url``.
+            "label": _redact_label(self.label),
+            "addr": self.addr,
+            "scheme": self.scheme,
+            "priority": self.priority,
+            "healthy": self.healthy,
+            "fail_count": self.fail_count,
+            "success_count": self.success_count,
+            "total_connections": self.total_connections,
+            "last_check": (
+                datetime.fromtimestamp(self.last_check, tz=timezone.utc).isoformat() if self.last_check > 0 else None
+            ),
+        }
+
+
+@dataclass
+class PoolStats:
+    total_connections: int = 0
+    active_connections: int = 0
+    total_errors: int = 0
+    uptime_start: float = field(default_factory=time.time)
+
+
+# ──────────────────── SOCKS5 helpers ────────────────────
+
+
+async def _read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
+    data = await reader.readexactly(n)
+    if len(data) != n:
+        raise ConnectionError("incomplete read")
+    return data
+
+
+async def _read_socks5_addr(reader: asyncio.StreamReader, addr_type: int) -> tuple[str, int]:
+    if addr_type == _ATYP_IPV4:
+        raw = await _read_exact(reader, 4)
+        host = socket.inet_ntoa(raw)
+    elif addr_type == _ATYP_DOMAIN:
+        length = (await _read_exact(reader, 1))[0]
+        host = (await _read_exact(reader, length)).decode("ascii", errors="replace")
+    elif addr_type == _ATYP_IPV6:
+        raw = await _read_exact(reader, 16)
+        host = socket.inet_ntop(socket.AF_INET6, raw)
+    else:
+        raise ValueError(f"unsupported ATYP: {addr_type:#x}")
+    port_raw = await _read_exact(reader, 2)
+    port = struct.unpack("!H", port_raw)[0]
+    return host, port
+
+
+def _encode_socks5_addr(host: str, port: int) -> bytes:
+    """Encode host:port into SOCKS5 address bytes."""
+    buf = bytearray()
+    try:
+        raw = socket.inet_aton(host)
+        buf.append(_ATYP_IPV4)
+        buf.extend(raw)
+    except OSError:
+        try:
+            raw = socket.inet_pton(socket.AF_INET6, host)
+            buf.append(_ATYP_IPV6)
+            buf.extend(raw)
+        except OSError:
+            domain = host.encode("ascii")
+            buf.append(_ATYP_DOMAIN)
+            buf.append(len(domain))
+            buf.extend(domain)
+    buf.extend(struct.pack("!H", port))
+    return bytes(buf)
+
+
+def _build_socks5_reply(reply: int, bind_host: str = "0.0.0.0", bind_port: int = 0) -> bytes:
+    return bytes([_SOCKS5_VER, reply, 0x00]) + _encode_socks5_addr(bind_host, bind_port)
+
+
+def _is_loopback(host: str) -> bool:
+    """True for an empty/``localhost``/loopback literal (used by the sticky warning)."""
+    text = str(host or "").strip().lower()
+    if text in {"", "localhost"}:
+        return True
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
+
+
+# ──────────────────── upstream handshakes ────────────────────
+
+
+async def _socks5_handshake(
+    r: asyncio.StreamReader,
+    w: asyncio.StreamWriter,
+    upstream: UpstreamProxy,
+    dest_host: str,
+    dest_port: int,
+    dest_atyp: int,
+    timeout: float,
+) -> None:
+    """RFC 1928 greeting + auth + CONNECT on an already-open socket."""
+    # greeting to upstream
+    if upstream.username and upstream.password:
+        w.write(bytes([_SOCKS5_VER, 0x02, _NO_AUTH, _USERPASS]))
+    else:
+        w.write(bytes([_SOCKS5_VER, 0x01, _NO_AUTH]))
+    await w.drain()
+
+    resp = await asyncio.wait_for(_read_exact(r, 2), timeout=timeout)
+    method = resp[1]
+
+    if method == _USERPASS:
+        # RFC 1929 username/password auth
+        user = upstream.username.encode()
+        pwd = upstream.password.encode()
+        auth = bytearray([0x01, len(user)])
+        auth.extend(user)
+        auth.append(len(pwd))
+        auth.extend(pwd)
+        w.write(bytes(auth))
+        await w.drain()
+        auth_resp = await asyncio.wait_for(_read_exact(r, 2), timeout=timeout)
+        if auth_resp[1] != 0x00:
+            raise ConnectionError("upstream auth failed")
+    elif method == _NO_ACCEPTABLE:
+        raise ConnectionError("upstream: no acceptable auth method")
+
+    # CONNECT request to upstream -- preserve original ATYP for remote DNS
+    connect_req = bytearray([_SOCKS5_VER, _CMD_CONNECT, 0x00])
+    connect_req.append(dest_atyp)
+    if dest_atyp == _ATYP_DOMAIN:
+        domain = dest_host.encode("ascii")
+        connect_req.append(len(domain))
+        connect_req.extend(domain)
+    elif dest_atyp == _ATYP_IPV4:
+        connect_req.extend(socket.inet_aton(dest_host))
+    elif dest_atyp == _ATYP_IPV6:
+        connect_req.extend(socket.inet_pton(socket.AF_INET6, dest_host))
+    connect_req.extend(struct.pack("!H", dest_port))
+    w.write(bytes(connect_req))
+    await w.drain()
+
+    reply = await asyncio.wait_for(_read_exact(r, 4), timeout=timeout)
+    if reply[1] != _REP_SUCCEEDED:
+        raise ConnectionError(f"upstream CONNECT reply: {reply[1]:#x}")
+    # consume bind address
+    bind_atyp = reply[3]
+    if bind_atyp == _ATYP_IPV4:
+        await _read_exact(r, 4)
+    elif bind_atyp == _ATYP_DOMAIN:
+        ln = (await _read_exact(r, 1))[0]
+        await _read_exact(r, ln)
+    elif bind_atyp == _ATYP_IPV6:
+        await _read_exact(r, 16)
+    await _read_exact(r, 2)  # bind port
+
+
+def _http_connect_authority(host: str, port: int) -> str:
+    """RFC 7231 authority form -- IPv6 literals must be bracketed."""
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+async def _http_connect_handshake(
+    r: asyncio.StreamReader,
+    w: asyncio.StreamWriter,
+    upstream: UpstreamProxy,
+    dest_host: str,
+    dest_port: int,
+    timeout: float,
+) -> None:
+    """Open an HTTP CONNECT tunnel on an already-open socket.
+
+    Every residential provider we buy exposes ``http://`` endpoints, so the pool
+    has to speak CONNECT to be usable at all.  Credentials travel as
+    ``Proxy-Authorization: Basic`` -- the same username/password pair the SOCKS5
+    path sends via RFC 1929.
+    """
+    authority = _http_connect_authority(dest_host, dest_port)
+    lines = [f"CONNECT {authority} HTTP/1.1", f"Host: {authority}"]
+    if upstream.username:
+        token = base64.b64encode(f"{upstream.username}:{upstream.password}".encode("utf-8")).decode("ascii")
+        lines.append(f"Proxy-Authorization: Basic {token}")
+    lines.extend(("", ""))
+    w.write("\r\n".join(lines).encode("ascii"))
+    await w.drain()
+
+    status = await asyncio.wait_for(r.readline(), timeout=timeout)
+    if not status:
+        raise ConnectionError("upstream closed during CONNECT")
+    try:
+        code = int(status.split()[1])
+    except (IndexError, ValueError) as exc:
+        raise ConnectionError(f"upstream CONNECT: unparsable status {status[:40]!r}") from exc
+
+    # Drain the response headers; the tunnel starts at the blank line.
+    while True:
+        line = await asyncio.wait_for(r.readline(), timeout=timeout)
+        if line in (b"\r\n", b"\n", b""):
+            break
+
+    if not 200 <= code < 300:
+        raise ConnectionError(f"upstream CONNECT reply: HTTP {code}")
+
+
+# ──────────────────── Server ────────────────────
+
+
+class Socks5Server:
+    def __init__(
+        self,
+        listen_host: str = "127.0.0.1",
+        listen_port: int = 18080,
+        upstreams: list[UpstreamProxy] | None = None,
+        stats_port: int = 18081,
+        stats_host: str = "",
+        health_check_interval: float = 30.0,
+        health_check_timeout: float = 5.0,
+        connect_timeout: float = 10.0,
+        pipe_buf_size: int = 65536,
+        health_check_target_host: str = "cloudflare.com",
+        health_check_target_port: int = 443,
+        health_check_fail_threshold: int = 3,
+        health_tracker: ProxyHealthTracker | None = None,
+        sticky_session_ttl: float = 0.0,
+        edge_probe: Callable[[str, float], tuple[bool, str]] | None = None,
+    ) -> None:
+        self._listen_host = listen_host
+        self._listen_port = listen_port
+        self._upstreams: list[UpstreamProxy] = upstreams or []
+        self._stats_port = stats_port
+        # The stats endpoint is read-only but still operator-facing inventory
+        # (every upstream address and its health), so it does not follow
+        # ``listen_host``: binding the SOCKS5 listener to 0.0.0.0 used to drag
+        # ``/stats`` along with it and publish the pool to the LAN. Loopback
+        # unless the operator names a different host explicitly.
+        self._stats_host = str(stats_host or "").strip()
+        self._health_check_interval = health_check_interval
+        self._health_check_timeout = health_check_timeout
+        # P0-3: the health probe used to hit connectivity-check.gstatic.com, which
+        # has nothing to do with OpenAI/Cloudflare reachability. ChatGPT sits behind
+        # Cloudflare, so we probe cloudflare.com instead -- a successful CONNECT
+        # there is a far better signal that the proxy can actually serve traffic.
+        self._health_check_target_host = health_check_target_host
+        self._health_check_target_port = health_check_target_port
+        # P0-3: death only after this many *consecutive* failures; recovery needs
+        # the same count of consecutive successes (see _apply_health hysteresis).
+        # A single blip no longer kills an upstream, and one lucky success no
+        # longer whitelists a bad one.
+        try:
+            threshold = int(health_check_fail_threshold)
+        except (TypeError, ValueError):
+            threshold = 3
+        self._health_check_fail_threshold = max(1, threshold)
+        # P1-2: optional shared health tracker (ProxyHealthTracker). When set, every
+        # health event funnelled through _apply_health is mirrored into the tracker's
+        # on-disk state so the registration/remail paths see the SOCKS5 pool's
+        # outcomes. Left None to keep the pool purely in-memory (default/tests).
+        self._health_tracker: ProxyHealthTracker | None = health_tracker
+        # P2-5: optional sticky sessions.  A client that offers SOCKS5
+        # username/password auth names its session by username; connections with
+        # the same username reuse one upstream for ``sticky_session_ttl`` seconds
+        # (sliding: each reuse refreshes it), so a registration does not hop
+        # exits mid-flow.  ``0`` disables the feature and preserves the historical
+        # per-connection round-robin exactly.
+        try:
+            ttl = float(sticky_session_ttl)
+        except (TypeError, ValueError):
+            ttl = 0.0
+        self._sticky_session_ttl = ttl if ttl > 0 else 0.0
+        self._sticky_sessions: dict[str, tuple[UpstreamProxy, float]] = {}
+        # P1-3 (opt-in): when set, the health probe issues a real HTTP request
+        # through the upstream and classifies the ChatGPT edge instead of only
+        # completing a tunnel.  That is what lets a Cloudflare-403 exit be marked
+        # unhealthy; the default (None) keeps the tunnel-only probe unchanged.
+        # Injected rather than imported so proxy_pool keeps its zero-runtime-import
+        # design -- the composition root (start_proxy_pool.py) wires the concrete
+        # probe.  Signature: ``(proxy_url, timeout) -> (healthy, error)``.
+        self._edge_probe = edge_probe
+        self._connect_timeout = connect_timeout
+        self._pipe_buf_size = pipe_buf_size
+        self._rr_idx = 0
+        self._stats = PoolStats()
+        self._server: asyncio.Server | None = None
+        self._stats_server: asyncio.Server | None = None
+        self._health_task: asyncio.Task[None] | None = None
+        self._shutdown = asyncio.Event()
+        self._active_tasks: set[asyncio.Task[None]] = set()
+
+    # ── lifecycle ──
+
+    def _stats_bind_host(self) -> str:
+        """Host the HTTP stats endpoint binds to (loopback unless overridden).
+
+        Small on purpose: it is the single expression the lifecycle and the
+        tests both read, so "the stats endpoint does not follow ``--host``" is
+        a property of this method rather than of a line buried in ``start``.
+        """
+        return self._stats_host or "127.0.0.1"
+
+    async def run(self) -> None:
+        await self.start()
+        try:
+            await self._shutdown.wait()
+        finally:
+            await self.stop()
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(self._on_client, self._listen_host, self._listen_port)
+        addrs = ", ".join(str(s.getsockname()) for s in self._server.sockets or [])
+        logger.info("SOCKS5 proxy pool listening on %s", addrs)
+        if self._sticky_session_ttl > 0:
+            logger.info(
+                "sticky sessions enabled (ttl=%.0fs): clients that offer SOCKS5 "
+                "username/password auth are pinned by username",
+                self._sticky_session_ttl,
+            )
+            if not _is_loopback(self._listen_host):
+                logger.warning(
+                    "sticky sessions are enabled on non-loopback %s; any client username is accepted as a session key",
+                    self._listen_host,
+                )
+
+        if self._stats_port > 0:
+            stats_host = self._stats_bind_host()
+            self._stats_server = await asyncio.start_server(self._on_stats, stats_host, self._stats_port)
+            logger.info("Stats endpoint on %s:%d", stats_host, self._stats_port)
+            if not _is_loopback(stats_host):
+                logger.warning(
+                    "stats endpoint is bound to non-loopback %s and has no authentication; "
+                    "anyone who can reach %s:%d can read the upstream inventory",
+                    stats_host,
+                    stats_host,
+                    self._stats_port,
+                )
+
+        if self._upstreams:
+            self._health_task = asyncio.create_task(self._health_check_loop())
+        else:
+            logger.warning("No upstream proxies configured -- server will reject all connections")
+
+    async def stop(self) -> None:
+        logger.info("Shutting down proxy pool...")
+        if self._health_task:
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except asyncio.CancelledError:
+                pass
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+        if self._stats_server:
+            self._stats_server.close()
+            await self._stats_server.wait_closed()
+        # wait for active connections (max 5s)
+        if self._active_tasks:
+            logger.info("Waiting for %d active connections...", len(self._active_tasks))
+            done, _ = await asyncio.wait(self._active_tasks, timeout=5.0)
+            for t in self._active_tasks - done:
+                t.cancel()
+        logger.info("Proxy pool stopped")
+
+    def request_shutdown(self) -> None:
+        self._shutdown.set()
+
+    # ── client handler ──
+
+    async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task:
+            self._active_tasks.add(task)
+        try:
+            await self._handle_client(reader, writer)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self._stats.total_errors += 1
+            logger.debug("connection error: %s", exc)
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            if task:
+                self._active_tasks.discard(task)
+
+    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # Phase 1: greeting
+        hdr = await asyncio.wait_for(_read_exact(reader, 2), timeout=10)
+        ver, nmethods = hdr[0], hdr[1]
+        if ver != _SOCKS5_VER:
+            return
+        methods = await _read_exact(reader, nmethods)
+        session_key = ""
+        if self._sticky_session_ttl > 0 and _USERPASS in methods:
+            # Offer USERPASS so a client can name its sticky session.  The
+            # username is the key and the password is accepted but ignored --
+            # there is no user database, and the listener is loopback by default
+            # (``start`` warns when it is not).
+            writer.write(bytes([_SOCKS5_VER, _USERPASS]))
+            await writer.drain()
+            session_key = await self._read_userpass(reader)
+            if session_key is None:
+                return
+            writer.write(bytes([_USERPASS_VER, _AUTH_SUCCESS]))
+            await writer.drain()
+        else:
+            writer.write(bytes([_SOCKS5_VER, _NO_AUTH]))
+            await writer.drain()
+
+        # Phase 2: CONNECT request
+        req_hdr = await asyncio.wait_for(_read_exact(reader, 4), timeout=10)
+        ver, cmd, _, atyp = req_hdr
+        if ver != _SOCKS5_VER:
+            return
+        if cmd != _CMD_CONNECT:
+            writer.write(_build_socks5_reply(_REP_CMD_NOT_SUPPORTED))
+            await writer.drain()
+            return
+
+        try:
+            dest_host, dest_port = await _read_socks5_addr(reader, atyp)
+        except (ValueError, asyncio.IncompleteReadError):
+            writer.write(_build_socks5_reply(_REP_ADDR_NOT_SUPPORTED))
+            await writer.drain()
+            return
+
+        # Phase 3: pick upstream and connect (with retry across upstreams)
+        # ``tried`` holds upstream *identities*, not addresses: a provider pool
+        # usually holds several sticky sessions on one host:port, and excluding
+        # by address would collapse them into a single attempt (see
+        # ``UpstreamProxy.identity``).
+        #
+        # There is deliberately **no** ``max_retries`` knob. ``tried`` grows by one
+        # identity per failure and ``_pick_upstream`` excludes it, so this loop
+        # already terminates after at most ``len(upstreams)`` attempts; a separate
+        # cap could only make it stop while healthy exits remain. The old
+        # ``max_retries`` argument did exactly nothing (stored, never read) while
+        # reading like a working knob, which is worse than having none: the pool
+        # shapes we actually buy -- several sessions behind one ``host:port`` --
+        # depend on every session being tried, so an operator "lowering retries"
+        # would have had no observable effect either way.
+        tried: set[UpstreamIdentity] = set()
+        up_r = up_w = None
+        upstream = None
+        max_attempts = len(self._upstreams) + 1
+        for _attempt in range(max_attempts):
+            upstream = self._pick_upstream(exclude=tried, sticky_key=session_key)
+            if upstream is None:
+                break
+            try:
+                up_r, up_w = await asyncio.wait_for(
+                    self._connect_through_upstream(upstream, dest_host, dest_port, atyp),
+                    timeout=self._connect_timeout,
+                )
+                break  # success
+            # Generic connect-phase failures are the point of this retry loop.
+            # pi-lens-ignore: no-boolean-in-except
+            except Exception as exc:
+                # P0-3: route live-failures through the same hysteresis as the
+                # health probe, so a single blip in real traffic does not instantly
+                # kill an upstream (and recovery must still earn consecutive success).
+                # P1-2: the error string is mirrored into the shared tracker too.
+                await self._apply_health_async(upstream, False, error=str(exc)[:120])
+                upstream.total_connections += 1
+                self._stats.total_errors += 1
+                tried.add(upstream.identity)
+                # A failed sticky binding is stale: drop it so the retry (and the
+                # next connection with this session name) re-binds instead of
+                # retrying the same dead exit.
+                if session_key:
+                    bound = self._sticky_sessions.get(session_key)
+                    if bound is not None and bound[0] is upstream:
+                        self._sticky_sessions.pop(session_key, None)
+                logger.warning(
+                    "upstream %s connect failed for %s:%d (attempt %d/%d): %s",
+                    upstream.label,
+                    dest_host,
+                    dest_port,
+                    _attempt + 1,
+                    max_attempts,
+                    exc,
+                )
+                upstream = None
+                continue
+
+        if upstream is None or up_r is None or up_w is None:
+            writer.write(_build_socks5_reply(_REP_GENERAL_FAILURE))
+            await writer.drain()
+            return
+
+        upstream.success_count += 1
+        upstream.total_connections += 1
+        self._stats.total_connections += 1
+        self._stats.active_connections += 1
+
+        # Phase 4: success reply and relay
+        writer.write(_build_socks5_reply(_REP_SUCCEEDED))
+        await writer.drain()
+
+        logger.debug(
+            "relay %s:%d via %s [%s]",
+            dest_host,
+            dest_port,
+            upstream.label,
+            upstream.addr,
+        )
+        try:
+            await self._relay(reader, writer, up_r, up_w)
+        finally:
+            self._stats.active_connections -= 1
+            try:
+                up_w.close()
+                await up_w.wait_closed()
+            except Exception:
+                pass
+
+    # ── upstream selection ──
+
+    def _apply_health(
+        self,
+        upstream: UpstreamProxy,
+        success: bool,
+        error: str = "",
+        *,
+        persist: bool = True,
+    ) -> None:
+        """Update an upstream's health with hysteresis (P0-3).
+
+        Death: an upstream goes unhealthy only after ``fail_threshold`` *consecutive*
+        failures. Recovery: once unhealthy, it must reach ``fail_count == 0`` (i.e.
+        several consecutive successes) before it is trusted again -- a single lucky
+        success does not whitelist a bad proxy, and a single blip does not kill a
+        good one.
+
+        P1-2: when a shared ``health_tracker`` is configured, the same event is
+        mirrored into it so the registration/remail paths observe this proxy's health.
+        The SOCKS5 pool's own selection logic still uses in-memory state only.
+        """
+        if success:
+            upstream.fail_count = max(0, upstream.fail_count - 1)
+        else:
+            upstream.fail_count = min(self._health_check_fail_threshold, upstream.fail_count + 1)
+        if upstream.healthy:
+            upstream.healthy = upstream.fail_count < self._health_check_fail_threshold
+        else:
+            upstream.healthy = upstream.fail_count == 0
+        upstream.last_check = time.time()
+
+        if persist and self._health_tracker is not None:
+            self._health_tracker.record(upstream.proxy_url, ok=success, error=error)
+
+    async def _apply_health_async(
+        self,
+        upstream: UpstreamProxy,
+        success: bool,
+        error: str = "",
+    ) -> None:
+        """Update memory immediately and persist shared state off the event loop."""
+        tracker = self._health_tracker
+        self._apply_health(upstream, success, error=error, persist=False)
+        if tracker is not None:
+            await asyncio.to_thread(
+                tracker.record,
+                upstream.proxy_url,
+                ok=success,
+                error=error,
+            )
+
+    async def _read_userpass(self, reader: asyncio.StreamReader) -> str | None:
+        """Read an RFC 1929 greeting and return the username as a sticky key.
+
+        Wire form: ``[ver, ulen, uname, plen, passwd]``.  The password is
+        consumed and ignored; there is no user database and the listener is
+        loopback by default.  Returns ``None`` on a malformed greeting so the
+        caller closes the connection.
+        """
+        try:
+            ver = (await asyncio.wait_for(_read_exact(reader, 1), timeout=10))[0]
+            ulen = (await asyncio.wait_for(_read_exact(reader, 1), timeout=10))[0]
+            username = (await _read_exact(reader, ulen)).decode("utf-8", "replace") if ulen else ""
+            plen = (await asyncio.wait_for(_read_exact(reader, 1), timeout=10))[0]
+            if plen:
+                await _read_exact(reader, plen)
+        except (asyncio.IncompleteReadError, TimeoutError, OSError):
+            return None
+        if ver != _USERPASS_VER:
+            return None
+        return username.strip()
+
+    def _pick_upstream(
+        self,
+        exclude: set[UpstreamIdentity] | None = None,
+        sticky_key: str = "",
+    ) -> UpstreamProxy | None:
+        if not self._upstreams:
+            return None
+        exclude = exclude or set()
+        sticky = bool(sticky_key) and self._sticky_session_ttl > 0
+        now = time.monotonic()
+        if sticky:
+            bound = self._sticky_sessions.get(sticky_key)
+            if bound is not None:
+                upstream, expires = bound
+                if expires > now and upstream.healthy and upstream.identity not in exclude:
+                    # Sliding TTL: keep the account pinned while it is active.
+                    self._sticky_sessions[sticky_key] = (upstream, now + self._sticky_session_ttl)
+                    return upstream
+                # Expired, unhealthy, or excluded by an in-flight retry: the
+                # binding is stale, so drop it and re-pick below.
+                self._sticky_sessions.pop(sticky_key, None)
+        selected: UpstreamProxy | None = None
+        healthy = [u for u in self._upstreams if u.healthy and u.identity not in exclude]
+        if healthy:
+            # priority-based selection: pick from the lowest priority number tier,
+            # round-robin within that tier.
+            min_pri = min(u.priority for u in healthy)
+            tier = [u for u in healthy if u.priority == min_pri]
+            idx = self._rr_idx % len(tier)
+            self._rr_idx += 1
+            selected = tier[idx]
+        else:
+            # Half-open: nothing healthy. Instead of fail-open-resurrecting the
+            # entire pool (which would spray every dead upstream with live traffic
+            # at once), probe a single candidate -- the least-bad, rotating among
+            # ties -- so a recovery is discovered incrementally rather than by
+            # mass-resurrecting.
+            candidates = sorted(
+                (u for u in self._upstreams if u.identity not in exclude),
+                key=lambda u: (u.fail_count, u.priority),
+            )
+            if candidates:
+                selected = candidates[self._rr_idx % len(candidates)]
+                self._rr_idx += 1
+        if sticky and selected is not None:
+            self._sticky_sessions[sticky_key] = (selected, now + self._sticky_session_ttl)
+            self._prune_sticky_sessions(now)
+        return selected
+
+    def _prune_sticky_sessions(self, now: float | None = None) -> None:
+        """Drop expired bindings; called on every new binding (cheap, bounded)."""
+        moment = time.monotonic() if now is None else now
+        expired = [key for key, (_upstream, expires) in self._sticky_sessions.items() if expires <= moment]
+        for key in expired:
+            self._sticky_sessions.pop(key, None)
+
+    # ── upstream handshake ──
+
+    def _open_upstream(self, upstream: UpstreamProxy):
+        """Dial the upstream, wrapping in TLS when the scheme asks for it."""
+        return asyncio.open_connection(upstream.host, upstream.port, ssl=upstream.scheme == "https")
+
+    async def _handshake(
+        self,
+        r: asyncio.StreamReader,
+        w: asyncio.StreamWriter,
+        upstream: UpstreamProxy,
+        dest_host: str,
+        dest_port: int,
+        dest_atyp: int,
+        timeout: float,
+    ) -> None:
+        """Open the tunnel: SOCKS5 CONNECT or HTTP CONNECT, per upstream scheme."""
+        if upstream.scheme in HTTP_UPSTREAM_SCHEMES:
+            await _http_connect_handshake(r, w, upstream, dest_host, dest_port, timeout)
+        else:
+            await _socks5_handshake(r, w, upstream, dest_host, dest_port, dest_atyp, timeout)
+
+    async def _connect_through_upstream(
+        self,
+        upstream: UpstreamProxy,
+        dest_host: str,
+        dest_port: int,
+        dest_atyp: int,
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        r, w = await self._open_upstream(upstream)
+
+        try:
+            await self._handshake(r, w, upstream, dest_host, dest_port, dest_atyp, self._connect_timeout)
+        except Exception:
+            w.close()
+            await w.wait_closed()
+            raise
+
+        return r, w
+
+    # ── bidirectional relay ──
+
+    async def _relay(
+        self,
+        client_r: asyncio.StreamReader,
+        client_w: asyncio.StreamWriter,
+        up_r: asyncio.StreamReader,
+        up_w: asyncio.StreamWriter,
+    ) -> None:
+        async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+            try:
+                while True:
+                    data = await src.read(self._pipe_buf_size)
+                    if not data:
+                        break
+                    dst.write(data)
+                    await dst.drain()
+            except (asyncio.CancelledError, ConnectionError, OSError):
+                pass
+            finally:
+                try:
+                    if dst.can_write_eof():
+                        dst.write_eof()
+                except Exception:
+                    pass
+
+        t1 = asyncio.create_task(_pipe(client_r, up_w))
+        t2 = asyncio.create_task(_pipe(up_r, client_w))
+        await asyncio.gather(t1, t2, return_exceptions=True)
+        for t in (t1, t2):
+            if not t.done():
+                t.cancel()
+
+    # ── health check ──
+
+    async def _check_upstream(self, upstream: UpstreamProxy, test_host: str, test_port: int) -> tuple[bool, str]:
+        """Return ``(healthy, error)`` for one upstream.
+
+        Default: complete the real, scheme-aware handshake (tunnel-only).
+        Opt-in (an ``edge_probe`` was injected): issue a real HTTP request and
+        let the probe classify the ChatGPT edge, so a Cloudflare-403 exit is
+        reported unhealthy.  The blocking probe runs in a worker thread so the
+        event loop keeps serving clients.
+        """
+        if self._edge_probe is not None:
+            try:
+                return await asyncio.to_thread(self._edge_probe, upstream.proxy_url, self._health_check_timeout)
+            except Exception as exc:  # a probe that raises must not kill the loop
+                return False, f"edge_probe_error:{type(exc).__name__}"
+        try:
+            # The probe runs the *same* handshake real traffic runs
+            # (scheme-aware, and with the upstream's credentials).
+            # The old inline probe always sent a no-auth SOCKS5
+            # greeting, so an upstream that requires RFC 1929 auth
+            # was reported dead even while serving fine -- and it
+            # could not express an HTTP upstream at all.
+            r, w = await asyncio.wait_for(
+                self._open_upstream(upstream),
+                timeout=self._health_check_timeout,
+            )
+            try:
+                await self._handshake(
+                    r,
+                    w,
+                    upstream,
+                    test_host,
+                    test_port,
+                    _ATYP_DOMAIN,
+                    self._health_check_timeout,
+                )
+                return True, ""
+            finally:
+                w.close()
+                await w.wait_closed()
+        except Exception as exc:
+            return False, str(exc)[:120]
+
+    async def _health_check_loop(self) -> None:
+        # P0-3: probe the configured target (cloudflare.com:443 by default) instead
+        # of connectivity-check.gstatic.com -- a green check now means the proxy can
+        # actually reach ChatGPT's edge (Cloudflare sits in front of it), so one probe
+        # serves both connectivity and edge-reachability. Each result is fed through
+        # self._apply_health, which enforces the consecutive-failure threshold and the
+        # hysteresis recovery -- no single blip kills an upstream, and no single lucky
+        # success whitelists a dead one.
+        test_host = self._health_check_target_host
+        test_port = self._health_check_target_port
+        while True:
+            # Probe BEFORE the first sleep. ``UpstreamProxy.healthy`` defaults to
+            # True and ``start()`` launches this loop as a task, so the old
+            # ``sleep``-first order meant a pool that came up with dead exits
+            # served live traffic for a full interval (30s by default) with no
+            # evidence behind a single "healthy" verdict. The hysteresis below is
+            # careful to never kill an upstream on one blip; it should not have to
+            # compensate for a first round that never ran either.
+            try:
+                for upstream in self._upstreams:
+                    was_healthy = upstream.healthy
+                    success, probe_error = await self._check_upstream(upstream, test_host, test_port)
+
+                    # P1-2: a shared tracker (if configured) sees the same event.
+                    await self._apply_health_async(
+                        upstream,
+                        success,
+                        error=probe_error if not success else "",
+                    )
+
+                    if upstream.healthy != was_healthy:
+                        level = logging.INFO if upstream.healthy else logging.WARNING
+                        logger.log(
+                            level,
+                            "upstream %s [%s]: %s → %s (fail_count=%d)",
+                            upstream.label,
+                            upstream.addr,
+                            "healthy" if was_healthy else "unhealthy",
+                            "healthy" if upstream.healthy else "unhealthy",
+                            upstream.fail_count,
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("health check error: %s", exc)
+            # The sleep has its own cancellation arm: with the probe moved ahead of
+            # it, a shutdown now arrives here rather than inside the try above.
+            try:
+                await asyncio.sleep(self._health_check_interval)
+            except asyncio.CancelledError:
+                break
+
+    # ── stats HTTP endpoint ──
+
+    async def _on_stats(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            # read HTTP request line + headers (minimal parsing)
+            request_line = await asyncio.wait_for(reader.readline(), timeout=5)
+            # consume remaining headers
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=5)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+
+            req_str = request_line.decode("ascii", errors="replace")
+            path = req_str.split(" ")[1] if len(req_str.split(" ")) > 1 else "/"
+
+            if path == "/health":
+                any_healthy = any(u.healthy for u in self._upstreams)
+                status = 200 if any_healthy else 503
+                body = json.dumps({"healthy": any_healthy}).encode()
+            else:
+                status = 200
+                body = json.dumps(self._stats_json(), indent=2).encode()
+
+            header = (
+                f"HTTP/1.1 {status} {'OK' if status == 200 else 'Service Unavailable'}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode()
+            writer.write(header + body)
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            writer.close()
+
+    def _stats_json(self) -> dict[str, Any]:
+        return {
+            "status": "running",
+            "uptime_seconds": round(time.time() - self._stats.uptime_start, 1),
+            "active_connections": self._stats.active_connections,
+            "total_connections": self._stats.total_connections,
+            "total_errors": self._stats.total_errors,
+            "sticky_sessions": len(self._sticky_sessions),
+            "health_probe": "edge" if self._edge_probe is not None else "tunnel",
+            "upstreams": [u.to_dict() for u in self._upstreams],
+        }

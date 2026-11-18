@@ -1,0 +1,760 @@
+using SmsWorkbench;
+
+namespace SmsWorkbench.Tests;
+
+public sealed class BackendCommandPlannerTests
+{
+    // ── Registration ────────────────────────────────────────────────────
+
+    [Fact]
+    public void CreatePoolRegistration_IncludesCountWorkersAndProxy()
+    {
+        var plan = BackendCommandPlanner.CreatePoolRegistration(
+            count: 5,
+            proxyPool: new[] { "http://proxy1:8080", "http://proxy2:8080" },
+            workers: 3);
+
+        Assert.Equal("邮箱池注册", plan.TaskName);
+        Assert.Equal(BackendAccountResultKind.None, plan.ResultKind);
+        Assert.Contains("--count", plan.Arguments);
+        Assert.Contains("5", plan.Arguments);
+        Assert.Contains("--workers", plan.Arguments);
+        Assert.Contains("3", plan.Arguments);
+        Assert.Contains("--no-phone-reuse", plan.Arguments);
+        Assert.Contains("--desktop-ipc", plan.Arguments);
+        Assert.Contains("--proxy", plan.Arguments);
+        Assert.Contains("http://proxy1:8080", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreatePoolRegistration_WithoutProxyPool_OmitsProxyArgs()
+    {
+        var plan = BackendCommandPlanner.CreatePoolRegistration(count: 1, proxyPool: Array.Empty<string>());
+        Assert.DoesNotContain("--proxy", plan.Arguments);
+        Assert.DoesNotContain("--proxy-pool", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateMailboxFileRegistration_IncludesRegistrationAtOnly()
+    {
+        var plan = BackendCommandPlanner.CreateMailboxFileRegistration(
+            "测试注册",
+            "--mailbox-file",
+            "C:\\test.txt",
+            count: 3,
+            workers: 4,
+            registrationAtOnly: true,
+            proxyPool: new[] { "http://proxy:8080" });
+
+        Assert.Equal("测试注册", plan.TaskName);
+        Assert.Contains("--registration-at-only", plan.Arguments);
+        Assert.Contains("--no-phone-reuse", plan.Arguments);
+        Assert.Contains("--mailbox-file", plan.Arguments);
+        Assert.Contains("C:\\test.txt", plan.Arguments);
+        Assert.Contains("--desktop-ipc", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateMailboxFileRegistration_WithoutRegistrationAtOnly_OmitsFlag()
+    {
+        var plan = BackendCommandPlanner.CreateMailboxFileRegistration(
+            "测试", "--mailbox-file", "C:\\test.txt", 1, 2,
+            registrationAtOnly: false, proxyPool: Array.Empty<string>());
+
+        Assert.DoesNotContain("--registration-at-only", plan.Arguments);
+        Assert.Contains("--no-phone-reuse", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateMailboxFileRegistration_WithDisable2fa_AddsNo2faFlag()
+    {
+        var plan = BackendCommandPlanner.CreateMailboxFileRegistration(
+            "测试", "--chatai-mailbox-file", "C:\\test.txt", 5, 5,
+            registrationAtOnly: true, proxyPool: Array.Empty<string>(), disable2fa: true);
+
+        Assert.Contains("--no-2fa", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateMailboxFileRegistration_DefaultOmitsNo2faFlag()
+    {
+        var plan = BackendCommandPlanner.CreateMailboxFileRegistration(
+            "测试", "--chatai-mailbox-file", "C:\\test.txt", 5, 5,
+            registrationAtOnly: true, proxyPool: Array.Empty<string>());
+
+        Assert.DoesNotContain("--no-2fa", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateMailboxFileRegistration_WithPromotionCheck_AddsPostRegistrationFlag()
+    {
+        var plan = BackendCommandPlanner.CreateMailboxFileRegistration(
+            "测试", "--mailbox-file", "C:\\test.txt", 2, 2,
+            registrationAtOnly: true,
+            proxyPool: Array.Empty<string>(),
+            checkPromotion: true);
+
+        Assert.Contains("--check-promotion-after-registration", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateRemailTargetRegistration_WithDisable2fa_AddsNo2faFlag()
+    {
+        var plan = BackendCommandPlanner.CreateRemailTargetRegistration(
+            count: 5, workers: 5, proxyPool: Array.Empty<string>(), disable2fa: true);
+
+        Assert.Contains("--no-2fa", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateRemailTargetRegistration_WithPromotionCheck_AddsPostRegistrationFlag()
+    {
+        var plan = BackendCommandPlanner.CreateRemailTargetRegistration(
+            count: 5,
+            workers: 5,
+            proxyPool: Array.Empty<string>(),
+            checkPromotion: true);
+
+        Assert.Contains("--check-promotion-after-registration", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreatePhoneRegistration_IncludesPhoneRegisterFlag()
+    {
+        var plan = BackendCommandPlanner.CreatePhoneRegistration(
+            count: 2,
+            proxyPool: new[] { "http://proxy:8080" });
+
+        // The label carries no vendor: this plan does not override
+        // `phone_reuse.source`, so naming one would misreport the run.
+        Assert.Equal("手机号注册", plan.TaskName);
+        Assert.DoesNotContain("--phone-source", plan.Arguments);
+        Assert.Contains("--phone-register", plan.Arguments);
+        Assert.Contains("--desktop-ipc", plan.Arguments);
+        Assert.Contains("--count", plan.Arguments);
+        Assert.Contains("2", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateCfWorkerRegistration_IncludesDomainAndRegistrationAtOnly()
+    {
+        var plan = BackendCommandPlanner.CreateCfWorkerRegistration(
+            domain: "example.cloud",
+            count: 5,
+            workers: 3,
+            proxyPool: Array.Empty<string>());
+
+        Assert.Equal("CFWorker邮箱注册", plan.TaskName);
+        Assert.Contains("--buy-cfworker-mailbox", plan.Arguments);
+        Assert.Contains("--cfworker-domain", plan.Arguments);
+        Assert.Contains("example.cloud", plan.Arguments);
+        Assert.Contains("--registration-at-only", plan.Arguments);
+        Assert.Contains("--desktop-ipc", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateRemailTargetRegistration_IncludesTargetAt200()
+    {
+        var plan = BackendCommandPlanner.CreateRemailTargetRegistration(
+            count: 10, workers: 2, proxyPool: Array.Empty<string>());
+
+        Assert.Contains("--target-at200", plan.Arguments);
+        Assert.Contains("--desktop-ipc", plan.Arguments);
+        Assert.Contains("10", plan.Arguments);
+        Assert.Contains("--buy-remail-mailbox", plan.Arguments);
+        Assert.Contains("--remail-service-mode", plan.Arguments);
+        Assert.Contains("purchase", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateSmailrRegistration_IncludesDomain()
+    {
+        var plan = BackendCommandPlanner.CreateSmailrRegistration(
+            domain: "smailr.com",
+            count: 3,
+            workers: 2,
+            proxyPool: Array.Empty<string>());
+
+        Assert.Contains("--buy-smailr-mailbox", plan.Arguments);
+        Assert.Contains("--desktop-ipc", plan.Arguments);
+        Assert.Contains("--smailr-domain", plan.Arguments);
+        Assert.Contains("smailr.com", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateRerunFailedRegistration_DelegatesToMailboxFileRegistration()
+    {
+        var plan = BackendCommandPlanner.CreateRerunFailedRegistration(
+            mailboxArgument: "--chatai-mailbox-file",
+            mailboxFile: "C:\\failed.txt",
+            count: 5,
+            proxyPool: Array.Empty<string>());
+
+        Assert.Contains("重新注册失败账号", plan.TaskName);
+        Assert.Contains("5", plan.TaskName);
+        Assert.Contains("--chatai-mailbox-file", plan.Arguments);
+    }
+
+    // ── One-click SMS ───────────────────────────────────────────────────
+
+    [Fact]
+    public void CreateOneClickSms_SingleEmail_UsesInlineArgs()
+    {
+        var plan = BackendCommandPlanner.CreateOneClickSms(
+            mailboxArgument: "--mailbox-file",
+            mailboxFile: "C:\\mbox.txt",
+            emails: new[] { "user@example.com" },
+            sessionFile: "C:\\session.json",
+            proxyPool: Array.Empty<string>());
+
+        Assert.Contains("--email", plan.Arguments);
+        Assert.Contains("user@example.com", plan.Arguments);
+        Assert.Contains("--session-file", plan.Arguments);
+        Assert.DoesNotContain("--email-file", plan.Arguments);
+        Assert.Empty(plan.TempFiles);
+    }
+
+    [Fact]
+    public void CreateOneClickSms_MultipleEmails_WritesTempFile()
+    {
+        var plan = BackendCommandPlanner.CreateOneClickSms(
+            mailboxArgument: "--mailbox-file",
+            mailboxFile: "C:\\mbox.txt",
+            emails: new[] { "a@b.com", "c@d.com" },
+            sessionFile: "",
+            proxyPool: Array.Empty<string>());
+
+        Assert.Contains("--email-file", plan.Arguments);
+        Assert.DoesNotContain("--email", plan.Arguments);
+        Assert.Single(plan.TempFiles);
+    }
+
+    [Fact]
+    public void CreateOneClickSms_WithPhoneSource_EmitsTheResolvedProvider()
+    {
+        var plan = BackendCommandPlanner.CreateOneClickSms(
+            mailboxArgument: "--mailbox-file",
+            mailboxFile: "C:\\mbox.txt",
+            emails: new[] { "user@example.com" },
+            sessionFile: "C:\\session.json",
+            proxyPool: Array.Empty<string>(),
+            phoneSource: "herosms");
+
+        int index = -1;
+        for (int i = 0; i < plan.Arguments.Count; i++)
+        {
+            if (plan.Arguments[i] == "--phone-source")
+            {
+                index = i;
+                break;
+            }
+        }
+        Assert.True(index >= 0, "--phone-source missing from " + string.Join(" ", plan.Arguments));
+        Assert.Equal("herosms", plan.Arguments[index + 1]);
+    }
+
+    [Fact]
+    public void CreateOneClickSms_WithoutPhoneSource_OmitsTheOverride()
+    {
+        // Blank means "let the backend read phone_reuse.source", which is the
+        // same key the settings page writes. Emitting `--phone-source ""` would
+        // instead be rejected by argparse.
+        foreach (string? blank in new[] { null, "", "   " })
+        {
+            var plan = BackendCommandPlanner.CreateOneClickSms(
+                mailboxArgument: "--mailbox-file",
+                mailboxFile: "C:\\mbox.txt",
+                emails: new[] { "user@example.com" },
+                sessionFile: "C:\\session.json",
+                proxyPool: Array.Empty<string>(),
+                phoneSource: blank);
+
+            Assert.DoesNotContain("--phone-source", plan.Arguments);
+        }
+    }
+
+    // ── Account liveness ────────────────────────────────────────────────
+
+    [Fact]
+    public void CreateAccountScan_MultipleEmails_UsesEmailFile()
+    {
+        var plan = BackendCommandPlanner.CreateAccountScan(
+            emails: new[] { "a@b.com", "c@d.com" },
+            sessionFile: "",
+            workers: 4,
+            autoRelogin: false,
+            proxyPool: Array.Empty<string>());
+
+        Assert.Contains("--email-file", plan.Arguments);
+        Assert.DoesNotContain("--email", plan.Arguments);
+        Assert.Contains("--desktop-ipc", plan.Arguments);
+        Assert.Single(plan.TempFiles);
+        Assert.Equal(BackendAccountResultKind.Liveness, plan.ResultKind);
+    }
+
+    [Fact]
+    public void CreateAccountScan_SingleEmail_UsesInlineEmail()
+    {
+        var plan = BackendCommandPlanner.CreateAccountScan(
+            emails: new[] { "user@example.com" },
+            sessionFile: "C:\\session.json",
+            workers: 4,
+            autoRelogin: true,
+            proxyPool: Array.Empty<string>());
+
+        Assert.Contains("--email", plan.Arguments);
+        Assert.Contains("user@example.com", plan.Arguments);
+        Assert.Contains("--quota-auto-relogin", plan.Arguments);
+        Assert.Contains("--quota-relogin-timeout", plan.Arguments);
+        Assert.Contains("300", plan.Arguments);
+        Assert.Contains("--quota-batch-timeout", plan.Arguments);
+        Assert.Contains("1680", plan.Arguments);
+        Assert.Contains("--quota-account-timeout", plan.Arguments);
+        Assert.Contains("120", plan.Arguments);
+        Assert.Single(plan.Arguments, a => a == "--quota-batch-timeout");
+        Assert.Single(plan.Arguments, a => a == "--quota-account-timeout");
+        Assert.Contains("--desktop-ipc", plan.Arguments);
+        // Recovery must outlive the widened 1680s batch deadline.
+        Assert.Equal(30 * 60 * 1000, plan.TimeoutMilliseconds);
+    }
+
+    [Fact]
+    public void CreateAccountScan_AutoRelogin_WidensBatchBudget()
+    {
+        var plan = BackendCommandPlanner.CreateAccountScan(
+            emails: new[] { "user@example.com" },
+            sessionFile: "",
+            workers: 4,
+            autoRelogin: true,
+            proxyPool: Array.Empty<string>());
+
+        // Each flag is emitted exactly once. Recovery needs room for an OTP
+        // round trip per account; the probe-only figure is 840.
+        var args = plan.Arguments.ToList();
+        Assert.Single(args, a => a == "--quota-batch-timeout");
+        Assert.Single(args, a => a == "--quota-account-timeout");
+        Assert.Equal("1680", args[args.IndexOf("--quota-batch-timeout") + 1]);
+        // The per-account figure still bounds the probe phase only.
+        Assert.Equal("120", args[args.IndexOf("--quota-account-timeout") + 1]);
+    }
+
+    [Fact]
+    public void CreateAccountScan_NoRelogin_KeepsProbeOnlyBudget()
+    {
+        var plan = BackendCommandPlanner.CreateAccountScan(
+            emails: new[] { "user@example.com" },
+            sessionFile: "",
+            workers: 4,
+            autoRelogin: false,
+            proxyPool: Array.Empty<string>());
+
+        var args = plan.Arguments.ToList();
+        Assert.Equal("840", args[args.LastIndexOf("--quota-batch-timeout") + 1]);
+        Assert.Equal(15 * 60 * 1000, plan.TimeoutMilliseconds);
+    }
+
+    [Fact]
+    public void CreateAccountScan_AutoReloginDisabled_OmitsReloginArgs()
+    {
+        var plan = BackendCommandPlanner.CreateAccountScan(
+            emails: new[] { "user@example.com" },
+            sessionFile: "C:\\session.json",
+            workers: 4,
+            autoRelogin: false,
+            proxyPool: Array.Empty<string>());
+
+        Assert.DoesNotContain("--quota-auto-relogin", plan.Arguments);
+        Assert.DoesNotContain("--quota-relogin-timeout", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreatePromotionCheck_UsesVersionedIpcEnvelope()
+    {
+        var plan = BackendCommandPlanner.CreatePromotionCheck(
+            emails: new[] { "user@example.com" },
+            workers: 4,
+            proxyPool: Array.Empty<string>());
+
+        Assert.Contains("--check-promotion", plan.Arguments);
+        Assert.Contains("--desktop-ipc", plan.Arguments);
+        Assert.Equal(BackendAccountResultKind.Promotion, plan.ResultKind);
+    }
+
+    [Fact]
+    public void AccountResultKind_SurvivesALocalizedTaskLabelChange()
+    {
+        var original = BackendCommandPlanner.CreatePromotionCheck(
+            new[] { "user@example.com" }, workers: 1, proxyPool: Array.Empty<string>());
+        var renamed = original with { TaskName = "Promotion (1)" };
+
+        Assert.True(BackendResultInterpreter.HasAccountResults(renamed.ResultKind));
+        Assert.Equal("账号优惠检测", BackendResultInterpreter.AccountResultTitle(renamed.ResultKind));
+    }
+
+    [Fact]
+    public void CreateQuotaUsageProbe_IncludesEmail()
+    {
+        var plan = BackendCommandPlanner.CreateQuotaUsageProbe(
+            email: "user@example.com",
+            refreshTimeoutSeconds: 120,
+            proxyPool: Array.Empty<string>());
+
+        Assert.Contains("--quota-usage", plan.Arguments);
+        Assert.Contains("--email", plan.Arguments);
+        Assert.Contains("user@example.com", plan.Arguments);
+        Assert.Contains("--refresh-timeout", plan.Arguments);
+        Assert.Contains("120", plan.Arguments);
+    }
+
+    // ── Deletion ────────────────────────────────────────────────────────
+
+    [Fact]
+    public void CreateDeleteAccount_IncludesDesktopIpc()
+    {
+        var plan = BackendCommandPlanner.CreateDeleteAccount("user@example.com");
+        Assert.Contains("--delete-account", plan.Arguments);
+        Assert.Contains("--email", plan.Arguments);
+        Assert.Contains("user@example.com", plan.Arguments);
+        Assert.Contains("--desktop-ipc", plan.Arguments);
+        Assert.Equal(120000, plan.TimeoutMilliseconds);
+    }
+
+    [Fact]
+    public void CreateBatchDeleteAccounts_WritesTempFile()
+    {
+        var plan = BackendCommandPlanner.CreateBatchDeleteAccounts(
+            new[] { "a@b.com", "c@d.com" }, workers: 6);
+        Assert.Contains("--email-file", plan.Arguments);
+        Assert.Contains("--workers", plan.Arguments);
+        Assert.Contains("6", plan.Arguments);
+        Assert.Single(plan.TempFiles);
+        Assert.Equal(120000, plan.TimeoutMilliseconds);
+    }
+
+    // ── Import ──────────────────────────────────────────────────────────
+
+    [Fact]
+    public void CreateAccountImport_NormalizesTarget()
+    {
+        var plan = BackendCommandPlanner.CreateAccountImport(
+            "SUB2API",
+            new[] { "user@example.com" });
+        Assert.Contains("--import-target", plan.Arguments);
+        Assert.Contains("sub2api", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateAccountImport_DefaultsToCpa()
+    {
+        var plan = BackendCommandPlanner.CreateAccountImport(
+            "unknown",
+            new[] { "user@example.com" });
+        Assert.Contains("cpa", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateSingleAccountImport_WritesTempFile()
+    {
+        var plan = BackendCommandPlanner.CreateSingleAccountImport(
+            "cpa",
+            "user@example.com");
+        Assert.Contains("--email-file", plan.Arguments);
+        Assert.Single(plan.TempFiles);
+    }
+
+    // ── Export conversion ───────────────────────────────────────────────
+
+    [Fact]
+    public void CreateSessionConversion_IncludesAllArgs()
+    {
+        var plan = BackendCommandPlanner.CreateSessionConversion(
+            "C:\\source.json",
+            "sub2api",
+            "C:\\output.json");
+
+        Assert.Contains("--convert-session-json", plan.Arguments);
+        Assert.Contains("C:\\source.json", plan.Arguments);
+        Assert.Contains("--convert-format", plan.Arguments);
+        Assert.Contains("sub2api", plan.Arguments);
+        Assert.Contains("--convert-output", plan.Arguments);
+        Assert.Contains("C:\\output.json", plan.Arguments);
+    }
+
+    // ── Refresh / maintenance ───────────────────────────────────────────
+
+    [Fact]
+    public void CreateRefreshSession_IncludesEmailAndSessionFile()
+    {
+        var plan = BackendCommandPlanner.CreateRefreshSession(
+            "user@example.com",
+            "C:\\session.json");
+        Assert.Contains("--refresh-session", plan.Arguments);
+        Assert.Contains("--session-file", plan.Arguments);
+    }
+
+    [Fact]
+    public void CreateRebuildSqlite_HasMinimalArgs()
+    {
+        var plan = BackendCommandPlanner.CreateRebuildSqlite();
+        Assert.Equal("重建SQLite索引", plan.TaskName);
+        Assert.Contains("--rebuild-sqlite", plan.Arguments);
+        Assert.Single(plan.Arguments);
+    }
+
+    // ── Inbox ───────────────────────────────────────────────────────────
+
+    [Fact]
+    public void CreateViewInbox_IncludesEmailAndLimit()
+    {
+        var plan = BackendCommandPlanner.CreateViewInbox(
+            email: "user@example.com",
+            limit: 10,
+            mailboxArgument: "--mailbox-file",
+            mailboxLine: "user@example.com----password----clientId----refreshToken",
+            sessionFile: "C:\\session.json",
+            mailboxProxy: "http://proxy:8080",
+            remailToken: "abc123",
+            tempDirectory: null!);
+
+        Assert.Contains("--view-inbox", plan.Arguments);
+        Assert.Contains("--email", plan.Arguments);
+        Assert.Contains("user@example.com", plan.Arguments);
+        Assert.Contains("--inbox-limit", plan.Arguments);
+        Assert.Contains("10", plan.Arguments);
+        Assert.Contains("--proxy", plan.Arguments);
+        Assert.Contains("http://proxy:8080", plan.Arguments);
+        Assert.Single(plan.Environment);
+        Assert.Equal("abc123", plan.Environment["REMAIL_SERVICE_TOKEN"]);
+    }
+
+    [Fact]
+    public void CreateChangeEmail_UsesProviderWorkersAndTemporaryEmailFile()
+    {
+        var plan = BackendCommandPlanner.CreateChangeEmail(
+            new[] { "a@example.com", "b@example.com" },
+            provider: "icloud",
+            mailboxFile: "C:\\mailboxes.txt",
+            workers: 2,
+            smailrDomain: "",
+            cfworkerDomain: "",
+            proxyPool: new[] { "http://proxy:8080" },
+            tempDirectory: null!);
+
+        Assert.Contains("--change-email", plan.Arguments);
+        Assert.Contains("--change-email-provider", plan.Arguments);
+        Assert.Contains("icloud", plan.Arguments);
+        Assert.Contains("--change-email-workers", plan.Arguments);
+        Assert.Contains("2", plan.Arguments);
+        Assert.Contains("--change-email-mailbox-file", plan.Arguments);
+        Assert.Contains("--proxy", plan.Arguments);
+        Assert.Contains("http://proxy:8080", plan.Arguments);
+        Assert.Single(plan.TempFiles);
+    }
+
+    // ── Shared helpers ──────────────────────────────────────────────────
+
+    [Fact]
+    public void MailboxArgumentForLine_ReturnsChataiForDashedLine()
+    {
+        string result = BackendCommandPlanner.MailboxArgumentForLine(
+            "user@example.com----password----clientId----refreshToken");
+        Assert.Equal("--chatai-mailbox-file", result);
+    }
+
+    [Fact]
+    public void MailboxArgumentForLine_ReturnsMailboxForTripleDash()
+    {
+        string result = BackendCommandPlanner.MailboxArgumentForLine(
+            "user@example.com---password---refreshToken");
+        Assert.Equal("--mailbox-file", result);
+    }
+
+    [Fact]
+    public void MailboxArgumentForLine_ReturnsMailboxForCfWorker()
+    {
+        string result = BackendCommandPlanner.MailboxArgumentForLine(
+            "cfworker://abc123");
+        Assert.Equal("--mailbox-file", result);
+    }
+
+    [Fact]
+    public void MailboxArgumentForLine_ReturnsEmptyForComment()
+    {
+        Assert.Equal("", BackendCommandPlanner.MailboxArgumentForLine("# comment"));
+    }
+
+    [Fact]
+    public void MailboxArgumentForLine_ReturnsEmptyForEmptyLine()
+    {
+        Assert.Equal("", BackendCommandPlanner.MailboxArgumentForLine(""));
+        Assert.Equal("", BackendCommandPlanner.MailboxArgumentForLine("   "));
+    }
+
+    [Fact]
+    public void NormalizeImportTarget_NormalizesCorrectly()
+    {
+        Assert.Equal("sub2api", BackendCommandPlanner.NormalizeImportTarget("sub2api"));
+        Assert.Equal("sub2api", BackendCommandPlanner.NormalizeImportTarget("SUB2API"));
+        Assert.Equal("cliproxyapi", BackendCommandPlanner.NormalizeImportTarget("cliproxyapi"));
+        Assert.Equal("cpa", BackendCommandPlanner.NormalizeImportTarget("cpa"));
+        Assert.Equal("cpa", BackendCommandPlanner.NormalizeImportTarget("unknown"));
+        Assert.Equal("cpa", BackendCommandPlanner.NormalizeImportTarget(""));
+    }
+
+    [Fact]
+    public void ImportTargetLabel_ReturnsCorrectLabel()
+    {
+        Assert.Equal("SUB2API", BackendCommandPlanner.ImportTargetLabel("sub2api"));
+        Assert.Equal("CLIProxyAPI", BackendCommandPlanner.ImportTargetLabel("cliproxyapi"));
+        Assert.Equal("CPA", BackendCommandPlanner.ImportTargetLabel("cpa"));
+        Assert.Equal("CPA", BackendCommandPlanner.ImportTargetLabel(""));
+    }
+
+    [Fact]
+    public void AppendProxyPool_SingleProxy_AddsScalar()
+    {
+        var args = new List<string>();
+        BackendCommandPlanner.AppendProxyPool(args, new[] { "http://proxy:8080" });
+        Assert.Contains("--proxy", args);
+        Assert.Contains("http://proxy:8080", args);
+        Assert.DoesNotContain("--proxy-pool", args);
+    }
+
+    [Fact]
+    public void AppendProxyPool_MultipleProxies_AddsPool()
+    {
+        var args = new List<string>();
+        BackendCommandPlanner.AppendProxyPool(args, new[] { "http://p1:8080", "http://p2:8080" });
+        Assert.Contains("--proxy", args);
+        Assert.Contains("--proxy-pool", args);
+    }
+
+    [Fact]
+    public void AppendProxyPool_EmptyPool_DoesNothing()
+    {
+        var args = new List<string>();
+        BackendCommandPlanner.AppendProxyPool(args, Array.Empty<string>());
+        Assert.Empty(args);
+    }
+
+    [Fact]
+    public void AppendProxy_AddsTrimmedScalar()
+    {
+        var args = new List<string>();
+        BackendCommandPlanner.AppendProxy(args, "  http://proxy:8080  ");
+        Assert.Equal(new[] { "--proxy", "http://proxy:8080" }, args);
+    }
+
+    [Fact]
+    public void AppendProxy_SkipsBlank()
+    {
+        var args = new List<string> { "--existing" };
+        BackendCommandPlanner.AppendProxy(args, "   ");
+        Assert.Single(args);
+    }
+
+    [Fact]
+    public void AppendProxyPool_DropsBlankEntriesBeforeChoosingScalar()
+    {
+        var args = new List<string>();
+        BackendCommandPlanner.AppendProxyPool(args, new[] { "", "  ", "http://p1:8080" });
+        Assert.Equal(new[] { "--proxy", "http://p1:8080" }, args);
+        Assert.DoesNotContain("--proxy-pool", args);
+    }
+
+    [Fact]
+    public void ChataiMailboxFileFlag_IsTheFourPartLineFlag()
+    {
+        Assert.Equal("--chatai-mailbox-file", BackendCommandPlanner.ChataiMailboxFileFlag);
+        Assert.Equal(
+            BackendCommandPlanner.ChataiMailboxFileFlag,
+            BackendCommandPlanner.MailboxArgumentForLine("a@b.com----pw----client----refresh"));
+    }
+
+    [Fact]
+    public void AppendSessionFile_AddsWhenNonEmpty()
+    {
+        var args = new List<string>();
+        BackendCommandPlanner.AppendSessionFile(args, "C:\\session.json");
+        Assert.Contains("--session-file", args);
+        Assert.Contains("C:\\session.json", args);
+    }
+
+    [Fact]
+    public void AppendSessionFile_SkipsWhenEmpty()
+    {
+        var args = new List<string> { "--existing" };
+        BackendCommandPlanner.AppendSessionFile(args, "");
+        Assert.Single(args);
+    }
+
+    // ── Temp-file ownership ─────────────────────────────────────────────
+    // The window's runner deletes everything in `plan.TempFiles` in a finally.
+    // A batch file that is created but not declared is mailbox credentials left
+    // in %TEMP% forever; a persistent pool file that IS declared is deleted after
+    // the first run. Both directions are pinned here.
+
+    [Fact]
+    public void CreateMailboxFileRegistration_DeclaresCallerTemporaryFiles()
+    {
+        var plan = BackendCommandPlanner.CreateMailboxFileRegistration(
+            "测试", "--chatai-mailbox-file", "C:\\temp\\selected_mailbox_20260101_000000.txt", 2, 2,
+            registrationAtOnly: true,
+            proxyPool: Array.Empty<string>(),
+            temporaryFiles: new[] { "C:\\temp\\selected_mailbox_20260101_000000.txt" });
+
+        Assert.Single(plan.TempFiles);
+        Assert.Equal("C:\\temp\\selected_mailbox_20260101_000000.txt", plan.TempFiles[0]);
+    }
+
+    [Fact]
+    public void CreateMailboxFileRegistration_WithoutTemporaryFiles_NeverDeclaresThePoolFile()
+    {
+        var plan = BackendCommandPlanner.CreateMailboxFileRegistration(
+            "测试", "--chatai-mailbox-file", "C:\\pool.txt", 2, 2,
+            registrationAtOnly: true, proxyPool: Array.Empty<string>());
+
+        Assert.Empty(plan.TempFiles);
+    }
+
+    [Fact]
+    public void CreateOneClickSms_MergesCallerTemporaryFilesWithItsOwnEmailFile()
+    {
+        var plan = BackendCommandPlanner.CreateOneClickSms(
+            mailboxArgument: "--mailbox-file",
+            mailboxFile: "C:\\temp\\selected_mailbox.txt",
+            emails: new[] { "a@b.com", "c@d.com" },
+            sessionFile: "",
+            proxyPool: Array.Empty<string>(),
+            callerTemporaryFiles: new[] { "C:\\temp\\selected_mailbox.txt" });
+
+        Assert.Equal(2, plan.TempFiles.Count);
+        Assert.Contains("C:\\temp\\selected_mailbox.txt", plan.TempFiles);
+    }
+
+    // ── Temp-file name uniqueness ───────────────────────────────────────
+    // Second-granularity names (yyyyMMdd_HHmmss) collided when two actions
+    // started in the same second: the new file overwrote the batch file the
+    // in-flight backend was still reading. The planner's email files and the
+    // window's selected-mailbox file each have one owner for that rule, and
+    // both are pinned here.
+
+    [Fact]
+    public void CreateAccountImport_WithSharedTempDirectory_WritesDistinctFiles()
+    {
+        using var fixture = new TemporaryDirectory();
+
+        var first = BackendCommandPlanner.CreateAccountImport(
+            "cpa", new[] { "a@example.com" }, tempDirectory: fixture.Path);
+        var second = BackendCommandPlanner.CreateAccountImport(
+            "cpa", new[] { "b@example.com" }, tempDirectory: fixture.Path);
+
+        Assert.Single(first.TempFiles);
+        Assert.Single(second.TempFiles);
+        Assert.NotEqual(first.TempFiles[0], second.TempFiles[0]);
+        Assert.True(File.Exists(first.TempFiles[0]));
+        Assert.True(File.Exists(second.TempFiles[0]));
+        Assert.All(first.TempFiles.Concat(second.TempFiles), path =>
+            Assert.Equal(fixture.Path, Path.GetDirectoryName(path)));
+    }
+}

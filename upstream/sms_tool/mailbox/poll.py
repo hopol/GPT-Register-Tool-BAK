@@ -1,0 +1,95 @@
+"""Common OTP polling loop with settle-stability detection.
+
+Shared template used by poll_email_otp and provider polling to avoid duplicating the deadline/interval/settle
+logic across providers.
+"""
+
+from __future__ import annotations
+
+import time
+import logging
+from typing import Callable, Iterable, Optional
+
+from ..kernel.sanitizer import mask_otp
+from .errors import is_terminal_mailbox_error
+from ..desktop_ipc import progress_dots_enabled
+
+logger = logging.getLogger(__name__)
+
+# Default configuration fallbacks (overridable via config).
+_DEFAULT_POLL_INTERVAL = 2.0
+_DEFAULT_SETTLE_SECONDS = 1.5
+
+
+def _poll_otp_with_settle(
+    fetch_candidate: Callable[[], Optional[dict]],
+    *,
+    timeout: int = 300,
+    interval: Optional[float] = None,
+    settle_seconds: Optional[float] = None,
+    excluded_otps: Iterable | None = None,
+    log_prefix: str = "poll",
+    is_newer: Callable[[Optional[dict], Optional[dict]], bool] | None = None,
+    reraise: tuple[type[Exception], ...] | None = None,
+) -> Optional[str]:
+    """Poll for an OTP with settle-stability detection.
+
+    Repeatedly calls ``fetch_candidate()`` until it returns a candidate dict
+    with an ``otp`` key.  Once a candidate is found, waits ``settle_seconds``
+    to confirm no newer OTP arrives (settle-stability pattern).
+
+    Args:
+        fetch_candidate: Callable that returns a dict with at least ``otp`` or None.
+        timeout: Total deadline in seconds.
+        interval: Sleep between polls (defaults to configured _DEFAULT_POLL_INTERVAL).
+        settle_seconds: How long to wait for stability before returning.
+        excluded_otps: Iterable of OTP strings to skip.
+        log_prefix: Prefix for log messages.
+        is_newer: Callable(newer, older) -> bool; defaults to comparing
+            ``received_ts`` keys.
+        reraise: Exception types to re-raise instead of swallowing.
+
+    Returns:
+        The OTP string, or None on timeout.
+    """
+    if interval is None:
+        interval = _DEFAULT_POLL_INTERVAL
+    if settle_seconds is None:
+        settle_seconds = _DEFAULT_SETTLE_SECONDS
+    if is_newer is None:
+
+        def _fallback_is_newer(a, b):
+            return (a or {}).get("received_ts", 0) > (b or {}).get("received_ts", 0)
+
+        is_newer = _fallback_is_newer
+
+    excluded = {str(value or "").strip() for value in (excluded_otps or ())}
+    deadline = time.time() + timeout
+    # Resolved once: the loop runs for the whole poll window and the answer
+    # cannot change mid-flight, but os.environ lookups per tick add up.
+    dots = progress_dots_enabled()
+
+    while time.time() < deadline:
+        try:
+            candidate = fetch_candidate()
+            if candidate and candidate.get("otp") not in excluded:
+                stable_until = time.time() + settle_seconds
+                while settle_seconds > 0 and time.time() < stable_until and time.time() < deadline:
+                    time.sleep(min(interval, max(0.0, stable_until - time.time())))
+                    newer = fetch_candidate()
+                    if is_newer(newer, candidate):
+                        candidate = newer
+                        stable_until = time.time() + settle_seconds
+                otp_code = str((candidate or {}).get("otp") or "")
+                if otp_code:
+                    print(f" code:{mask_otp(otp_code)}!")
+                    return otp_code
+        except Exception as e:
+            if isinstance(e, reraise or ()) or is_terminal_mailbox_error(e):
+                raise
+            print(f"[{log_prefix} error: {e}]")
+        if dots:
+            print(".", end="", flush=True)
+        time.sleep(interval)
+    print(" timeout")
+    return None

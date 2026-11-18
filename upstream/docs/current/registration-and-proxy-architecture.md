@@ -1,0 +1,297 @@
+# 注册与代理运行时架构深读
+
+> 本篇是 [`architecture.md`](../architecture.md)（模块职责 / 边界视角）的**互补文档**，从**运行时控制流 + 代码定位**角度，拆解两个被频繁触及却没有被串成一条线的子系统：
+>
+> 1. **注册路径**（协议注册 vs 无头浏览器注册）
+> 2. **代理池**（三元隔离 + 单一范式解析 + 动态轮换）
+>
+> 行号基于 2026-08-29 的代码快照，随重构可能漂移；以函数/类名检索为准。
+>
+> **Scope.** 本篇只负责运行时控制流与代理/指纹的**组合视角**：阶段顺序见
+> [registration-architecture.md](registration-architecture.md)，端点与请求体见
+> [protocol-registration.md](protocol-registration.md)，失败处置见
+> [registration-recovery.md](registration-recovery.md)。
+
+---
+
+## 0. 模块地图
+
+| 关注点 | 模块 | 角色 |
+| --- | --- | --- |
+| 驱动枚举 / 归一化 | `sms_tool/registration_drivers/base.py` | 区分 protocol 与 browser 两类注册入口 |
+| 指纹 + 鉴权头 | `sms_tool/auth_headers.py` | 确定性指纹 + `oai-*` 头注入 |
+| 反爬 Token | `sms_tool/sentinel_tokens.py` + `sms_tool/sentinel/` | 真实 Node SDK 执行 + 缓存 + DID 一致性 |
+| 预检 + 协议纠正 | `sms_tool/registration/preflight.py` | 边界探活 + socks5↔http 纠错 |
+| 注册入口 | `sms_tool/registration/orchestrator.py` | 入口分派（`run_email` / `run_batch`）+ 驱动/配置选择 + 按调用绑定 `RegistrationOperations`；阶段顺序在 `handlers.py` |
+| 代理单一范式 | `sms_tool/proxy/entry.py` | 解析 / 重建凭据 / 地区重定 / 会话轮换 |
+| 代理路由 | `sms_tool/proxy/routing.py` | 按 lane 选池 + 单向回退 |
+| 指纹池（协议路径） | `sms_tool/fingerprint_pool.py` | `ProtocolEnvironmentProfile` + `FingerprintPool` 单例 |
+| 指纹池（浏览器路径） | `sms_tool/browser_fingerprint_pool.py` | 7 硬件档案 + 出口地理对齐（4 个浏览器驱动共享） |
+| 浏览器进程池 | `sms_tool/browser_pool.py` | 常驻进程池（支持池化的浏览器驱动共享，非每驱动独立） |
+| 桌面调用 | `sms_tool/desktop_ipc` + `SmsWorkbench/` | v2 IPC 信封，Python 子进程执行 |
+
+---
+
+## 1. 注册双路径：protocol vs browser
+
+注册入口由 `RegistrationDriver` 枚举驱动（`registration_drivers/base.py:23`）：
+
+```python
+class RegistrationDriver(str, Enum):
+    PROTOCOL = "protocol"  # 默认：curl_cffi HTTP 直登
+    PLAYWRIGHT = "playwright"
+    CAMOUFOX = "camoufox"
+    CLOAK = "cloak"
+    ROXY = "roxy"
+```
+
+> `adspower` 已于 2026-09-09 移除（前后端模块、配置、CLI/UI 选项同步删除）。
+> 现存 4 个浏览器驱动：playwright / camoufox / cloak / roxy。
+
+关键切分在 `BROWSER_REGISTRATION_DRIVERS`（`registration_drivers/base.py:95`）—— 除 `protocol` 之外的全部成员。
+`normalize_registration_driver()`（`registration_drivers/base.py:104`）负责把 `None` / 字符串 / 配置值归一化，**默认落回 `protocol`**。
+
+### 两条路径的异同
+
+| 维度 | `protocol` | `browser_*`（playwright/camoufox/…） |
+| --- | --- | --- |
+| 执行体 | curl_cffi HTTP 直登 | 无头浏览器驱动完成 signup |
+| 指纹/鉴权头 | `sentinel_fingerprint()` + `openai_auth_headers()` | **同一套**，注入到浏览器上下文 |
+| Sentinel 事务 | 独立事务 + 独立 `oai-did` | 独立事务 + 独立 `oai-did` |
+| 异常处理 | 标准网络/鉴权重试 | `BrowserRegistrationError`（`registration_drivers/base.py:130`）封装浏览器层错误 |
+
+**核心结论**：两条路径在「指纹 → 鉴权头 → Sentinel Token → AT 探活 → 持久化」这条主干上**完全共用**，差异只在最前端的 signup 执行方式。这意味着无论走哪条路，反关联与反爬强度是一致的，不存在「浏览器路径更稳」或「协议路径更弱」的本质区别——强弱由指纹/头/Sentinel 一致性决定，而非驱动选择。
+
+> 这也解释了为什么 `registration/orchestrator.py` 是**入口模块**（解析运行配置、选择驱动、`run_email` / `run_batch` 分派、按调用绑定 `RegistrationOperations`，并把 helper 对外暴露）：阶段顺序与阶段实现被拆到 `registration/handlers.py` 与同目录的 stage 模块（`otp_stages.py`、`account_stages.py`、`sentinel_stages.py`、`edge_challenge.py`、`resume.py`、`finalize.py`），以及更底层的 `auth_flow / account_creation / otp_strategy / mailbox / session_builder / storage`。不要把它理解为“纯 re-export 门面”——依赖绑定本身就在这里。
+
+---
+
+## 2. 指纹与鉴权头（Fingerprint & Auth Headers）
+
+`sms_tool/auth_headers.py` 是「每个账号看起来像同一台稳定设备」的事实来源。
+
+- **设备档案**：`AUTH_FINGERPRINT_PROFILES`（`auth_headers.py:42`）覆盖 Chrome 124–150、Firefox 133–147、Safari 17/18（含 iOS）的 UA / 平台 / 渲染器组合。
+- **确定性指纹**：`sentinel_fingerprint()`（`auth_headers.py:824`）按账号 `device_id` **确定性派生** screen / CPU / 内存 / `time_origin`，使得同一账号每次注册拿到一致指纹，不同账号彼此不关联（防关联）。
+- **鉴权头注入**：`openai_auth_headers()`（`auth_headers.py:1049`）注入 `oai-device-id`、`oai-session-id`、`sec-ch-ua*`、`sec-ch-ua-platform`、`Datadog` trace 等；`family` 分为 `nextauth` / `auth` / `chatgpt` 三族，三族**共享**同一 DID、稳定的 session logging id、flow invocation id、UA、client hints、GeoIP 派生的 locale/timezone。
+- **一致性强约束**（见 `architecture.md` 的 *Registration Protocol Consistency*）：Sentinel QuickJS 消费**同一指纹**，为 `username_password_create` / `authorize_continue` / `oauth_create_account` 分别产出 token；token payload id、`oai-did` cookie、auth header **必须匹配**。提取失败**fail closed**——绝不使用纯 HTTP 的 PoW fallback。
+
+- **TLS ClientHello 每账号唯一化**（2026-11-11）：`sms_tool/tls_fingerprint.py` 按账号 device seed **确定性打乱** profile 自己那份扩展**顺序**（不改集合），经 `CurlOpt.TLS_EXTENSION_ORDER` 装到 session 上。此前 4 个 Firefox profile 共用同一个 `ja3_hash`（`6f7889b9…`），占指纹池 50% 权重；Chrome preset 本就逐握手打乱，Safari 的列表重排会被 BoringSSL 拒绝（`curl: (35) Invalid TLS extensions`），因此只有 Firefox 家族走这条覆盖。HTTP/2（Akamai）**故意不动**：preset 是 curl-impersonate native target，`extra_fp` 改不了它的 SETTINGS。配置：`registration.tls_fingerprint`；证据：`scripts/tls_fingerprint_probe.py`。
+- **平台化硬件档位 + 一致性校验**（2026-11-11）：`_device_profile(seed, platform_class)` 改为按平台类查表（Windows / macOS / iOS），缓存键含平台类，iOS 不再报 1920×1080 桌面屏；`auth_headers.validate_protocol_fingerprint()` 断言平台↔UA、触点↔平台、屏幕↔平台区间、locale↔Accept-Language、时区↔偏移，`identity_stages` 只记日志不中断。详见 [protocol-registration.md](protocol-registration.md) 的 *Device fingerprint consistency*。
+- **`timezoneName` 走 OS 标签**：Sentinel profile 带 `timezone_name`（`geo.profiles.WINDOWS_TIMEZONE_BY_IANA`，与浏览器 lane 同源），`_requirements_token` 也用同一标签，两个 token 生成器不再各说各话（`(JST)` vs `(Asia/Tokyo)`）。
+- **requirements token 与 SDK 逐字段对齐**（2026-11-12）：`client._requirements_token` 手写 `sdk.js getConfig()` 的 25 元组，其中 `[10]/[11]/[12]` 是 SDK **每次页面加载随机抽**的 navigator 原型键 / document 键 / window 键 ⇒ 候选集合与渲染值放进 `sentinel/surface.py`，按 device seed 抽样（候选 = shim 与真机抓取的交集，渲染值逐字节钉住）；`[2]`/`[24]` 按家族门控（`performance.memory` 只有 Chromium 有，`InstallTrigger` 只有 Gecko 有）；`[13]/[17]` 由同一个 `performance.timeOrigin` 推导（页面年龄 25 s–15 min），并作为 `pageTimeOrigin` 传给 runner，使 VM 侧与 Python 侧描述同一个页面。`Accept-Encoding` 同步按引擎门控（`zstd`：Chrome 123+/Firefox 126+，Safari 26.3 起）。门禁：`tests/registration/test_sentinel_proof_parity.py`（离线 PoW 跑真 runner，逐槽对比 + 候选集对照真 VM）。
+
+> 实战含义：调注册相关代码时，**不要**单独改某一处 `oai-*` 头或指纹，必须走 `auth_headers` 统一出口，否则 DID/Header/Cookie 三者错位会直接被风控。
+
+---
+
+## 3. Sentinel 反爬（Anti-bot）
+
+Sentinel 不是纯 Python PoW，而是调用**真实 Node SDK**：
+
+- 后端选择：环境变量 `OPENAI_SENTINEL_BACKEND`（在 `sms_tool/sentinel/client.py:59` 读取，默认 `node_runner`），对应 `config.example.json` 的 `sentinel_backend: "node_runner"`。`node_runner` 执行 vendored 在 `sms_tool/sentinel/` 下的 SDK（`sentinel/client.py:315`）。
+- **线程安全缓存**：`_get_cached_sentinel()`（`sentinel_tokens.py:79`）/ `_save_sentinel_cache()`（`sentinel_tokens.py:97`）带锁，调用方保留 single-flight 填充语义。
+- **DID 一致性**：`_sentinel_device_id()`（`sentinel_tokens.py:136`）+ `assert_sentinel_device_id()`（`sentinel_tokens.py:148`）保证同一账号的 Sentinel DID 恒定；跨账号绝不共享。
+- **并发边界**：每个账号独立 Sentinel 事务与 `oai-did`，batch worker 不把 token 回写共享池；`sentinel_max_concurrency` 默认 2（上限 4）。`tests/registration/test_sentinel_runner.py:71/135` 已验证 node_runner 可**离线**执行 vendored SDK。
+
+---
+
+## 4. 注册成功判定：AT HTTP 200 稳定探活
+
+账号「活着」的边界只有一个：**持久化的 Access Token + 结论性 HTTP 200 探活**。
+
+- `registration_outcome._probe_registration_access_token`（经 `registration/orchestrator.py` 门面暴露）做**多轮稳定性探测**，`--target-at200` 即以稳定 200 成功数作为目标。
+- **可恢复检查点**：post-create AT 探测前写原子 checkpoint，transport-unknown 的探测可 resume，不会重放账号创建。
+- 每个账号保留一个 proxy-bound HTTP session；只有被归类为网络/鉴权态的重试才会新建 session 并换新鲜代理出口。
+- `http_client` 持有每会话 403/429 熔断；HTTP 429 单独归类为 `rate_limit`，不立即重试，首个 429 打开进程内认证流冷却电路，阻止同批次等待账号继续冲击上游。
+
+---
+
+## 5. 代理三元隔离（Proxy Three-lane Isolation）
+
+代理按用途分 lane；只有文档化的兼容回退允许跨 lane 候选（详见
+`architecture.md` 的 *Proxy Routing Boundary*）：
+
+| Lane | 用途 | 出口来源 |
+| --- | --- | --- |
+| ① 注册代理 | 注册 worker（全部 6 驱动） | `proxy.registration` + `proxy.pool`（动态 sticky session，**单地区 VN、lajiao 10 条**；9http 于 2026-09-22 从活动注册池移除，模板解析能力保留） |
+| ② 邮箱/OTP 代理 | OTP 轮询收件 | `mailbox_proxy` / `mailbox_proxy_pool` 优先；`email_registration.mailbox_proxy_fallback_to_operation_proxy=true` 时把本次 operation proxy 追加为故障回退 |
+| ③ 协议支付代理 | Checkout/Approve | **随用户选择的 checkout/approve 出口动态选择**：取 `protocol_payments.methods.<method>.checkout_proxy_pool` / `approve_proxy_pool` 持有的候选池（如 IPWO US/JP/GB），**非固定 JP/US/GB 混用** |
+
+- **按 lane 选池**：`proxy_pool_for()`（`proxy/routing.py:85`）返回 lane 专属池 + 单向回退。已知 lane：`browser_registration`、`protocol_registration`、`liveness`、`promotion`、`health_browser`。
+- **统一操作代理候选**：`select_operation_proxy()`（`proxy/routing.py:272`）按显式输入、可选 registration affinity、operation pool 和文档化回退取首项，并保留非敏感来源标签。
+- **统一读面 / 可选单一声明点**：`proxy/registry.py` 是三条 lane 的唯一 façade（`resolve` / `census`，凭据永不输出），提供 `scripts/proxy_census.py` 一键普查。可选段 `proxy.lanes` 存在时对匹配 lane **权威**，缺省则完全走旧键；三条实路径（`proxy_pool_for`、`mailbox._mailbox_proxy_candidates`、`PaymentRoutePlanner._named_pools`）均已接通。详见 `PROXY_GUIDE.md` 的 *Unified Proxy Registry*。
+
+> 实战含义：本地用 Clash/代理软件把 `127.0.0.1:7897` 作为 OTP 收件专用出口，注册与支付各走独立上游；不要把同一个 session 出口同时喂给注册和健康探测。
+
+---
+
+## 6. ProxyEntry 单一范式与动态轮换
+
+代理字符串操作**只有一个权威来源**：`sms_tool/proxy/entry.py`。`phone_proxy` 与 `paypal_proxy` 的 `refresh_proxy_sid` / `match_proxy_region` / `retarget_proxy_country` 等都是**薄封装**，归一化后委托给 `proxy_entry`，保证同一供应商代理在不同流程中轮换方式完全一致。
+
+- **单一模型**：`ProxyEntry` frozen dataclass（`proxy/entry.py:82`）—— 全项目的规范代理表示。
+- **六形式解析**：`parse_proxy()`（`proxy/entry.py:143`）处理 6 种代理 URL 写法。
+- **重建 / 重定 / 轮换**：
+  - `rebuild_proxy_credentials()`（`proxy/entry.py:399`）
+  - `retarget_region()`（`proxy/entry.py:420`）—— 重定出口地区
+  - `rotate_session()`（`proxy/entry.py:455`）—— 刷新 sticky session id
+- **供应商模板**：
+  - **Cliproxy**：username `region-XX` + `-sid-<id>-t-<n>`
+  - **9http / 9proxy**：username `geo-XX` + `-sid-<id>-ttl-<n>`。地区标签是 `geo` 而非 `region`，`_INFER_USER_REGION_RE` / `_USER_REGION_RE` 同时接受两种拼写；**重定地区时保留原标签**，否则 `geo-VN` 会被改写成供应商不认的 `region-US`。
+  - **IPWO**：`custom_zone_XX`
+  - **rola**：username `..._<sid>-country-XX`。地区标签是 `country`，`_REGION_TAG` 必须包含它，否则重定与会话轮换对它**静默 no-op**；`_ROLA_SID_RE` 用 lookbehind 取 `_` 与 `-country-XX` 之间的 sid。国家码**大小写不敏感**（实测 `country-US` 拿到 US 出口），重定后会被规范成大写。
+  - **Kookeey**：password `BASE-CC-SESSION-TTL`，TTL 单位 `\d+[smhd]` 超集
+- **选池**：`load_proxy_pool()`（`proxy/entry.py:562`）/ `choose_proxy_entry()`（`proxy/entry.py:628`）。
+- **脱敏**：`masked` 去除凭据，日志/报告只显示脱敏串。
+- **池形态约束（以 `proxy.json` 为准）**：
+  🔴 **2026-09-22 现状：单地区 VN、lajiao 10 条。** `proxy.registration` /
+  `default` / `proxy.pool` 均使用 lajiao `region-VN` 模板
+  （`us.lajiaohttp.net:2000`，与 Cliproxy/Novproxy 模板**逐字同构** ⇒ 解析 /
+  重定 / 轮换零代码改动）。09-21 曾为拆单点故障域接入 9http 6 条
+  （`geo-JP/DE/CA/US`）并交错排布，09-22 按运营指令移除，池由 16 条回到
+  10 条 —— **同账号、同密码、同地区、同主机**，只有 sid 不同。
+  通用 `ProxyEntry` 仍保留 9http `geo-XX` 模板解析能力，供历史配置、
+  支付 lane（`payment.json` 仍持有 9http 凭据）与其他独立代理池使用。
+
+  ⚠️ **代价（别只看"池更干净了"）**：单供应商 + 单地区 ⇒ 回到
+  "一家被拒即整批同时死"（2026-09-13 的 403 就是这么打穿全池的）。
+  9http 6 条完整凭据保留在 `runtime/proxy-backups/proxy.json.before-remove-9http-*`，
+  可整体回滚。另：`runtime/registration_proxy_health.json` 里 9http 的历史
+  健康记录成为孤儿键（永不会被查询，无害）。
+
+  **VN 地理档案已接线**：规范表 `geo/profiles.MARKET_PROFILES["VN"]` 使用
+  `vi-VN` / `Asia/Ho_Chi_Minh`，浏览器映射使用
+  `COUNTRY_LOCALE_PROFILE_MAP["VN"]="vn"`。`TIMEZONE_NAME_BY_IANA` 同时含
+  `Asia/Ho_Chi_Minh` 与 `Asia/Bangkok` —— 后者是 VN IP 常见的**实测**时区
+  （10 条里 5 条落到曼谷），两者 CLDR 名同为 `Indochina Time`，
+  补键后输出字节不变。**IN 档案（`en-IN` / `Asia/Kolkata`）保留**，
+  供历史配置使用，守卫位于 `tests/registration/test_registration_protocol_geo.py`。
+
+  批次启动前会对候选路由逐条执行 OpenAI 边界预检，只把成功路由传给 batch。
+  批次内的 IP/国家探测不再被当作 OpenAI 可达性的替代判据。
+
+  <details><summary>历史（2026-09-13 / 09-17 的 VN 与 IPWO 实测，保留供追溯）</summary>
+
+  顶层 `proxy.registration` / `default` / `pool` 曾是 **30 条**，三家供应商混编。**主出口 VN（20 条）**：9http（`global.9http.com:9091`，`geo-VN` 模板，10 条）与 IPWO（`us.ipwo.net:7878`，`custom_zone_VN` 模板，10 条），出口实测落在 FPT Telecom / VNPT / Viettel 等本地 ISP；**第二出口 PH（10 条）**：rola（`gate.rola.vip:2000`，`country-PH` 模板）。加第二出口的原因是原池 30 条**地区维度零冗余（全是 VN）**，一个地区被拒即整批同时死；⚠️ 注意别把「主机有三家」当成冗余——主机维度确实有冗余，**地区维度没有**。🔴 **2026-09-13 实测（用活跃池凭据，已推翻上一版的保留意见）**：`us.ipwo.net:7878` 用**活跃池里的** `custom_zone_VN` 凭据在 CONNECT 阶段回 `403 {"code":403,"msg":"access denied,china IP is not allow"}`——被拒的是**本机自己的中国出口 IP**（响应头 `X-Client-Remote-Addr: 115.197.164.253`），与地区标签、账号余额、凭据有效性都无关 ⇒ 这条出口**从这台机器上不可能通**，除非先经非中国 IP 中转。`global.9http.com:9091` 则是 TCP 连通后**在 `recv` 阶段被 RST**（明文与 TLS 包裹结果相同、无任何 HTTP 响应）⇒ 不是 scheme/端口错配；原因无法坐实，**推断**同为客户端 IP 封锁。结论：**当前唯一可用出口是 rola PH**，所以"VN 主 / PH 备"在实际可用性上是反的——这也正是加第二出口的价值所在。要判定活跃池健康度请用 `runtime/_probe_egress_regions.py` 实测（它会按 `(host, 声明地区)` 分组抽测并对账）。`proxy.registration` / `default` 仍指向 9http 的 VN 条目，所以 VN 保持主出口，PH 靠 `ProxyHealthTracker` 的健康排序在主出口冷却时才被优先选中。**PH 的地理档案已一并补齐**：手改 **3 处**——规范表 `geo/profiles.MARKET_PROFILES`（`en-PH` / `Asia/Manila`）+ `browser_fingerprint_pool.COUNTRY_LOCALE_PROFILE_MAP["PH"]="ph"` + `TIMEZONE_NAME_BY_IANA["Asia/Manila"]="Singapore Standard Time"`（Windows 无菲律宾专属时区，走 CLDR）；`auth_headers._GEO_PROFILES` 与 `BROWSER_LOCALE_PROFILES` 是**派生视图，自动生效**。缺任一手改项都会静默降级：协议路径回退 UTC、浏览器路径回退 `'us'` 档案，出现"菲律宾出口 + 美国指纹"。对账手段见 `runtime/_probe_egress_regions.py`（实测地区 vs 凭据声明）与 `registration.fingerprint_pool.verify_hint`。协议支付 / PayPal 的 `checkout_proxy_pool`、`approve_proxy_pool`、`proxies`、`stage_proxy_pools`、`proxy_pool` **仍按用户选择的 checkout/approve 出口动态选取**（候选为 IPWO US/JP/GB，见 §7 代理 lane 表），**不是固定 JP/US/GB 混用**，且**不随注册池切换到 VN**。**Kookeey（`gate.kookeey.info`）只保留在支付方法的 `stage_proxies` / 单方法 `proxy` 字段**（各 payment method 的 stage 拉取那一步），不参与注册与 checkout/approve；`direct_card` 等仍通过同一 ProxyEntry 模板规则旋转 Kookeey sticky 密码。**Cliproxy 用户名处理（`region-XX`）在 `proxy/entry.py` 中仍保留**，但未配置 Cliproxy URL，属未启用状态。
+  
+  </details>
+- **配置真源提醒**：`config.json` 在 `proxy.json` / `runtime.json` / `payment.json` 任一分片存在时即退化为 legacy 死文件（`config/loader.py:176`），且其 `proxy.registration` 仍是历史的 100 条列表形态，与分片不一致。**改代理只改 `proxy.json`**。
+
+> 实战含义：新增任何代理供应商支持，**只改 `proxy_entry`**（解析 + 重建 + 重定 + 轮换），不要让 `phone_proxy` / `paypal_proxy` 重新实现字符串操作。
+
+---
+
+## 7. 各驱动 → 指纹池 / 代理池 映射（环境配置矩阵）
+
+两条注册路径（§1）的**指纹来源**和**代理 lane**并不相同。下表为 2026-08-29 代码快照结论；行号随重构漂移，以符号检索为准。
+
+### 7.1 指纹池：两个，非每驱动一个
+
+| 路径 | 指纹池类型 | 单例入口 | 内容 | 地理对齐 |
+| --- | --- | --- | --- | --- |
+| `protocol` | `FingerprintPool`（`fingerprint_pool.py:121`） | `shared_fingerprint_pool(config)`（`fingerprint_pool.py:328`） | TLS/UA 档案 `ProtocolEnvironmentProfile`（`fingerprint_pool.py:37`） | `next(proxy)`（`fingerprint_pool.py:249`）按 `_GEO_PROFILES`（`auth_headers.py:313`）覆盖 locale/timezone |
+| `browser_*`（4 个） | `BrowserProfilePool`（`browser_fingerprint_pool.py:258`） | `shared_browser_profile_pool(config)`（`browser_fingerprint_pool.py:297`），经 `select_browser_profile(...)`（`browser_fingerprint_pool.py:611`）取档 | 7 个内置桌面硬件档案 `BROWSER_PROFILE_POOL`（`browser_fingerprint_pool.py:159`） | `detect_proxy_exit_geo(proxy)`（`browser_fingerprint_pool.py:373`）经共享 `geo.resolver`（Cloudflare trace 优先）→ `BROWSER_LOCALE_PROFILES`（`browser_fingerprint_pool.py:140`，经 `COUNTRY_LOCALE_PROFILE_MAP` 把 `VN` 映射到 `vn`） |
+
+**核心结论**：浏览器路径的 7 个硬件档案是**进程级单例、被全部 4 个浏览器驱动共享**——playwright / camoufox / cloak / roxy 都走 `run_browser_registration`（`registration_drivers/browser_flow/orchestrator.py:69`）→ `_browser_session_scope`（`registration_drivers/browser_flow/flow_steps.py:160`）→ `select_browser_profile(_browser_geo, seed=device_id, config=config)`（`browser_fingerprint_pool.py:611`）取同一池。协议路径用独立的 `FingerprintPool`，两者**互不复用**。硬件档案只来自内置池；已退休的 `registration.browser_profile_pool` 会在配置校验时报错，不再制造“配置已生效”的假 Interface。
+
+> **地区覆盖（2026-09-11）**：两侧都已收录 `VN`——协议路径 `_GEO_PROFILES["VN"]` = `Asia/Ho_Chi_Minh` / `vi-VN`；浏览器路径 `BROWSER_LOCALE_PROFILES["vn"]` + `COUNTRY_LOCALE_PROFILE_MAP["VN"] = "vn"`，并在 `TIMEZONE_NAME_BY_IANA` 补了 `Asia/Ho_Chi_Minh`。**未收录的国家不会报错，而是静默回退**：协议路径回退到"实测时区 + 档案原语言"，浏览器路径 `locale_profile_key_from_geo` 直接回退 `"us"`。因此**新增出口地区时必须同步补这三张表**，否则会出现"出口在 A 国、语言是 en-US"的隐性矛盾。
+
+### 7.2 代理 lane：三元隔离的运行时落地
+
+| Lane | 选取入口 | 落地池（config 键） | 备注 |
+| --- | --- | --- | --- |
+| 注册（全部 6 驱动） | `proxy_pool_for(config, "protocol_registration"` / `"browser_registration")`（`proxy/routing.py:40`） | `proxy.registration` + `proxy.pool` → 回退 `proxy.default`（现为 **10 条 rola `country-in`**） | `browser_registration` 先查 `browser_pool`/`browser_registration_pool` 别名，空则回退注册主池（`proxy/routing.py:53`、`:68`）。**两条注册路径共用同一个池**，且活体/健康 lane 也回退到它——改注册池会连带改变健康探测出口 |
+| 邮箱/OTP | `mailbox._mailbox_proxy_candidates` | `mailbox_proxy` → `mailbox_proxy_pool` → 可选 operation proxy | mailbox 配置保持第一优先；operation proxy 仅在开关启用时作为尾部故障回退 |
+| 协议支付 | 方法配置 `protocol_payments.methods.<method>.checkout_proxy_pool` / `approve_proxy_pool`（`config.json:650` 起） | **随用户选择的 checkout/approve 出口动态选择**，候选池形如 IPWO US/JP/GB | **不是固定 JP/US/GB 混用**（见 §6 池形态约束更正） |
+| 活体/推广/健康 | `operation_proxy_candidates(...)` / `select_operation_proxy(...)` | 显式输入 → 可选 registration affinity → operation pool → 文档化回退 | 候选来源随诊断记录；调用方不得自行重排 |
+
+`proxy.dynamic_generation`（默认关）开启时，`select_registration_proxy_pool()` 把生成结果记成
+`{"used", "count", "reason"}`：`reason` 取 `disabled` / `asn_mismatch` / `datacenter_detected` /
+`error:<Type>` 之一，随每次尝试的 `proxy_metadata` 落进 `result.proxy_audit.dynamic_generation`。
+在此之前「开关开了但一条也没生出来」和「开关没开」都只打一行日志、都回落静态池，跑完的批次看不出区别。
+
+### 7.3 浏览器进程池：跨驱动共享
+
+全部 4 个浏览器驱动共享同一个**常驻进程池**（`browser_pool.py`），非每驱动各开各的：
+
+- `PoolConfig`（`browser_pool.py:67`）：`max_concurrent`（默认 4）/ `max_uses_per_process`（默认 10）/ `recycle_on_error`（默认 true）/ `max_total_rss_mb`（默认 0 = 关闭）。
+  **推荐值有实测依据（2026-10-21）**：一个 headless Chromium 进程树约 **478 MB**，四个约 **1.9 GB**（各 3 次重复）；Camoufox 是 Gecko、通常更重，因此推荐值按 `max_concurrent × 512 MB` 推导（默认 4 路 = **2048 MB**），写进 `config.example.json`。默认仍是 0（看门狗会回收**存活**的浏览器，对存量配置静默开启可能打断注册，需 canary），但池启动时会在关闭且并发 > 1 的情况下打一条带推荐值的 warning，`stats` 永远同时给出 `recommended_max_total_rss_mb`。
+- 内存看门狗：`max_total_rss_mb > 0` 时，每次取槽位前用 psutil 汇总当前进程所有子进程（浏览器 + renderer）的 RSS；超过上限就回收一个**空闲且最久未使用**的槽位，没有空闲槽位则回收当前槽位。它是回收触发器，不是硬性 kill；采样失败只降级为“本次不测量”。`stats` 在该开关开启时才返回 `rss_mb`。
+- config 键**故意叫 `registration.browser_process_pool`**（`config.json:293`），**不叫 `browser_pool`**——后者是 `proxy_routing` 里的代理别名，二者无关（`browser_pool.py:70` 注释明确）。
+- 进程级回收：达到 `max_uses_per_process`、出错（`recycle_on_error`）或代理变更时，该槽位进程回收重建（`browser_pool.py:156`）。默认 `max_concurrent:4` 与脉冲 `wave_size:4` 对齐。
+
+### 7.4 各驱动环境配置键一览
+
+| 驱动 | 路径 | 关键 config 键（`registration.drivers.<name>`，`config.json`） |
+| --- | --- | --- |
+| `protocol` | 协议直登 | 无浏览器键；用 `proxy.registration` + `fingerprint_pool` |
+| `playwright` | 浏览器 | `registration.drivers.playwright.start_url`（`:227`） |
+| `roxy` | 浏览器（Roxy CDP） | `registration.drivers.roxy.api_base`=50000 / `api_token` / `workspace_id` / `project_id`（`:229`） |
+| `cloak` | 浏览器 | `registration.drivers.cloak.humanize` / `geoip` / `use_proxy` / `license_key`（`:243`） |
+| `camoufox` | 浏览器（默认 `registration.driver`） | `registration.drivers.camoufox.humanize` / `geoip` / `max_width` / `max_height` / `locale` / `timezone`（`:253`） |
+| 全部浏览器 | — | `registration.browser_process_pool`（`:293`）、`registration.browser_headless` / `browser_timeout_seconds` / `browser_locale` / `browser_timezone`（`:219`） |
+
+> 实战含义：改指纹/代理行为先判明驱动走协议池还是浏览器池——协议池改 `fingerprint_pool` + `_GEO_PROFILES`，浏览器池改 `browser_fingerprint_pool` 的 `BROWSER_PROFILE_POOL` / `BROWSER_LOCALE_PROFILES`，且改动影响**全部 4 个浏览器驱动**（单例共享）。代理出口严格按 lane 隔离，注册/邮箱/支付/健康四路互不复用同一 session。
+
+---
+
+## 8. 预检与代理协议纠正
+
+注册真正开始前，先跑网络边界预检（在认领邮箱之前）：
+
+- `registration_network_preflight()`（`registration/preflight.py:145`）探测 chatgpt / auth / sentinel 边界，使用 `impersonate` 模拟。
+- `_resolve_proxy_scheme()`（`registration/preflight.py:111`）纠正被标错的 socks5↔http；并可用 `proxy_scheme_fallback=off` **钉死** scheme，避免运行时被自动回退到错误协议。
+
+---
+
+## 9. 桌面端如何调用（IPC）
+
+WPF 桌面端（`SmsWorkbench/`）通过 `PythonBackendClient` 启动 `python -m sms_tool` 子进程，结构化结果走 `smsworkbench.ipc.v2` 信封（见 `architecture.md` 的 *WPF UI* 节）。注册逻辑**始终在 `sms_tool.registration.orchestrator`**，桌面端只负责启动 + 读取已脱敏结果，绝不回流 ChatGPT 注册生命周期。
+
+编译唯一入口：`SmsWorkbench/build_dotnet.ps1`（使用 `dotnet publish` 输出到 `dist/net10/SmsWorkbench.exe`，随后清理中间产物）。**禁止**直接 `dotnet build`——只会产出非分发目录的中间物且不自动清理。
+
+---
+
+## 10. 敏感数据边界
+
+- `.gitignore` 已保护：`config.json`、`sms_tool/config.json`、`mailbox_tokens.txt`、`sessions/`、`runtime/`、`dist/`、`.dotnet/`、`logs/`、`*_tokens.txt` 等。
+- `sensitive_policy.json` 是唯一的语言中立脱敏策略；Python 经 `sanitizer`，WPF 经 `SensitiveDataSanitizer` 加载同一文件。token / TOTP / 代理凭据 / 卡号 / 密码 / 支付密钥在日志、异常、IPC、报告里**全部替换**（非前缀遮罩）。
+
+---
+
+## 附：关键符号索引（file:line）
+
+| 符号 | 位置 | 作用 |
+| --- | --- | --- |
+| `RegistrationDriver` | `registration_drivers/base.py:23` | 驱动枚举 |
+| `BROWSER_REGISTRATION_DRIVERS` | `registration_drivers/base.py:95` | browser vs protocol 切分 |
+| `normalize_registration_driver` | `registration_drivers/base.py:104` | 归一化，默认 protocol |
+| `BrowserRegistrationError` | `registration_drivers/base.py:140` | 浏览器层错误封装 |
+| `AUTH_FINGERPRINT_PROFILES` | `auth_headers.py:42` | Chrome 124–150 / Firefox / Safari 设备档案 |
+| `sentinel_fingerprint` | `auth_headers.py:824` | 确定性指纹派生 |
+| `openai_auth_headers` | `auth_headers.py:1049` | `oai-*` 头注入 |
+| `OPENAI_SENTINEL_BACKEND` | `sentinel/client.py:59`（默认 `node_runner`） | Sentinel 后端选择 |
+| `_get_cached_sentinel` / `_save_sentinel_cache` | `sentinel_tokens.py:79` / `:97` | 线程安全缓存 |
+| `_sentinel_device_id` / `assert_sentinel_device_id` | `sentinel_tokens.py:136` / `:148` | DID 一致性 |
+| `proxy_pool_for` | `proxy/routing.py:85` | 按 lane 选池 + 单向回退 |
+| `select_operation_proxy` | `proxy/routing.py:272` | 从统一候选序列选择操作代理 |
+| `ProxyEntry` | `proxy/entry.py:82` | 规范代理模型 |
+| `parse_proxy` | `proxy/entry.py:143` | 6 形式解析 |
+| `rebuild_proxy_credentials` | `proxy/entry.py:399` | 凭据重建 |
+| `retarget_region` | `proxy/entry.py:420` | 地区重定 |
+| `rotate_session` | `proxy/entry.py:455` | 会话轮换 |
+| `load_proxy_pool` / `choose_proxy_entry` | `proxy/entry.py:562` / `:628` | 选池 |
+| `registration_network_preflight` | `registration/preflight.py:145` | 边界探活 |
+| `_resolve_proxy_scheme` | `registration/preflight.py:111` | socks5↔http 纠错 |
+| `shared_fingerprint_pool` | `fingerprint_pool.py:385` | 协议路径指纹池单例 |
+| `FingerprintPool` / `ProtocolEnvironmentProfile` | `fingerprint_pool.py:123` / `:39` | 协议路径 TLS/UA 档案 |
+| `shared_browser_profile_pool` | `browser_fingerprint_pool.py:297` | 浏览器路径内置指纹池单例 |
+| `select_browser_profile` | `browser_fingerprint_pool.py:611` | 取浏览器硬件档案（seed 稳定） |
+| `detect_proxy_exit_geo` | `browser_fingerprint_pool.py:373` | 穿透代理查出口地理 |
+| `BrowserProfilePool` / `BROWSER_PROFILE_POOL` | `browser_fingerprint_pool.py:258` / `:159` | 7 个内置桌面硬件档案（4 个浏览器驱动共享） |
+| `run_browser_registration` | `registration_drivers/browser_flow/orchestrator.py:69` | 5 浏览器驱动统一入口 |
+| `PoolConfig`（进程池） | `browser_pool.py:67` | `registration.browser_process_pool` 解析 |
+
+---
+
+*本文档与 `architecture.md` 互为补充：边界/归属看 `architecture.md`，运行时控制流看本文。两者冲突时以 `architecture.md` 的边界规则为准。*

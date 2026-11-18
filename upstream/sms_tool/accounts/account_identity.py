@@ -1,0 +1,366 @@
+"""Stable per-account network and protocol identity.
+
+The public interface allocates identity once during registration, persists only
+safe affinity metadata, reconstructs the configured proxy later, and rebinds
+thread-local fingerprint state at every worker entry.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import re
+from collections.abc import Mapping
+from typing import Any
+from urllib.parse import unquote, urlsplit
+
+from ..fingerprint_pool import shared_fingerprint_pool
+from ..phone_proxy import normalize_proxy_url
+from ..proxy.entry import infer_region, rebuild_proxy_credentials
+
+
+IDENTITY_VERSION = 1
+_USER_SID_RE = re.compile(r"(?<=-sid-)[A-Za-z0-9]+(?=-t-|-|$)")
+_KOOKEEY_PASSWORD_RE = re.compile(r"^(?P<base>.+?)-(?P<cc>[A-Za-z]{2})-(?P<sid>[A-Za-z0-9]+)-(?P<ttl>\d+[smhd])$")
+
+
+def create_registration_identity(
+    proxy: str | None,
+    *,
+    pool_index: int = -1,
+    fingerprint_key: str = "",
+    device_id: str = "",
+    auth_session_logging_id: str = "",
+    account_key: str = "",
+    browser_identity: Mapping[str, Any] | None = None,
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Allocate the canonical identity persisted for one account."""
+    key = _canonical_fingerprint_key(fingerprint_key)
+    if not key:
+        key = _canonical_fingerprint_key(shared_fingerprint_pool(config).next(proxy).name)
+    identity: dict[str, Any] = {
+        "version": IDENTITY_VERSION,
+        "proxy_affinity": _proxy_affinity(proxy, pool_index=pool_index),
+        "fingerprint_key": key,
+        "device_id": str(device_id or "").strip(),
+        "auth_session_logging_id": str(auth_session_logging_id or "").strip(),
+        "account_key": str(account_key or "").strip(),
+    }
+    if browser_identity:
+        identity["browser_identity"] = dict(browser_identity)
+    return identity
+
+
+def complete_registration_identity(
+    identity: Mapping[str, Any] | None,
+    *,
+    device_id: str = "",
+    auth_session_logging_id: str = "",
+) -> dict[str, Any]:
+    """Attach device values discovered inside a registration driver."""
+    value = dict(identity or {})
+    value.setdefault("version", IDENTITY_VERSION)
+    value["proxy_affinity"] = dict(value.get("proxy_affinity") or {})
+    value["fingerprint_key"] = _canonical_fingerprint_key(value.get("fingerprint_key"))
+    if device_id:
+        value["device_id"] = str(device_id).strip()
+    else:
+        value.setdefault("device_id", "")
+    if auth_session_logging_id:
+        value["auth_session_logging_id"] = str(auth_session_logging_id).strip()
+    else:
+        value.setdefault("auth_session_logging_id", "")
+    value.setdefault("account_key", "")
+    return value
+
+
+def account_identity(account: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Read the canonical context, with compatibility for earlier sessions."""
+    _raw_value: object = account
+    value: Mapping = _raw_value if isinstance(_raw_value, Mapping) else {}
+    stored = value.get("identity_context")
+    identity = dict(stored) if isinstance(stored, Mapping) else {}
+    identity.setdefault("version", IDENTITY_VERSION)
+    identity["proxy_affinity"] = dict(identity.get("proxy_affinity") or {})
+    identity["fingerprint_key"] = _canonical_fingerprint_key(
+        identity.get("fingerprint_key") or value.get("auth_fingerprint_profile") or value.get("fingerprint_key")
+    )
+    identity["device_id"] = str(identity.get("device_id") or value.get("device_id") or "").strip()
+    identity["auth_session_logging_id"] = str(
+        identity.get("auth_session_logging_id") or value.get("auth_session_logging_id") or ""
+    ).strip()
+    identity.setdefault("account_key", str(value.get("account_key") or value.get("email") or "").strip())
+    if identity.get("browser_identity") is None and value.get("browser_identity"):
+        identity["browser_identity"] = dict(value["browser_identity"])
+    return identity
+
+
+def bind_account_identity(identity_or_account: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Bind an account identity to the current worker thread."""
+    from ..auth_headers import (
+        set_auth_fingerprint,
+        set_fingerprint_device,
+        set_fingerprint_geo,
+    )
+
+    identity = account_identity(identity_or_account)
+    key = identity.get("fingerprint_key")
+    if key:
+        set_auth_fingerprint(str(key))
+    affinity = identity.get("proxy_affinity") or {}
+    country = str(affinity.get("country") or "").strip().upper()
+    if country:
+        set_fingerprint_geo(country)
+    device_id = str(identity.get("device_id") or "").strip()
+    if device_id:
+        set_fingerprint_device(device_id)
+    return identity
+
+
+def resolve_account_proxy(
+    account: Mapping[str, Any] | None,
+    *,
+    fallback_proxy: str | None = None,
+    config: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Resolve a saved account's original proxy; fallback is legacy-only."""
+    identity = account_identity(account)
+    affinity = identity.get("proxy_affinity") or {}
+    if affinity:
+        base = _configured_affinity_base(affinity, config)
+        restored = _restore_session(base, affinity) if base else ""
+        if restored:
+            return restored
+    normalized = normalize_proxy_url(fallback_proxy or "")
+    return normalized or None
+
+
+def proxy_egress_key(proxy: str | None) -> str:
+    """Credential-free identity of one *configured* egress.
+
+    Two proxies share a key only when they are the same endpoint **and** the
+    same sticky session -- i.e. when they are expected to leave through the same
+    exit.  The session id matters: this install's whole pool points at one host
+    (``us.lajiaohttp.net:2000``) and the only thing that separates the ten exits
+    is the ``-sid-XXXXXXXX-`` token inside the username.  Keying on host:port
+    alone would collapse the entire pool into a single identity and report a
+    collision for every concurrent account.
+
+    ``pool_index`` is deliberately not part of the key: the same configured entry
+    can sit at a different index after a rotation generation, and the exit it
+    describes does not change.  Keying on the slot would make the ledger see two
+    identities where the wire sees one.
+
+    This is the *configured* identity.  The measured exit IP is ground truth and
+    is recorded separately by ``store.environment_ledger`` -- the two can differ
+    (a provider may route two session ids out of the same address), which is
+    exactly the drift the ledger is meant to surface.
+    """
+    affinity = _proxy_affinity(proxy, pool_index=-1)
+    if not affinity:
+        return ""
+    endpoint = f"{affinity['scheme']}://{affinity['host']}:{affinity['port']}"
+    session_id = str(affinity.get("session_id") or "").strip()
+    return f"{endpoint}|sid={session_id}" if session_id else endpoint
+
+
+def _proxy_affinity(proxy: str | None, *, pool_index: int) -> dict[str, Any]:
+    normalized = normalize_proxy_url(proxy or "")
+    if not normalized:
+        return {}
+    parsed = urlsplit(normalized)
+    session_kind, session_id = _session_parts(parsed)
+    return {
+        "pool_index": int(pool_index) if int(pool_index) >= 0 else -1,
+        "scheme": str(parsed.scheme or "http").lower(),
+        "host": str(parsed.hostname or "").lower(),
+        "port": int(parsed.port or 0),
+        "country": infer_region(normalized),
+        "session_kind": session_kind,
+        "session_id": session_id,
+    }
+
+
+def _configured_affinity_base(
+    affinity: Mapping[str, Any],
+    config: Mapping[str, Any] | None,
+) -> str:
+    proxy_cfg = config.get("proxy", {}) if isinstance(config, Mapping) else {}
+    if not isinstance(proxy_cfg, Mapping):
+        proxy_cfg = {}
+    configured = proxy_cfg.get("pool") or []
+    if isinstance(configured, str):
+        configured = [
+            item.strip() for item in configured.replace(";", "\n").replace(",", "\n").splitlines() if item.strip()
+        ]
+    candidates = list(configured) if isinstance(configured, (list, tuple)) else []
+    for key in ("registration", "default"):
+        if proxy_cfg.get(key):
+            candidates.append(proxy_cfg[key])
+
+    index = _as_int(affinity.get("pool_index"), -1)
+    if 0 <= index < len(candidates):
+        candidate = normalize_proxy_url(candidates[index])
+        if _endpoint_matches(candidate, affinity):
+            return candidate
+    for raw in candidates:
+        candidate = normalize_proxy_url(raw)
+        if _endpoint_matches(candidate, affinity):
+            return candidate
+    return ""
+
+
+def _endpoint_matches(proxy: str, affinity: Mapping[str, Any]) -> bool:
+    if not proxy:
+        return False
+    parsed = urlsplit(proxy)
+    return (
+        str(parsed.scheme or "http").lower() == str(affinity.get("scheme") or "http").lower()
+        and str(parsed.hostname or "").lower() == str(affinity.get("host") or "").lower()
+        and int(parsed.port or 0) == _as_int(affinity.get("port"), 0)
+    )
+
+
+def _session_parts(parsed: Any) -> tuple[str, str]:
+    username = unquote(parsed.username or "")
+    password = unquote(parsed.password or "")
+    match = _USER_SID_RE.search(username)
+    if match:
+        return "username_sid", match.group(0)
+    match = _KOOKEEY_PASSWORD_RE.match(password)
+    if match:
+        return "password_sid", match.group("sid")
+    return "", ""
+
+
+def _restore_session(base_proxy: str, affinity: Mapping[str, Any]) -> str:
+    if not base_proxy:
+        return ""
+    session_id = str(affinity.get("session_id") or "").strip()
+    session_kind = str(affinity.get("session_kind") or "").strip()
+    if not session_id or not session_kind:
+        return base_proxy
+    parsed = urlsplit(base_proxy)
+    username = unquote(parsed.username or "")
+    password = unquote(parsed.password or "")
+    if session_kind == "username_sid":
+        username, count = _USER_SID_RE.subn(session_id, username, count=1)
+        return rebuild_proxy_credentials(parsed, username, password) if count else ""
+    if session_kind == "password_sid":
+        match = _KOOKEEY_PASSWORD_RE.match(password)
+        if not match:
+            return ""
+        password = f"{match.group('base')}-{match.group('cc')}-{session_id}-{match.group('ttl')}"
+        return rebuild_proxy_credentials(parsed, username, password)
+    return ""
+
+
+def _canonical_fingerprint_key(value: Any) -> str:
+    key = str(value or "").strip().lower().split("_", 1)[0]
+    try:
+        from ..auth_headers import AUTH_FINGERPRINT_PROFILES
+
+        return key if key in AUTH_FINGERPRINT_PROFILES else ""
+    except Exception:
+        return ""
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def access_token_of(account: Any) -> str:
+    """Return the access token carried by an account row or bare token string.
+
+    The single reader for ``access_token``. Callers that also accept a raw
+    token string pass it straight through; anything else yields ``""`` so a
+    probe reports a missing-AT failure instead of an ``AttributeError``.
+    """
+    if isinstance(account, str):
+        return account.strip()
+    if isinstance(account, Mapping):
+        return str(account.get("access_token") or "").strip()
+    return ""
+
+
+def chatgpt_account_id_from_token(value: Any) -> str:
+    """Extract ``chatgpt_account_id`` from a JWT access/id token or mapping.
+
+    Canonical parser for the ``https://api.openai.com/auth`` claim. The former
+    copies in ``account_promotion`` and ``account_liveness`` are thin shims over
+    this function so the claim path cannot drift between probes.
+    """
+    if isinstance(value, Mapping):
+        return str(value.get("chatgpt_account_id") or value.get("chatgptAccountId") or "").strip()
+    token = str(value or "").strip()
+    parts = token.split(".")
+    if len(parts) < 2:
+        return ""
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
+        data = json.loads(decoded.decode("utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(data, Mapping):
+        return ""
+    auth = data.get("https://api.openai.com/auth")
+    if isinstance(auth, Mapping):
+        account_id = str(auth.get("chatgpt_account_id") or auth.get("chatgptAccountId") or "").strip()
+        if account_id:
+            return account_id
+    return str(data.get("chatgpt_account_id") or data.get("chatgptAccountId") or "").strip()
+
+
+def account_chatgpt_id(account: Mapping[str, Any] | None) -> str:
+    """Best-effort ChatGPT account id from a saved account row.
+
+    Lives with the other identity parsers rather than in ``account_liveness``:
+    it is identity extraction, not liveness probing. Explicit fields win over
+    token claims so an account that carries both resolves deterministically.
+    """
+    _raw_value: object = account
+    value: Mapping = _raw_value if isinstance(_raw_value, Mapping) else {}
+    candidates: list[Any] = [
+        value.get("chatgpt_account_id"),
+        value.get("account_id"),
+        value.get("workspace_id"),
+        value.get("k12_workspace_id"),
+        _nested_value(value, "account", "id"),
+        _nested_value(value, "auth_session", "account", "id"),
+    ]
+    for token_key in ("id_token", "access_token"):
+        token_account = chatgpt_account_id_from_token(value.get(token_key))
+        if token_account:
+            candidates.append(token_account)
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _nested_value(data: Mapping[str, Any], *keys: str) -> Any:
+    node: Any = data
+    for key in keys:
+        if not isinstance(node, Mapping):
+            return ""
+        node = node.get(key)
+    return node
+
+
+__all__ = [
+    "account_chatgpt_id",
+    "account_identity",
+    "access_token_of",
+    "bind_account_identity",
+    "chatgpt_account_id_from_token",
+    "complete_registration_identity",
+    "create_registration_identity",
+    "proxy_egress_key",
+    "resolve_account_proxy",
+]

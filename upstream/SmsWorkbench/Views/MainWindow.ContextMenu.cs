@@ -1,0 +1,225 @@
+// Opted into nullable reference checking file-by-file - see the note in
+// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
+#nullable enable
+
+using SmsWorkbench.Localization;
+
+namespace SmsWorkbench
+{
+    public partial class MainWindow
+    {
+        // ── DataGrid context menu handlers ──
+
+        private void CtxViewDetail()
+        {
+            if (accountGridControl.SelectedRow is PoolRow row)
+                ShowAccountDetail(row);
+        }
+
+        private void CtxViewInbox()
+        {
+            if (accountGridControl.SelectedRow is PoolRow row)
+                ShowInboxDialog(row);
+        }
+
+        private void CtxCopyEmail()
+        {
+            if (accountGridControl.SelectedRow is PoolRow row && !string.IsNullOrWhiteSpace(row.Identifier))
+            {
+                try
+                {
+                    Clipboard.SetText(row.Identifier);
+                    NotifyInfo(Loc.T("邮箱已复制：") + row.Identifier);
+                }
+                catch (Exception ex)
+                {
+                    Log("复制邮箱失败：" + ex.Message);
+                }
+            }
+        }
+
+        private void CtxCopyAccessToken()
+            => RunUiTask(() => CtxCopyAccessTokenAsync(_lifetimeCts.Token));
+
+        private async Task CtxCopyAccessTokenAsync(CancellationToken ct = default)
+        {
+            if (accountGridControl.SelectedRow is not PoolRow row)
+            {
+                NotifyWarning(Loc.T("请先选择一个账号。"));
+                return;
+            }
+            string accessToken = await accountDetail.ResolveAccessTokenAsync(row, ct);
+            if (string.IsNullOrWhiteSpace(accessToken))
+            {
+                NotifyWarning(Loc.T("当前选中账号没有可复制的 AT。"));
+                return;
+            }
+            try
+            {
+                Clipboard.SetText(accessToken);
+                NotifyInfo(Loc.T("AT 已复制。"));
+            }
+            catch (Exception ex)
+            {
+                Log("复制 AT 失败：" + ex.Message);
+            }
+        }
+
+        private void CtxCopyPayPal()
+        {
+            if (accountGridControl.SelectedRow is PoolRow row && !string.IsNullOrWhiteSpace(row.PayPalUrl))
+            {
+                CopyPayPalUrl(row.PayPalUrl, row.Identifier);
+            }
+            else
+            {
+                NotifyWarning(Loc.T("当前选中行无支付链接。"));
+            }
+        }
+
+        private void CtxOpenPayPal()
+        {
+            if (accountGridControl.SelectedRow is PoolRow row && !string.IsNullOrWhiteSpace(row.PayPalUrl))
+            {
+                OpenPayPalUrl(row.PayPalUrl, row.Identifier);
+            }
+            else
+            {
+                NotifyWarning(Loc.T("当前选中行无支付链接。"));
+            }
+        }
+
+        private void CtxOpenSource()
+        {
+            if (accountGridControl.SelectedRow is PoolRow row)
+                OpenAccountJson(row);
+        }
+
+        private void CtxCheckAccountAlive()
+            => RunUiTask(() => CtxCheckAccountAliveAsync(_lifetimeCts.Token));
+
+        private async Task CtxCheckAccountAliveAsync(CancellationToken ct = default)
+        {
+            if (accountGridControl.SelectedRow is not PoolRow row || string.IsNullOrWhiteSpace(row.Identifier))
+            {
+                NotifyWarning(Loc.T("请先选择一个账号。"));
+                return;
+            }
+            await CheckAccountAliveAsync(row, ct);
+        }
+
+        private void CtxChangeEmail()
+            => RunUiTask(() => CtxChangeEmailAsync(_lifetimeCts.Token));
+
+        private void ChangeEmail()
+            => RunUiTask(() => CtxChangeEmailAsync(_lifetimeCts.Token));
+
+        private async Task CtxChangeEmailAsync(CancellationToken ct = default)
+        {
+            var rows = SelectedRowsOrCurrent().Where(row => row != null && !string.IsNullOrWhiteSpace(row.Identifier)).ToList();
+            if (rows.Count == 0)
+            {
+                NotifyWarning(Loc.T("请先选择要换绑的账号。"));
+                return;
+            }
+            var options = ChangeEmailDialogService.Show(
+                this,
+                rows.Count,
+                Register.DefaultWorkerCount(),
+                GetConfiguredSmailrDomain(),
+                GetConfiguredCfWorkerDomain());
+            if (options is null) return;
+            var plan = BackendCommandPlanner.CreateChangeEmail(
+                rows.Select(row => row.Identifier).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+                options.Provider,
+                options.MailboxFile,
+                options.Workers,
+                options.SmailrDomain,
+                options.CfworkerDomain,
+                GetRegistrationProxyPool(),
+                rootDir);
+            string json;
+            try { json = await RunBackendWithResultAsync(plan.TaskName, plan.Arguments.ToList(), plan.TimeoutMilliseconds ?? 900000, ct); }
+            finally { foreach (string path in plan.TempFiles) TryDeleteFile(path); }
+            try
+            {
+                using var doc = JsonDocument.Parse(json);
+                bool ok = doc.RootElement.TryGetProperty("ok", out var okEl) && okEl.GetBoolean();
+                await DialogFactory.ShowInfoAsync(this, Loc.T("邮箱换绑"), ok ? Loc.T("邮箱换绑完成。") : Loc.T("邮箱换绑部分失败，请查看任务结果。"));
+                RefreshPools();
+            }
+            catch
+            {
+                await DialogFactory.ShowInfoAsync(this, Loc.T("邮箱换绑"), Loc.T("未收到有效结果，请查看运行日志。"));
+            }
+        }
+
+        private async Task CheckAccountAliveAsync(PoolRow row, CancellationToken ct = default)
+        {
+            if (row == null || string.IsNullOrWhiteSpace(row.Identifier))
+            {
+                NotifyWarning(Loc.T("请先选择一个账号。"));
+                return;
+            }
+
+            if (!row.HasAccessToken)
+            {
+                await DialogFactory.ShowInfoAsync(this, Loc.T("账号测活"), Loc.T("该账号未获取 Access Token，无法测活。请先登录获取 AT。"));
+                return;
+            }
+
+            try
+            {
+                Log($"正在进行账号测活：{row.Identifier}");
+                BackendCommandPlan plan = BackendCommandPlanner.CreateQuotaUsageProbe(
+                    row.Identifier, 45, GetRegistrationProxyRoute());
+                string json = await RunBackendWithResultAsync(
+                    plan.TaskName, plan.Arguments.ToList(), 120000, ct);
+
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    await DialogFactory.ShowInfoAsync(this, Loc.T("账号测活"), Loc.T("账号测活失败：未收到有效响应。"));
+                    return;
+                }
+
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+
+                if (root.TryGetProperty("ok", out var okEl) && okEl.GetBoolean())
+                {
+                    string detail = FormatAccountLivenessDetail(root);
+                    await DialogFactory.ShowInfoAsync(this, Loc.F("账号测活：{0}", row.Identifier), detail);
+                    Log($"账号测活成功：{row.Identifier} → AT 有效");
+                    RefreshPools();
+                }
+                else
+                {
+                    string error = root.TryGetProperty("error", out var errEl) ? SensitiveDataSanitizer.Redact(errEl.GetString() ?? "未知错误") : "未知错误";
+                    string status = root.TryGetProperty("status", out var stEl) ? stEl.GetString() ?? "" : "";
+                    string failureClass = root.TryGetProperty("failure_class", out var fcEl) ? fcEl.GetString() ?? "" : "";
+                    string msg = $"测活失败：{error}";
+                    if (failureClass.Length > 0)
+                        msg += $"\n失败分类：{failureClass}";
+                    if (status == "token_invalid")
+                        msg += "\n\n接口返回 HTTP 401，当前 Access Token 已失效。";
+                    await DialogFactory.ShowInfoAsync(this, Loc.F("账号测活：{0}", row.Identifier), msg);
+                    Log($"账号测活失败：{row.Identifier} → {error} failure_class={failureClass}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"账号测活异常：{ex.Message}");
+                    await DialogFactory.ShowInfoAsync(this, Loc.T("账号测活"), Loc.F("测活异常：{0}", SensitiveDataSanitizer.Redact(ex.Message)));
+            }
+        }
+
+        private static string FormatAccountLivenessDetail(JsonElement root)
+        {
+            var sb = new StringBuilder();
+            string statusCode = root.TryGetProperty("status_code", out var codeEl) ? codeEl.ToString() : "";
+            sb.AppendLine("状态：AT 有效");
+            sb.AppendLine("接口：HTTP " + (string.IsNullOrWhiteSpace(statusCode) ? "200" : statusCode));
+            return sb.ToString().TrimEnd();
+        }
+    }
+}

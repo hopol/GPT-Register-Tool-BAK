@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <IsTestProject>true</IsTestProject>
+    <IsPackable>false</IsPackable>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Scenario-style test names and one-off fixture arrays are intentional. -->
+    <NoWarn>$(NoWarn);CA1707;CA1861</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\SmsWorkbench.Contracts\SmsWorkbench.Contracts.csproj" />
+    <ProjectReference Include="..\..\SmsWorkbench\SmsWorkbench.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Shared cross-language promotion contract fixture (see PromotionStatusContractTests). -->
+    <None Include="..\fixtures\promotion_status_cases.json" CopyToOutputDirectory="PreserveNewest" Link="promotion_status_cases.json" />
+    <!-- Shared cross-language proxy parsing fixture (see ProxyInputNormalizerTests / test_proxy_entry). -->
+    <None Include="..\fixtures\proxy_input_cases.json" CopyToOutputDirectory="PreserveNewest" Link="proxy_input_cases.json" />
+    <!-- Shared cross-language OAuth client id fixture (see OAuthClientIdContractTests / test_mailbox_graph_pure). -->
+    <None Include="..\fixtures\oauth_client_id.json" CopyToOutputDirectory="PreserveNewest" Link="oauth_client_id.json" />
+    <!-- Shared cross-language proxy-transport contract (see ProxyArgumentTransportTests / test_proxy_cli_env_transport). -->
+    <None Include="..\fixtures\proxy_env_transport.json" CopyToOutputDirectory="PreserveNewest" Link="proxy_env_transport.json" />
+  </ItemGroup>
+</Project>

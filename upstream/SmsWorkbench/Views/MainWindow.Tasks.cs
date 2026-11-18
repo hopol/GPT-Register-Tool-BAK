@@ -1,0 +1,533 @@
+// Opted into nullable reference checking file-by-file - see the note in
+// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
+#nullable enable
+
+
+using SmsWorkbench.Localization;
+
+namespace SmsWorkbench
+{
+    public partial class MainWindow
+    {
+        // Backend process, task list, deletion and cancellation actions.
+        //
+        // CLI argument construction is delegated to BackendCommandPlanner;
+        // backend JSON business interpretation is delegated to
+        // BackendResultInterpreter.
+
+        private bool doctorProbeStarted;
+
+        // Built in the constructor from the shared task coordinator and this
+        // window's log sink.
+        private readonly AccountDeleteService accountDelete;
+
+        // Long-running backend tasks (registration / payment batches) share one
+        // timeout budget; keep it a named constant instead of inline math.
+        private const int BackendTaskTimeoutMs = 12 * 60 * 60 * 1000;
+        private const int BackendTaskTimeoutSeconds = 12 * 60 * 60;
+        private DateTime lastHotPersistenceRefreshUtc = DateTime.MinValue;
+
+        /// <summary>
+        /// One-shot background environment probe (`python -m sms_tool --doctor --json`)
+        /// run straight through the backend client so the single-active-task
+        /// invariant is untouched. Surfaces missing interpreter/dependencies
+        /// with fix hints instead of letting them surface as per-task failures.
+        /// </summary>
+        internal async Task RunStartupDoctorProbeAsync(CancellationToken ct = default)
+        {
+            if (doctorProbeStarted)
+                return;
+            doctorProbeStarted = true;
+            try
+            {
+                var command = BackendCommand.Create("doctor", new[] { "--doctor", "--json" }, 90 * 1000);
+                BackendCommandResult result = await backendClient.RunAsync(command, cancellationToken: ct).ConfigureAwait(true);
+                if (!result.Payload.HasValue)
+                {
+                    Log("[doctor] 环境自检未返回结构化结果(退出码 " + result.ExitCode + ")");
+                    return;
+                }
+                var fails = new List<string>();
+                int warned = 0;
+                foreach (JsonElement check in result.Payload.Value.GetProperty("checks").EnumerateArray())
+                {
+                    // GetString() returns null for a JSON `null` value, not only
+                    // for a missing property - `?? ""` keeps that null out of
+                    // the interpolated failure line below.
+                    string status = check.TryGetProperty("status", out JsonElement statusElement) ? statusElement.GetString() ?? "" : "";
+                    string name = check.TryGetProperty("name", out JsonElement nameElement) ? nameElement.GetString() ?? "" : "";
+                    string hint = check.TryGetProperty("hint", out JsonElement hintElement) ? hintElement.GetString() ?? "" : "";
+                    if (status == "fail")
+                        fails.Add(string.IsNullOrEmpty(hint) ? name : $"{name}: {hint}");
+                    else if (status == "warn")
+                        warned++;
+                }
+                if (fails.Count == 0)
+                {
+                    Log($"[doctor] 环境自检通过{(warned > 0 ? $"({warned} 项警告,详见设置与代理配置)" : "")}");
+                    return;
+                }
+                var detail = string.Join("\n  - ", fails);
+                Log("[doctor] 环境自检发现 " + fails.Count + " 项缺失依赖");
+                MessageBox.Show(
+                    this,
+                    Loc.F(
+                        "环境自检发现 {0} 项必需依赖缺失:\n  - {1}\n\n可先运行: python -m pip install -r requirements.txt -c constraints.txt\n或使用命令 python chatgpt_phone_reg.py --doctor 查看完整报告。",
+                        fails.Count,
+                        detail),
+                    Loc.T("环境自检"),
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+            catch (Exception ex)
+            {
+                Log("[doctor] 环境自检失败: " + ex.Message);
+                MessageBox.Show(
+                    this,
+                    Loc.F(
+                        "{0}\n\n桌面端依赖 Python 3.10+ 与 requirements.txt/constraints.txt 中的依赖包。\n安装后在 设置 → 数据与文件 → 运行环境 配置解释器路径,再重启本程序。",
+                        SensitiveDataSanitizer.Redact(ex.Message)),
+                    Loc.T("无法启动 Python 后端"),
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+        }
+
+        // RerunFailed_Click / RebuildSqlite_Click removed (2026-09-02, round 6):
+        // dead event handlers -- no XAML element subscribes to either. They were
+        // also the only `async void` in this file. The BackendCommandPlanner
+        // builders they called (CreateRerunFailedRegistration /
+        // CreateRebuildSqlite) are kept: the Contracts side is unit-tested and is
+        // the piece to wire up if these actions ever return to the UI.
+
+        private void RunBackend(string taskName, List<string> args)
+            => RunUiTask(() => RunBackendAsync(taskName, args, ct: _lifetimeCts.Token));
+
+        /// <summary>
+        /// Plan-based entry point. It differs from the string-only overload in one
+        /// respect: it carries <see cref="BackendCommandPlan.TempFiles"/> into the
+        /// runner, so the wrapper's <c>finally</c> deletes the batch files this run
+        /// created. Without it a plan's declared temp files are never touched --
+        /// which is exactly how the selected-mailbox batch files (mailbox
+        /// credentials) used to survive in <c>%TEMP%</c>.
+        /// </summary>
+        private void RunBackend(BackendCommandPlan plan)
+            => RunUiTask(() => RunBackendAsync(
+                plan.TaskName,
+                plan.Arguments.ToList(),
+                timeoutMs: plan.TimeoutMilliseconds,
+                resultKind: plan.ResultKind,
+                temporaryFiles: plan.TempFiles,
+                ct: _lifetimeCts.Token));
+
+        private void RunAccountBatchBackend(BackendCommandPlan plan, string domain, int total)
+            => RunUiTask(() => RunBackendAsync(
+                plan.TaskName, plan.Arguments.ToList(), domain, total, plan.TimeoutMilliseconds,
+                resultKind: plan.ResultKind, temporaryFiles: plan.TempFiles, ct: _lifetimeCts.Token));
+
+        /// <summary>
+        /// Temp-file owning wrapper. Cleanup is delegated to
+        /// <see cref="TransientArtifactCleanup.RunWithCleanupAsync"/> because the
+        /// <c>try/finally</c> has to sit outside the whole body: callers write
+        /// their temporary files (a selected-mailbox batch file holds raw
+        /// mailbox credentials) *before* calling in, so every exit path must
+        /// delete them -- including the single-task guard below and a throw while
+        /// the progress dialog is being constructed.
+        /// </summary>
+        private Task RunBackendAsync(
+            string taskName,
+            List<string> args,
+            string progressDomain = "",
+            int progressTotal = 0,
+            int? timeoutMs = null,
+            BackendAccountResultKind resultKind = BackendAccountResultKind.None,
+            IReadOnlyList<string>? temporaryFiles = null,
+            CancellationToken ct = default)
+            => TransientArtifactCleanup.RunWithCleanupAsync(
+                temporaryFiles,
+                () => RunBackendCoreAsync(
+                    taskName, args, progressDomain, progressTotal, timeoutMs, resultKind, ct),
+                DeleteTemporaryFiles);
+
+        private async Task RunBackendCoreAsync(
+            string taskName,
+            List<string> args,
+            string progressDomain,
+            int progressTotal,
+            int? timeoutMs,
+            BackendAccountResultKind resultKind,
+            CancellationToken ct)
+        {
+            if (backendTasks.IsRunning)
+            {
+                MessageBox.Show(Loc.T("已有批次正在运行，请先取消或等待完成。"), Loc.T("运行中"), MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            string safeArgs = FormatBackendArgsForDisplay(args);
+            TaskRow task = TaskList.StartBatch(taskName, safeArgs);
+            ScrollTaskGridToBottom();
+            DateTime started = DateTime.Now;
+            AccountBatchProgressTracker? accountProgress = string.IsNullOrWhiteSpace(progressDomain)
+                ? null
+                : new AccountBatchProgressTracker(progressDomain, progressTotal);
+            AccountBatchProgressDialog? progressDialog = accountProgress == null
+                ? null
+                : new AccountBatchProgressDialog(this, taskName, progressTotal, () => backendTasks.Cancel());
+            progressDialog?.Show();
+
+            // One run owns one service instance: the capture buffer and the log
+            // folder are per-run state, and a finished batch must not bleed into the
+            // next one.
+            var backendRun = new BackendRunService();
+            string commandId = Guid.NewGuid().ToString("N");
+            // The folding rules (envelope vs. operator line) live in the service; this
+            // is the window's share: counters, the throttled pool refresh, the progress
+            // dialog and the task-row detail.
+            void HandleProgressEvent(BackendProgressEvent progressEvent)
+            {
+                LogBackendProgress(taskName, progressEvent);
+                // One terminal event per finished account is the throughput sample;
+                // the strip's window arithmetic lives in MetricsViewModel.
+                Metrics.Record(progressEvent);
+                if (progressEvent.Domain == "registration"
+                    && (progressEvent.Stage == "registration_status_changed"
+                        || progressEvent.Stage == "mailboxes_skipped"))
+                {
+                    // The backend drops cooling/quarantined/dead-end mailboxes
+                    // before attempting them; refreshing here takes those rows out
+                    // of their stale pre-batch state instead of leaving the
+                    // operator to find the skip in the backend log.
+                    RefreshPoolsThrottled(preserveView: true);
+                    }
+                    if (accountProgress != null
+                        && string.Equals(progressEvent.Domain, accountProgress.Domain, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Update only returns true for a terminal per-account event,
+                        // i.e. one account really finished and was persisted
+                        // backend-side. That is the moment its grid row goes stale.
+                        if (accountProgress.Update(progressEvent))
+                            RefreshPoolsThrottled(preserveView: true);
+                        progressDialog?.Update(
+                            accountProgress.Completed,
+                            accountProgress.Total,
+                            progressEvent.AccountRef,
+                            progressEvent.Detail);
+                    }
+                task.Info = progressEvent.Detail.Length > 0
+                    ? $"{progressEvent.Stage}: {progressEvent.Detail}"
+                    : progressEvent.Stage;
+            }
+
+            // WPF marshals to the UI thread; the service keeps the folding rules.
+            var progress = new Progress<BackendOutputLine>(
+                line => backendRun.Feed(line, HandleProgressEvent, UiLog, RefreshPoolsAfterHotPersistence));
+            string activeKey = string.Empty;
+            try
+            {
+                // Promote the navigation key parked by OnNavigate: the sidebar marks
+                // this row until the finally below clears it. Dialog-only actions
+                // never reach this funnel, so they leave no highlight behind.
+                activeKey = TakePendingNavKey();
+                if (activeKey.Length > 0) ActiveNavKey = activeKey;
+                logger?.Information("启动后端任务 task={TaskName} command_id={CommandId} args={Args}", taskName, commandId, safeArgs);
+                Log(BackendLogPresenter.TaskStartLine(taskName));
+                StatusBar.Text = taskName + " 运行中";
+                BackendCommandResult result = await backendTasks.RunAsync(
+                    BackendCommand.Create(
+                        taskName,
+                        args,
+                        timeoutMs ?? BackendTaskTimeoutMs,
+                        new Dictionary<string, string>
+                        {
+                            ["SMSWORKBENCH_EVENTS"] = "1",
+                            ["SMS_TOOL_COMMAND_ID"] = commandId,
+                            ["SMS_TOOL_TASK_NAME"] = taskName,
+                            ["SMS_TOOL_EVENT_SOURCE"] = "wpf",
+                        }),
+                    progress,
+                    ct);
+
+                // Use BackendResultInterpreter to normalize the outcome
+                BackendExecutionResult interpreted = BackendResultInterpreter.Interpret(
+                    result, taskName, (timeoutMs ?? BackendTaskTimeoutMs) / 1000);
+
+                // A killed Python process may not emit its terminal envelope.
+                // Recover the rows already persisted by the liveness workers so
+                // the operator still gets a useful partial result dialog.
+                if (result.TimedOut && resultKind == BackendAccountResultKind.Liveness)
+                {
+                    string snapshot = TryReadLatestLivenessSnapshot();
+                    if (snapshot.Length > 0)
+                        backendRun.Capture(snapshot);
+                }
+
+                string batchSummary = BackendResultInterpreter.BatchSummaryLabel(
+                    interpreted.Payload,
+                    // A registration payload that lost a counter key used to read as
+                    // 0 in the task row with nothing in the log. The manifest gate
+                    // catches the rename at commit time; this catches an older
+                    // binary meeting a newer backend at run time.
+                    //
+                    // ``Serilog.Log`` fully qualified: this class has its own
+                    // ``Log(string)`` panel method, and the static sink avoids the
+                    // maybe-null capture the compiler reports for the injected field
+                    // inside a lambda (CS8600/CS8602) while the build-warning
+                    // ratchet holds a zero baseline.
+                    missingKey => Serilog.Log.Warning(
+                        "Registration batch summary is missing required key {Key}", missingKey));
+                BackendRunOutcome outcome = BackendRunService.Describe(interpreted, batchSummary, started, DateTime.Now);
+                task.Status = outcome.Status;
+                if (outcome.Info != null) task.Info = outcome.Info;
+                task.Cost = outcome.CostSeconds;
+                task.DoneAt = outcome.DoneAt;
+                StatusBar.Text = taskName + " 已结束";
+                RefreshPools();
+                ScrollTaskGridToBottom();
+                if (BackendResultInterpreter.HasAccountResults(resultKind))
+                {
+                    ShowAccountScanResultDialog(backendRun.CapturedOutput, resultKind);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                task.Status = "已取消";
+                task.DoneAt = SafeTime(DateTime.Now);
+                StatusBar.Text = taskName + " 已取消";
+            }
+            catch (BackendTaskAlreadyRunningException)
+            {
+                task.Status = "未启动";
+                task.DoneAt = SafeTime(DateTime.Now);
+                StatusBar.Text = taskName + " 未启动";
+                MessageBox.Show(Loc.T("已有批次正在运行，请先取消或等待完成。"), Loc.T("运行中"), MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                task.Status = "启动失败";
+                Log("启动失败：" + ex.Message);
+            }
+            finally
+            {
+                ClearActiveNavKey(activeKey);
+                // Temp-file deletion lives in RunBackendAsync's wrapper: it has to
+                // cover the early returns above this try block as well.
+                progressDialog?.Close();
+            }
+        }
+
+        private void DeleteTemporaryFiles(IReadOnlyList<string>? paths)
+        {
+            if (paths == null)
+                return;
+            foreach (string path in paths)
+            {
+                if (!string.IsNullOrWhiteSpace(path))
+                    TryDeleteFile(path);
+            }
+        }
+
+        private string TryReadLatestLivenessSnapshot()
+        {
+            try
+            {
+                string directory = Path.Combine(rootDir, "runtime", "account_liveness_batches");
+                if (!Directory.Exists(directory)) return "";
+                // Prefer a terminal snapshot: partial snapshots are written
+                // while the batch runs (and after a hard kill) and may carry
+                // unfinished rows. A stale non-terminal snapshot (older than
+                // 10 minutes) is crash residue from a dead batch, not an
+                // answer to this task's question.
+                string? latest = Directory.GetFiles(directory, "*.json")
+                    .OrderByDescending(File.GetLastWriteTimeUtc)
+                    .FirstOrDefault();
+                if (string.IsNullOrWhiteSpace(latest)) return "";
+                using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(latest));
+                JsonElement root = doc.RootElement;
+                if (!root.TryGetProperty("results", out _) || !root.TryGetProperty("total", out _))
+                    return "";
+                bool terminal = root.TryGetProperty("terminal", out JsonElement terminalEl)
+                    && terminalEl.ValueKind == JsonValueKind.True;
+                if (!terminal && File.GetLastWriteTimeUtc(latest) < DateTime.UtcNow.AddMinutes(-10))
+                    return "";
+                return root.GetRawText();
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private async Task<string> RunBackendWithResultAsync(string taskName, List<string> args, int timeoutMs = 120000, CancellationToken ct = default)
+        {
+            string commandId = Guid.NewGuid().ToString("N");
+            logger?.Information("启动后端任务 task={TaskName} command_id={CommandId} args={Args}", taskName, commandId, FormatBackendArgsForDisplay(args));
+            Log(BackendLogPresenter.TaskStartLine(taskName));
+            var logFolder = new BackendLogFolder();
+            var progress = new Progress<BackendOutputLine>(line =>
+            {
+                if (BackendProgressEventParser.TryParse(line.Text, out BackendProgressEvent? progressEvent))
+                {
+                    string? stageLine = BackendLogPresenter.ProgressEventLine(progressEvent);
+                    if (stageLine != null)
+                        UiLog(stageLine);
+                    return;
+                }
+                foreach (string display in logFolder.Feed(line.Text))
+                    UiLog(display);
+            });
+            return await backendTasks.RunForResultAsync(
+                BackendCommand.Create(
+                    taskName,
+                    args,
+                    timeoutMs,
+                    new Dictionary<string, string>
+                    {
+                        ["SMSWORKBENCH_EVENTS"] = "1",
+                        ["SMS_TOOL_COMMAND_ID"] = commandId,
+                        ["SMS_TOOL_TASK_NAME"] = taskName,
+                        ["SMS_TOOL_EVENT_SOURCE"] = "wpf",
+                    }),
+                progress,
+                ct);
+        }
+
+        private void LogBackendProgress(string taskName, BackendProgressEvent progressEvent)
+        {
+            logger?.Information(
+                "后端进度 task={TaskName} command_id={CommandId} account_ref={AccountRef} stage={Stage} status={Status} failure_class={FailureClass} detail={Detail}",
+                taskName,
+                progressEvent.CommandId,
+                progressEvent.AccountRef,
+                progressEvent.Stage,
+                progressEvent.Status,
+                progressEvent.FailureClass,
+                SensitiveDataSanitizer.Redact(progressEvent.Detail));
+        }
+
+        private static string FormatBackendArgsForDisplay(List<string> args)
+        {
+            return SensitiveDataSanitizer.RedactArguments(args);
+        }
+
+        private void RefreshPoolsAfterHotPersistence(string line)
+        {
+            if (string.IsNullOrWhiteSpace(line)
+                || !line.Contains(BackendTextMarkers.SavedSession, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            // Registration adds rows, so jumping to page one is the useful
+            // behaviour there. Mid-batch scan refreshes must not do that.
+            RefreshPoolsThrottled(preserveView: false);
+        }
+
+        /// <summary>
+        /// Rate-limited pool reload shared by both hot-refresh signals: the
+        /// "Saved session:" text marker (registration) and the terminal
+        /// per-account IPC event (scan / promotion). A backend can finish
+        /// several accounts inside 750ms; one reload per burst is enough.
+        /// <para>
+        /// A reload is not free: <c>read_accounts</c> took ~1.3s to build an
+        /// 862-row response when this was measured, so the window is only a
+        /// floor. <c>RefreshPoolsAsync</c> also drops a reload that arrives
+        /// while another is still in flight, which is what actually paces a
+        /// batch that completes accounts faster than the read can keep up.
+        /// </para>
+        /// </summary>
+        private void RefreshPoolsThrottled(bool preserveView)
+        {
+            DateTime now = DateTime.UtcNow;
+            if ((now - lastHotPersistenceRefreshUtc).TotalMilliseconds < 750)
+                return;
+            lastHotPersistenceRefreshUtc = now;
+            if (preserveView)
+                RefreshPoolsPreservingView();
+            else
+                RefreshPools();
+        }
+
+        private void ScrollTaskGridToBottom() => consoleControl.ScrollToLast();
+
+        private void DeleteSelected()
+            => RunUiTask(() => DeleteSelectedAsync(_lifetimeCts.Token));
+
+        private async Task DeleteSelectedAsync(CancellationToken ct = default)
+        {
+            var selected = SelectedEmailRowsOrNotify(Loc.T("删除"));
+            if (selected.Count == 0) return;
+            if (!await ShowDeleteConfirmDialog(selected.Count)) return;
+            try
+            {
+                // The invocation, the failure count and the temp-file cleanup live in
+                // AccountDeleteService; asking, reporting and refreshing stay here.
+                AccountDeleteResult result = await accountDelete
+                    .DeleteAsync(selected.Select(row => NormalizeEmailKey(row.Identifier)).ToList(), ct)
+                    .ConfigureAwait(true);
+                if (result.Failed > 0)
+                {
+                    await DialogFactory.ShowInfoAsync(
+                        this,
+                        Loc.T("删除未完成"),
+                        Loc.F("{0} 条记录未能完整删除。请查看运行日志。", result.Failed));
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("批量删除失败：" + SensitiveDataSanitizer.Redact(ex.Message));
+                await DialogFactory.ShowInfoAsync(this, Loc.T("删除失败"), Loc.T("批量删除未完成，请查看运行日志。"));
+            }
+            finally
+            {
+                RefreshPools();
+            }
+        }
+
+        private async Task<bool> ShowDeleteConfirmDialog(int count)
+        {
+            return await DialogFactory.ShowConfirmAsync(
+                this,
+                Loc.F("删除选中的 {0} 条记录？", count),
+                Loc.T("将同步清理本地邮箱池、SQLite 索引和匹配的 session 文件。此操作不可撤销。"),
+                Loc.T("删除"),
+                isDanger: true);
+        }
+
+        /// <summary>
+        /// Delete one file, logging a sanitized failure. Shared by the batch delete,
+        /// the context menu, the inbox and the temp-file cleanup, which is why it did
+        /// not move into <see cref="AccountDeleteService"/>.
+        /// </summary>
+        private bool TryDeleteFile(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return false;
+                File.Delete(path);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log("删除文件失败：" + SensitiveDataSanitizer.Redact(path) + " " + SensitiveDataSanitizer.Redact(ex.Message));
+                return false;
+            }
+        }
+
+        private void CancelBatch()
+        {
+            if (!backendTasks.IsRunning)
+            {
+                Log("当前没有运行中的批次。");
+                return;
+            }
+            try
+            {
+                if (backendTasks.Cancel())
+                    Log("已取消当前批次。");
+            }
+            catch (Exception ex)
+            {
+                Log("取消失败：" + ex.Message);
+            }
+        }
+    }
+}

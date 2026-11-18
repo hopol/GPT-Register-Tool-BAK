@@ -1,0 +1,40 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.cs]
+indent_style = space
+indent_size = 4
+csharp_new_line_before_open_brace = all
+dotnet_style_qualification_for_field = false:suggestion
+dotnet_style_prefer_auto_properties = true:suggestion
+
+[*.py]
+indent_style = space
+indent_size = 4
+
+[*.{json,jsonl,yml,yaml,xml,csproj,props,slnx}]
+indent_style = space
+indent_size = 2
+
+# The pre-MVVM code-behind used to carry a ten-rule CA baseline here
+# (CA1305/1310/1805/1806/1822/1845/1847/1861/1866/1869). The 2026-11-01 split
+# moved the dialogs, the batch-file builders and the row mappers out of the
+# partials; re-measuring with the whole block removed reported 0 warnings on
+# `dotnet build -t:Rebuild`, so the baseline is gone rather than narrowed.
+# Do not re-add it: fix the call site or suppress the one diagnostic in place,
+# with a comment saying why the analyzer cannot model the runtime shape.
+
+[**/DialogFactory.cs]
+dotnet_diagnostic.CA1859.severity = none
+
+[**/MailboxPoolFileStore.cs]
+dotnet_diagnostic.CA1861.severity = none
+
+[**/SmsProviderCatalogClient.cs]
+dotnet_diagnostic.CA1859.severity = none
+dotnet_diagnostic.CA1865.severity = none

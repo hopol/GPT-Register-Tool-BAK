@@ -1,0 +1,102 @@
+<ui:FluentWindow x:Class="SmsWorkbench.MainWindow"
+                 xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:loc="clr-namespace:SmsWorkbench.Localization"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+                 xmlns:local="clr-namespace:SmsWorkbench"
+                 xmlns:sys="clr-namespace:System;assembly=System.Runtime"
+                 Title="GPT Register Tool"
+                 Width="1360" Height="860" MinWidth="1220" MinHeight="720"
+                 WindowStartupLocation="CenterScreen"
+                 Background="{DynamicResource AppBg}"
+                 FontFamily="Segoe UI, Microsoft YaHei UI"
+                 FontSize="{StaticResource Type.Body.Size}"
+                 UseLayoutRounding="True"
+                 SnapsToDevicePixels="True"
+                 ExtendsContentIntoTitleBar="True"
+                 WindowBackdropType="Mica"
+                 WindowCornerPreference="Round">
+      <Grid Background="{DynamicResource AppBg}">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="48"/>
+          <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+      <local:TitleBar Grid.Row="0"/>
+
+      <Grid Grid.Row="1">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition x:Name="SidebarColumn" Width="248"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <!-- The chrome is its own surface and the divider against the content is
+             drawn once, here: window chrome and the title bar are the only places
+             besides inputs and the focus ring that keep a stroke. -->
+        <Grid Grid.Column="0">
+          <local:Sidebar IsCollapsed="{Binding SidebarCollapsed}"
+                         ActiveKey="{Binding ActiveNavKey, RelativeSource={RelativeSource AncestorType=Window}}"
+                         ToggleRequested="OnSidebarToggleRequested"/>
+          <Border Width="1" HorizontalAlignment="Right" Background="{DynamicResource Divider}"/>
+        </Grid>
+        <Grid Grid.Column="1" Margin="14,0,14,10">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="6"/>
+            <RowDefinition Height="320" MinHeight="160" MaxHeight="560"/>
+            <RowDefinition Height="24"/>
+          </Grid.RowDefinitions>
+
+          <local:AccountFilterBar Grid.Row="0"/>
+          <local:AccountGridView x:Name="AccountGridControl" Grid.Row="1" Pool="{Binding Pool}"/>
+
+          <GridSplitter Grid.Row="2"
+                        Height="6"
+                        HorizontalAlignment="Stretch"
+                        VerticalAlignment="Center"
+                        Background="Transparent"
+                        ShowsPreview="False"
+                        ResizeDirection="Rows"
+                        ResizeBehavior="PreviousAndNext"
+                        Cursor="SizeNS"
+                        ToolTip="{loc:Tr Key='拖动调整控制台高度'}"/>
+
+          <local:WorkbenchConsole x:Name="ConsoleControl" Grid.Row="3" TaskList="{Binding TaskList}" LogPanel="{Binding LogPanel}"/>
+
+          <!-- Status bar: the rolling throughput strip on the left, the operator
+               message on the right. The strip lives here rather than in its own row
+               because it is ambient information, not a panel: it must cost no vertical
+               space that the account grid could use. -->
+          <Border Grid.Row="4" Background="{DynamicResource StatusBg}" BorderBrush="{DynamicResource Line}" BorderThickness="0,1,0,0">
+            <Grid Margin="8,2">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                <local:Sparkline Width="72" Height="12" Margin="0,0,8,0"
+                                 VerticalAlignment="Center"
+                                 Values="{Binding Metrics.Throughput}"
+                                 Stroke="{DynamicResource Primary}"/>
+                <TextBlock VerticalAlignment="Center"
+                           FontSize="{StaticResource Type.Caption.Size}"
+                           Foreground="{DynamicResource TextSub}"
+                           Text="{Binding Metrics.SummaryText}"/>
+                <!-- Failure split: hidden while nothing fails, so the strip does not
+                     permanently reserve space for an empty slot. -->
+                <TextBlock Margin="10,0,0,0"
+                           VerticalAlignment="Center"
+                           FontSize="{StaticResource Type.Caption.Size}"
+                           Foreground="{DynamicResource Danger}"
+                           Visibility="{Binding Metrics.FailureVisible, Converter={StaticResource BooleanToVisibilityConverter}}"
+                           Text="{Binding Metrics.FailureText}"/>
+              </StackPanel>
+              <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="{Binding StatusBar.Text}" Foreground="{DynamicResource TextSub}"/>
+            </Grid>
+          </Border>
+        </Grid>
+      </Grid>
+    <ui:SnackbarPresenter x:Name="SnackbarPresenter" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="24,24,24,48"/>
+    </Grid>
+</ui:FluentWindow>

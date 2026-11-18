@@ -1,0 +1,30 @@
+# Project Context
+
+## Domain Terms
+
+- **Mailbox provider**: an adapter that creates, reads, refreshes, or polls a mailbox.
+- **Registration driver**: the protocol or browser implementation that performs account registration.
+- **Registration operations**: the immutable set of dependencies bound for one protocol workflow invocation.
+- **Registration runtime**: per-invocation resources, identity, auth, OTP, account and outcome state; not a persistence schema.
+- **Retry policy**: shared failure decisions; session, stage and mailbox circuits retain separate state lifetimes.
+- **Command ID / Run ID**: a backend-process correlation ID and its per-registration attempt ID.
+- **Proxy lane**: an isolated egress purpose such as registration, mailbox/OTP, liveness, or payment.
+- **Desktop read**: the read-only sanitized account/mailbox contract consumed by WPF.
+- **Payment wire**: the cross-lane payment kernel — the non-Checkout session
+  factory, the Checkout primitives, the country→currency map, the provider-stage
+  order and the shared failure vocabulary. Owned by `sms_tool/payment/wire.py`;
+  `paypal_extract` re-exports it rather than redefining it.
+- **Payment batch**: a resumable cohort execution with per-account terminal results.
+- **Payment capability probe**: a side-effect-limited Checkout and Stripe-init
+  observation that lists offered methods without creating or confirming one.
+- **Extractor runtime**: provider-neutral helpers shared by the protocol-payment
+  QR extractors — pre-proxy normalization and the sticky proxy-chain key. Owned
+  by `services/protocol-payment/common/extractor_runtime.py`; anything that reads
+  a provider env var, locale, or constant stays in its extractor (Rule 19).
+
+## Ownership Rules
+
+- `sms_tool/providers/` owns provider implementations; `mailbox/router.py` owns routing.
+- `sms_tool/store/` owns persistence and emits facts, not provider side effects.
+- `SmsWorkbench/` owns presentation and command planning; Python owns provider and protocol behavior.
+- `docs/architecture.md` describes current boundaries; `docs/audits/` contains historical evidence; `docs/adr/` records decisions.

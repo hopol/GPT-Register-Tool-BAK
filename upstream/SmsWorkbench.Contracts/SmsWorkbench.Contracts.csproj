@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- Keep in sync with SmsWorkbench.csproj: publishing restores with
+         -r win-x64 while `dotnet test` restores without a RID. Declaring the
+         RID here keeps the packages.lock.json RID set consistent with both,
+         otherwise restore in locked mode fails with NU1004. -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>SmsWorkbench.Contracts</AssemblyName>
+    <RootNamespace>SmsWorkbench</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Shared policy/catalog resources live with their only readers
+         (SensitiveDataSanitizer / PaymentMethods), which moved here so the
+         desktop command-plan contracts are window-independent. LogicalName is
+         pinned so the resource id does not follow the assembly rename. -->
+    <EmbeddedResource Include="..\payment_methods.json" LogicalName="SmsWorkbench.payment_methods.json" />
+    <EmbeddedResource Include="..\sensitive_policy.json" LogicalName="SmsWorkbench.sensitive_policy.json" />
+  </ItemGroup>
+</Project>

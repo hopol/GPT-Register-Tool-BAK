@@ -1,0 +1,423 @@
+"""ChatGPT account plan / promotion (优惠) detection.
+
+Probes ``/backend-api/accounts/check/v4-2023-04-27`` with a saved access token and
+extracts the account's current plan plus any Plus-trial / discount eligibility.
+Referenced from the turb-gpt-free-register plan-check flow, adapted to this
+project's curl_cffi + auth-header stack. The condensed ``promotion_status`` label
+is what the desktop 优惠状态 column shows; the full parse is persisted for detail.
+
+This module owns the **probe only**. Running it across many saved accounts --
+proxy rotation, 429 throttling, persistence and progress events -- lives in
+:mod:`sms_tool.accounts.promotion_batch`.
+"""
+
+from __future__ import annotations
+
+from typing import Any, cast
+
+from curl_cffi import requests as curl_requests
+
+from .account_identity import (
+    access_token_of,
+    account_chatgpt_id,
+    bind_account_identity,
+    chatgpt_account_id_from_token,
+)
+from ..auth_headers import auth_impersonate, chatgpt_headers
+from .. import endpoints
+from ..config import CFG
+from ..phone_proxy import normalize_proxy_url, redact_proxy_url as _redact_proxy_url
+from ..promotion_states import (
+    PROMOTION_STATE_AUTH_INVALID,
+    PROMOTION_STATE_FREE,
+    PROMOTION_STATE_PROBE_FAILED,
+    PROMOTION_STATE_SUBSCRIBED,
+    PROMOTION_STATE_TRIAL_ELIGIBLE,
+    PROMOTION_STATE_UNKNOWN,
+)
+from ..proxy.routing import select_operation_proxy_candidate
+
+ACCOUNTS_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27"
+ACCOUNTS_CHECK_URL = f"{endpoints.CHATGPT_BASE}{ACCOUNTS_CHECK_PATH}"
+
+#: Read-only Plus-trial coupon probe.  It answers "is the one-month trial still
+#: redeemable for this account?" directly, where ``accounts/check`` only exposes
+#: an indirect ``eligible_promo_campaigns`` hint.  Never redeems anything.
+COUPON_PATH = "/backend-api/promo_campaign/check_coupon"
+COUPON_QUERY = "coupon=plus-1-month-free&is_coupon_from_query_param=true"
+COUPON_URL = f"{endpoints.CHATGPT_BASE}{COUPON_PATH}?{COUPON_QUERY}"
+
+
+def _account_token(account: Any) -> str:
+    """Back-compat shim; the canonical reader is ``account_identity.access_token_of``."""
+    return access_token_of(account)
+
+
+def parse_accounts_check(body: Any, *, account_id: str = "") -> dict[str, Any]:
+    """Extract plan + Plus-trial/discount eligibility from an accounts/check body."""
+    accounts = body.get("accounts") if isinstance(body, dict) else None
+    if not isinstance(accounts, dict):
+        return {"ok": False, "error": "accounts_check_missing_accounts"}
+    item = None
+    if account_id and isinstance(accounts.get(account_id), dict):
+        item = accounts.get(account_id)
+    elif isinstance(accounts.get("default"), dict):
+        item = accounts.get("default")
+    else:
+        item = next((v for k, v in accounts.items() if k != "default" and isinstance(v, dict)), None)
+    if not isinstance(item, dict):
+        return {"ok": False, "error": "accounts_check_no_entry"}
+
+    account = item.get("account") or {}
+    entitlement = item.get("entitlement") or {}
+    promo = item.get("eligible_promo_campaigns") or {}
+    plus_campaign = promo.get("plus") if isinstance(promo, dict) else None
+    plus_meta = (plus_campaign or {}).get("metadata") or {}
+    discount = plus_meta.get("discount") or {}
+    duration = plus_meta.get("duration") or {}
+
+    plan_type = str(account.get("plan_type") or "").strip()
+    subscription_plan = str(entitlement.get("subscription_plan") or "").strip()
+    has_active = bool(entitlement.get("has_active_subscription"))
+    is_free = plan_type.lower() == "free" or subscription_plan.lower() == "chatgptfreeplan"
+    plus_trial_eligible = bool(is_free and plus_campaign)
+    offers = (item.get("eligible_offers") or {}).get("offers") or []
+    eligible_offer_ids = [o.get("id") for o in offers if isinstance(o, dict) and o.get("id")]
+
+    return {
+        "ok": True,
+        "current_plan_type": plan_type,
+        "subscription_plan": subscription_plan,
+        "has_active_subscription": has_active,
+        "is_active_subscription_gratis": bool(entitlement.get("is_active_subscription_gratis")),
+        "expires_at": entitlement.get("expires_at"),
+        "plus_trial_eligible": plus_trial_eligible,
+        "plus_trial_campaign_id": (plus_campaign or {}).get("id"),
+        "plus_trial_title": plus_meta.get("title"),
+        "plus_trial_discount_percentage": discount.get("percentage"),
+        "plus_trial_duration_num_periods": duration.get("num_periods"),
+        "plus_trial_duration_period": duration.get("period"),
+        "eligible_offer_ids": eligible_offer_ids,
+    }
+
+
+def parse_coupon_check(body: Any) -> dict[str, Any]:
+    """Extract the trial-coupon state from a ``check_coupon`` body.
+
+    Mirrors the reference ``plus_trial_checker``: ``state == "eligible"`` is the
+    affirmative answer, and ``redemption.redeemed`` is the negative one.
+    """
+    _raw_payload: object = body
+    payload: dict = _raw_payload if isinstance(_raw_payload, dict) else {}
+    raw_redemption = payload.get("redemption")
+    redemption: dict[str, Any] = raw_redemption if isinstance(raw_redemption, dict) else {}
+    state = str(payload.get("state") or payload.get("status") or "").strip().lower()
+    return {
+        "coupon_state": state,
+        "coupon_redeemed": bool(redemption.get("redeemed")),
+        "coupon_trial_eligible": state == "eligible",
+        "coupon_redeemed_at": str(
+            redemption.get("user_redeemed_at")
+            or redemption.get("redeemed_at")
+            or redemption.get("workspace_redeemed_at")
+            or ""
+        ),
+        "coupon_expires_at": str(redemption.get("expires_at") or ""),
+    }
+
+
+def _merge_coupon_evidence(parsed: dict[str, Any], coupon: dict[str, Any]) -> None:
+    """Fold coupon evidence into an accounts/check parse without overriding plan.
+
+    The coupon endpoint is authoritative for *trial eligibility*; it never
+    changes plan or subscription state, so this only ever promotes
+    ``plus_trial_eligible`` to True and demotes it on a redeemed coupon.
+    """
+    parsed["coupon_state"] = str(coupon.get("coupon_state") or "")
+    parsed["coupon_redeemed"] = bool(coupon.get("coupon_redeemed"))
+    parsed["coupon_trial_eligible"] = bool(coupon.get("coupon_trial_eligible"))
+    for key in ("coupon_redeemed_at", "coupon_expires_at"):
+        if coupon.get(key):
+            parsed[key] = coupon[key]
+    # When the authoritative probe has actually run, **only its affirmative
+    # answer** may advertise a trial.  A hint that is not confirmed -- because
+    # the coupon answered ``not_eligible``, or because the probe itself failed --
+    # is recorded as ``plus_trial_hint`` for diagnostics and never as
+    # ``plus_trial_eligible``.
+    #
+    # Measured 2026-11-05 on the iCloud pool: two full passes (270 probes)
+    # reported 11 + 1 accounts as ``可试用Plus -100% ×1month`` from
+    # ``eligible_promo_campaigns`` alone; re-probing every one of them through
+    # nine IN exits (plus three US exits, plus the identical batch path) answered
+    # ``not_eligible`` / no campaign every time.  A hint-only verdict is simply
+    # not reproducible, so it must not reach the 优惠状态 badge.
+    parsed["plus_trial_hint"] = bool(parsed.get("plus_trial_eligible"))
+    parsed["plus_trial_eligible"] = bool(coupon.get("coupon_trial_eligible"))
+
+
+def _coupon_probe_worth_running(parsed: dict[str, Any]) -> bool:
+    """Only free, subscription-less accounts can have a redeemable trial."""
+    if not parsed.get("ok") or parsed.get("has_active_subscription"):
+        return False
+    return str(parsed.get("current_plan_type") or "").strip().lower() in {"", "free"}
+
+
+def _probe_plus_coupon(*, headers, timeout, browser_fetch, proxies) -> dict[str, Any]:
+    """Read-only coupon probe on the same transport/fingerprint as the plan check.
+
+    Never raises: a coupon failure is a diagnostic, not a promotion verdict, so
+    the caller keeps the accounts/check answer and records the shortfall.
+    """
+    try:
+        if browser_fetch is not None:
+            result = browser_fetch(COUPON_URL, headers=headers, timeout_ms=int(timeout * 1000))
+            if isinstance(result, dict) and "status_code" not in result and "status" in result:
+                result = {**result, "status_code": result.get("status")}
+            status_code = int(result.get("status_code") or 0) if isinstance(result, dict) else 0
+            body = result.get("body") if isinstance(result, dict) else result
+            if status_code != 200 or not isinstance(body, dict):
+                return {"ok": False, "status_code": status_code, "error": "plus_coupon_unavailable"}
+            return {"ok": True, **parse_coupon_check(body)}
+        response = curl_requests.get(
+            COUPON_URL,
+            headers=headers,
+            proxies=proxies,
+            timeout=timeout,
+            impersonate=auth_impersonate(),
+            allow_redirects=False,
+        )
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        try:
+            body = response.json()
+        except Exception:
+            return {"ok": False, "status_code": status_code, "error": "plus_coupon_invalid_json"}
+        if status_code != 200 or not isinstance(body, dict):
+            return {"ok": False, "status_code": status_code, "error": "plus_coupon_unavailable"}
+        return {"ok": True, **parse_coupon_check(body)}
+    except Exception as exc:
+        return {"ok": False, "error": f"plus_coupon_transport:{str(exc)[:200]}"}
+
+
+def promotion_status_label(result: dict[str, Any]) -> str:
+    """Condense a parsed result into the compact 优惠状态 badge text."""
+    if not isinstance(result, dict) or not result.get("ok"):
+        error = str((result or {}).get("error") or "").lower()
+        if "401" in error or "token" in error or "unauthorized" in error:
+            return "AT失效"
+        return "检测失败"
+    plan = str(result.get("current_plan_type") or "").strip().lower()
+    if result.get("has_active_subscription") and plan and plan != "free":
+        label = "Plus" if "plus" in plan else (plan or "已订阅")
+        return f"{label.capitalize()}(赠)" if result.get("is_active_subscription_gratis") else f"已订阅·{label}"
+    if result.get("plus_trial_eligible"):
+        pct = result.get("plus_trial_discount_percentage")
+        periods = result.get("plus_trial_duration_num_periods")
+        period = str(result.get("plus_trial_duration_period") or "").strip()
+        parts = ["可试用Plus"]
+        if pct not in (None, ""):
+            try:
+                parts.append(f"-{int(round(float(pct)))}%")
+            except (TypeError, ValueError):
+                pass
+        if periods not in (None, "") and period:
+            parts.append(f"×{periods}{period}")
+        return "·".join(parts)
+    return "Free·无优惠"
+
+
+def promotion_status_code(result: Any) -> str:
+    """Machine state for the 优惠 badge, from the same parsed result as
+    :func:`promotion_status_label`.
+
+    Persisted as ``promotion_state`` next to the display label so the desktop
+    filter/sort consumes a stable enum (see ``sms_tool/promotion_states.py``)
+    instead of substring-matching Chinese copy.
+    """
+    if not isinstance(result, dict) or not result:
+        return PROMOTION_STATE_UNKNOWN
+    if not result.get("ok"):
+        error = str(result.get("error") or "").lower()
+        if "401" in error or "token" in error or "unauthorized" in error:
+            return PROMOTION_STATE_AUTH_INVALID
+        return PROMOTION_STATE_PROBE_FAILED
+    plan = str(result.get("current_plan_type") or "").strip().lower()
+    if result.get("has_active_subscription") and plan and plan != "free":
+        return PROMOTION_STATE_SUBSCRIBED
+    if result.get("plus_trial_eligible"):
+        return PROMOTION_STATE_TRIAL_ELIGIBLE
+    return PROMOTION_STATE_FREE
+
+
+def check_account_promotion(
+    account: Any,
+    proxy: str | None = None,
+    timeout: int = 20,
+    timezone_offset_min: str = "-",
+    *,
+    browser_fetch: Any = None,
+    proxy_pool: str | list[str] | None = None,
+    coupon_probe: bool = False,
+) -> dict[str, Any]:
+    """Probe accounts/check for one account and return plan + promotion detail.
+
+    When ``browser_fetch`` is provided, the probe is routed through the
+    browser context's ``fetch_json`` method instead of ``curl_cffi``,
+    carrying the real browser fingerprint and cookies to bypass
+    Cloudflare-based 401 blocks on protocol-only requests.
+
+    ``coupon_probe`` (opt-in, used by the batch path) additionally asks the
+    read-only Plus-trial coupon endpoint for free accounts, so a redeemable
+    trial is reported from the direct source rather than inferred from
+    ``eligible_promo_campaigns`` alone.
+    """
+    token = _account_token(account)
+    if not token:
+        return {
+            "ok": False,
+            "promotion_status": "缺少AT",
+            "error": "missing_access_token",
+            "promotion_state": PROMOTION_STATE_PROBE_FAILED,
+        }
+
+    had_identity_context = bool(account.get("identity_context")) if isinstance(account, dict) else False
+    identity = bind_account_identity(account)
+    # Promotion checks must reuse the saved registration egress/fingerprint
+    # pair; presenting the same AT from a different exit can trigger revocation.
+    selected_proxy = select_operation_proxy_candidate(
+        account
+        if had_identity_context
+        else {key: value for key, value in account.items() if key != "identity_context"},
+        operation="promotion",
+        explicit=cast("str | None", proxy or proxy_pool),
+        config=CFG,
+    )
+    resolved_proxy = selected_proxy.proxy if selected_proxy else None
+    proxy_source = selected_proxy.source if selected_proxy else "direct"
+
+    account_id = account_chatgpt_id(account) if isinstance(account, dict) else chatgpt_account_id_from_token(token)
+    did = str(identity.get("device_id") or (account.get("device_id") if isinstance(account, dict) else "") or "")
+    headers = chatgpt_headers(did, accept="*/*", referer=endpoints.CHATGPT_ORIGIN)
+    headers["Authorization"] = f"Bearer {token}"
+    headers["oai-language"] = "en-US"
+    if account_id:
+        headers["Chatgpt-Account-Id"] = account_id
+
+    url = f"{ACCOUNTS_CHECK_URL}?timezone_offset_min={timezone_offset_min}"
+
+    normalized_proxy = normalize_proxy_url(resolved_proxy or "")
+    # ``Any`` on purpose: curl_cffi's ``ProxySpec`` is a ``TypedDict``, which a
+    # plain ``dict[str, str]`` is not assignable to, while the runtime accepts it.
+    proxies: Any = {"http": normalized_proxy, "https": normalized_proxy} if normalized_proxy else None
+
+    # When a browser fetch callable is provided, route the probe through the
+    # browser context to carry the real fingerprint and cookies.
+    retry_after = ""
+    if browser_fetch is not None:
+        try:
+            result = browser_fetch(url, headers=headers, timeout_ms=timeout * 1000)
+            # ``PlaywrightBrowserSession.fetch_json`` returns the HTTP status
+            # under the ``status`` key, not ``status_code``.  Normalize the same
+            # way ``account_liveness.probe_account_liveness`` does, otherwise a
+            # genuine response is discarded as a transport failure and every
+            # browser-routed promotion probe degrades to "HTTP 0".
+            if isinstance(result, dict) and "status_code" not in result and "status" in result:
+                result = {**result, "status_code": result.get("status")}
+            if isinstance(result, dict) and "status_code" in result:
+                status_code = int(result.get("status_code") or 0)
+                body = result.get("body")
+            else:
+                status_code = 0
+                body = result
+        except Exception as exc:
+            return {
+                "ok": False,
+                "promotion_status": "检测失败",
+                "error": str(exc)[:300],
+                "promotion_state": PROMOTION_STATE_PROBE_FAILED,
+                "proxy_source": proxy_source,
+            }
+    else:
+        try:
+            response = curl_requests.get(
+                url,
+                headers=headers,
+                proxies=proxies,
+                timeout=timeout,
+                impersonate=auth_impersonate(),
+                allow_redirects=False,
+            )
+        except Exception as exc:
+            error = str(exc)
+            for candidate in (str(proxy or "").strip(), str(resolved_proxy or "").strip(), normalized_proxy):
+                if candidate:
+                    error = error.replace(candidate, _redact_proxy_url(candidate, empty_placeholder=""))
+            return {
+                "ok": False,
+                "promotion_status": "检测失败",
+                "error": error[:300],
+                "promotion_state": PROMOTION_STATE_PROBE_FAILED,
+                "proxy_source": proxy_source,
+            }
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        try:
+            retry_after = str((getattr(response, "headers", None) or {}).get("Retry-After") or "").strip()
+        except Exception:
+            retry_after = ""
+        try:
+            body = response.json()
+        except Exception:
+            return {
+                "ok": False,
+                "promotion_status": "检测失败",
+                "error": "invalid_json",
+                "status_code": status_code,
+                "promotion_state": PROMOTION_STATE_PROBE_FAILED,
+                "proxy_source": proxy_source,
+            }
+
+    if status_code == 401:
+        return {
+            "ok": False,
+            "promotion_status": "AT失效",
+            "error": "token_invalid",
+            "status_code": 401,
+            "promotion_state": PROMOTION_STATE_AUTH_INVALID,
+            "proxy_source": proxy_source,
+        }
+    if not (200 <= status_code < 300):
+        failure = {
+            "ok": False,
+            "promotion_status": f"HTTP {status_code}",
+            "error": f"http_{status_code}",
+            "status_code": status_code,
+            "promotion_state": PROMOTION_STATE_PROBE_FAILED,
+            "proxy_source": proxy_source,
+        }
+        if retry_after:
+            failure["retry_after"] = retry_after
+        return failure
+
+    parsed = parse_accounts_check(body, account_id=account_id)
+    parsed["status_code"] = status_code
+    if coupon_probe and _coupon_probe_worth_running(parsed):
+        coupon = _probe_plus_coupon(headers=headers, timeout=timeout, browser_fetch=browser_fetch, proxies=proxies)
+        parsed["coupon"] = coupon
+        if coupon.get("ok"):
+            _merge_coupon_evidence(parsed, coupon)
+    parsed["promotion_status"] = promotion_status_label(parsed)
+    parsed["promotion_state"] = promotion_status_code(parsed)
+    parsed["proxy_source"] = proxy_source
+    return parsed
+
+
+__all__ = [
+    "ACCOUNTS_CHECK_PATH",
+    "ACCOUNTS_CHECK_URL",
+    "COUPON_PATH",
+    "COUPON_URL",
+    "check_account_promotion",
+    "parse_accounts_check",
+    "parse_coupon_check",
+    "promotion_status_code",
+    "promotion_status_label",
+]

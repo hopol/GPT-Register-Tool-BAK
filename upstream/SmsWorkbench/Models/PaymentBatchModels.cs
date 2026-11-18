@@ -1,0 +1,113 @@
+// Opted into nullable reference checking file-by-file - see the note in
+// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
+#nullable enable
+
+using CommunityToolkit.Mvvm.ComponentModel;
+
+namespace SmsWorkbench
+{
+    public sealed record PaymentBatchAccount(string Email, bool HasAccessToken, string AccessToken = "");
+
+    /// <summary>
+    /// Payment-owned egress pools used by the batch extractor.  The UI keeps
+    /// one proxy per line while the backend receives the same newline-delimited
+    /// value and selects/rotates an entry per account and stage.
+    /// </summary>
+    public sealed record PaymentBatchProxyConfiguration(
+        string CheckoutProxyPool = "",
+        string ApproveProxyPool = "",
+        string CheckoutCountry = "",
+        string ApproveCountry = "",
+        string UpdateCountry = "",
+        /// <summary>
+        /// Full mixed-region source pool (every zone's entries).  Persisted to
+        /// the named &lt;method&gt;_checkout / &lt;method&gt;_approve pool so the
+        /// region filter never loses the zones the user is not currently viewing.
+        /// Empty falls back to <see cref="CheckoutProxyPool"/> for back-compat.
+        /// </summary>
+        string CheckoutProxySourcePool = "",
+        /// <summary>Same as <see cref="CheckoutProxySourcePool"/> for Approve.</summary>
+        string ApproveProxySourcePool = "");
+
+    /// <summary>
+    /// Test seam for the batch window's catalog-driven country options.  The
+    /// production view model passes null and resolves through
+    /// <see cref="PaymentMethods"/>; tests supply per-method overrides without
+    /// mutating the embedded catalog.
+    /// </summary>
+    internal interface IPaymentCountryCatalog
+    {
+        IReadOnlyList<PaymentProxyCountryOption> CheckoutCountryOptions(string paymentMethod);
+        IReadOnlyList<PaymentProxyCountryOption> ApproveCountryOptions(string paymentMethod);
+    }
+
+    public sealed partial class PaymentMatrixRow : ObservableObject
+    {
+        [ObservableProperty] private string name = "default";
+        [ObservableProperty] private string registrationCountry = "";
+        [ObservableProperty] private string checkoutCountry = "";
+        [ObservableProperty] private string promotionCountry = "";
+        [ObservableProperty] private string providerCountry = "";
+        [ObservableProperty] private string approveCountry = "";
+        [ObservableProperty] private string redirectCountry = "";
+        [ObservableProperty] private string strategy = "";
+        [ObservableProperty] private int sampleSize = 1;
+
+        // IsValid() removed (2026-09-02, round 6): no caller and no test. The
+        // two-letter country rule it encoded now lives only here as a note -- if
+        // batch validation is ever reintroduced, this is the predicate to revive.
+    }
+
+    public sealed partial class PaymentBatchResultRow : ObservableObject
+    {
+        [ObservableProperty] private string accountRef = "";
+        [ObservableProperty] private string progressText = "0%";
+        [ObservableProperty] private double progressPercent;
+        [ObservableProperty] private string currentStage = "等待";
+        [ObservableProperty] private string resultStatus = "等待";
+        public string MatrixCell { get; init; } = "";
+        public string AuthStatus { get; init; } = "";
+        public string RefreshStatus { get; init; } = "";
+        public string Eligibility { get; init; } = "";
+        public string Decision { get; init; } = "";
+        public string TerminalState { get; init; } = "";
+        public string ErrorStage { get; init; } = "";
+        public bool Retryable { get; init; }
+        public string ResultKind { get; init; } = "";
+        public string ResultValue { get; init; } = "";
+        public bool ResultPresent { get; init; }
+        public bool AuthorizationQueued { get; init; }
+        public string AuthorizationStatus { get; init; } = "";
+        public string AuthorizationDisplay => AuthorizationQueued
+            ? AuthorizationStatus.Length > 0 ? AuthorizationStatus : "pending"
+            : "";
+        public string ResultDisplay => ResultValue.Length > 0
+            ? ResultValue
+            : ResultPresent ? "已生成（报告仅保留存在状态）" : Decision;
+        public bool HasCopyableResult => ResultValue.Length > 0;
+        public string CopyToolTip => HasCopyableResult
+            ? $"复制{ResultKind}"
+            : ResultPresent ? "报告仅保留支付结果存在状态" : "没有可复制的支付结果";
+        public int Attempts { get; init; }
+    }
+
+    public sealed record PaymentBatchRequest(
+        IReadOnlyList<PaymentBatchAccount> Accounts,
+        string PaymentMethod,
+        int Workers,
+        int Retries,
+        int Canary,
+        string BatchId,
+        string CheckoutProxyPool,
+        string ApproveProxyPool,
+        string CheckoutCountry,
+        string ApproveCountry,
+        string UpdateCountry,
+        bool JitRefresh,
+        bool ProbeOnly,
+        bool RequireZero,
+        IReadOnlyList<PaymentMatrixRow> MatrixRows)
+    {
+        public bool ResumeCheckpoint { get; init; }
+    }
+}

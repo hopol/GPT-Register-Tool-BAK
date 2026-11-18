@@ -1,0 +1,385 @@
+﻿param(
+    [string]$Version = "",
+    [switch]$SkipPublish,
+    [switch]$SkipBundledPython,
+    [switch]$SelfSign,
+    [string]$CertificateSubject = "CN=GPT-Register-Tool Internal",
+    [string]$CertificateExportName = "GPT-Register-Tool-Internal-CodeSigning.cer"
+)
+
+$ErrorActionPreference = "Stop"
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$dotnet = Join-Path $repoRoot ".dotnet\dotnet.exe"
+if (-not (Test-Path $dotnet)) {
+    $dotnet = Join-Path $env:ProgramFiles "dotnet\dotnet.exe"
+}
+if (-not (Test-Path $dotnet)) {
+    $dotnet = "dotnet"
+}
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    # Single source of truth for the version is the latest git tag (vYYYY.MM.DD[.N]).
+    # Falls back to today's date only when no tag is reachable (e.g. shallow clone).
+    $tag = & git -C $repoRoot describe --tags --match='v*' --abbrev=0 2>$null
+    if ($LASTEXITCODE -eq 0 -and $tag) {
+        $Version = $tag.TrimStart('v')
+    } else {
+        $Version = "$(Get-Date -Format 'yyyy.MM.dd')"
+    }
+}
+
+# 手工传参时也要 trim。此前只有自动取 tag 的分支做了 TrimStart('v')，于是
+# -Version v2026.09.01 会原样进 `-p:Version=`，dotnet 直接报"不是有效的版本字符串"，
+# 而 -Version 2026.09.01 虽能构建却产出 Setup-2026.09.01.exe —— 与历史资产
+# 的 Setup-v2026.08.31.exe 命名不一致。两条路都不对，统一在这里归一。
+$Version = $Version.TrimStart('v')
+
+$publishDir = Join-Path $repoRoot "dist\net10"
+$installerRoot = Join-Path $repoRoot "dist\installer"
+$packageDir = Join-Path $installerRoot "package"
+$releaseDir = Join-Path $repoRoot "dist\release"
+$installerProject = Join-Path $repoRoot "scripts\installer\GPTRegisterToolSetup.csproj"
+
+function Reset-Directory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$AllowedRoot
+    )
+
+    $allowed = [System.IO.Path]::GetFullPath($AllowedRoot).TrimEnd('\') + '\'
+    $target = [System.IO.Path]::GetFullPath($Path)
+    if (-not $target.StartsWith($allowed, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to reset path outside ${allowed}: $target"
+    }
+
+    if (Test-Path $target) {
+        Remove-Item -LiteralPath $target -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $target -Force | Out-Null
+}
+
+function Copy-FilePreservingPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [Parameter(Mandatory = $true)][string]$DestinationRoot
+    )
+
+    $source = Join-Path $repoRoot $RelativePath
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        return
+    }
+
+    $destination = Join-Path $DestinationRoot $RelativePath
+    $destinationDir = Split-Path -Parent $destination
+    if (-not (Test-Path $destinationDir)) {
+        New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
+    }
+    Copy-Item -LiteralPath $source -Destination $destination -Force
+}
+
+function Remove-PackagePath {
+    param([Parameter(Mandatory = $true)][string]$RelativePath)
+
+    $target = [System.IO.Path]::GetFullPath((Join-Path $packageDir $RelativePath))
+    $allowed = [System.IO.Path]::GetFullPath($packageDir).TrimEnd('\') + '\'
+    if (-not $target.StartsWith($allowed, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove path outside package: $target"
+    }
+    if (Test-Path $target) {
+        Remove-Item -LiteralPath $target -Recurse -Force
+    }
+}
+
+function Get-InternalCodeSigningCertificate {
+    param([Parameter(Mandatory = $true)][string]$Subject)
+
+    $now = Get-Date
+    $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert |
+        Where-Object { $_.Subject -eq $Subject -and $_.NotAfter -gt $now } |
+        Sort-Object NotAfter -Descending |
+        Select-Object -First 1
+
+    if ($null -ne $cert) {
+        return $cert
+    }
+
+    Write-Host "Creating self-signed code signing certificate: $Subject"
+    return New-SelfSignedCertificate `
+        -Type CodeSigningCert `
+        -Subject $Subject `
+        -CertStoreLocation "Cert:\CurrentUser\My" `
+        -KeyAlgorithm RSA `
+        -KeyLength 3072 `
+        -HashAlgorithm SHA256 `
+        -KeyExportPolicy Exportable `
+        -NotAfter $now.AddYears(5)
+}
+
+function Sign-FileWithCertificate {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Cannot sign missing file: $Path"
+    }
+
+    Write-Host "Signing $Path"
+    $signature = Set-AuthenticodeSignature -FilePath $Path -Certificate $Certificate -HashAlgorithm SHA256
+    if ($null -eq $signature.SignerCertificate) {
+        throw "Signing failed for ${Path}: no signer certificate was written. Status: $($signature.Status) $($signature.StatusMessage)"
+    }
+    if ($signature.SignerCertificate.Thumbprint -ne $Certificate.Thumbprint) {
+        throw "Signing failed for ${Path}: signer thumbprint $($signature.SignerCertificate.Thumbprint) did not match $($Certificate.Thumbprint)"
+    }
+    if ($signature.Status -ne 'Valid') {
+        Write-Host "Signed with untrusted self-signed chain until the .cer is imported: $($signature.Status) $($signature.StatusMessage)"
+    }
+}
+
+function Export-CodeSigningCertificate {
+    param(
+        [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $parent = Split-Path -Parent $Path
+    if (-not (Test-Path $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    Export-Certificate -Cert $Certificate -FilePath $Path -Force | Out-Null
+    Write-Host "Exported public signing certificate: $Path"
+}
+
+function Assert-AuthenticodeSigned {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate
+    )
+
+    $signature = Get-AuthenticodeSignature -FilePath $Path
+    if ($null -eq $signature.SignerCertificate) {
+        throw "Missing Authenticode signature for ${Path}: $($signature.Status) $($signature.StatusMessage)"
+    }
+    if ($signature.SignerCertificate.Thumbprint -ne $Certificate.Thumbprint) {
+        throw "Unexpected signer for ${Path}: $($signature.SignerCertificate.Subject)"
+    }
+    Write-Host "Verified self-signed signature: $Path ($($signature.SignerCertificate.Subject), trust status: $($signature.Status))"
+}
+
+$signingCert = $null
+if ($SelfSign) {
+    $signingCert = Get-InternalCodeSigningCertificate -Subject $CertificateSubject
+}
+
+if (-not $SkipPublish) {
+    & (Join-Path $repoRoot "SmsWorkbench\build_dotnet.ps1") -Version $Version
+    if ($LASTEXITCODE -ne 0) {
+        throw "SmsWorkbench publish failed with exit code $LASTEXITCODE"
+    }
+}
+
+$desktopExe = Join-Path $publishDir "SmsWorkbench.exe"
+if (-not (Test-Path $desktopExe)) {
+    throw "Missing published desktop executable: $desktopExe"
+}
+
+if ($SelfSign) {
+    Sign-FileWithCertificate -Path $desktopExe -Certificate $signingCert
+    Assert-AuthenticodeSigned -Path $desktopExe -Certificate $signingCert
+}
+
+Reset-Directory -Path $installerRoot -AllowedRoot (Join-Path $repoRoot "dist")
+New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+
+# `ls-files` alone only lists TRACKED paths, so a brand-new release note that
+# has not been committed yet is silently dropped from the payload — the zip then
+# ships a README pointing at a release note that is not inside it (hit on
+# 2026-09-11 with release-v2026.09.11.md). `--others --exclude-standard` adds
+# untracked-but-not-ignored files, which keeps the payload consistent with the
+# working tree. Credential-bearing snapshots stay out because .gitignore now
+# rejects the whole config family (see the `proxy.json*` block there).
+$trackedFiles = & git -C $repoRoot ls-files --cached --others --exclude-standard
+if ($LASTEXITCODE -ne 0) {
+    throw "git ls-files failed with exit code $LASTEXITCODE"
+}
+
+foreach ($relative in $trackedFiles) {
+    $normalized = $relative -replace '/', '\'
+    if ($normalized -match '^(.agents|.claude|tests|SmsWorkbench\\bin|SmsWorkbench\\obj|scripts\\installer)(\\|$)') {
+        continue
+    }
+    if ($normalized -match '^dist(\\|$)') {
+        continue
+    }
+    if ([System.IO.Path]::GetFileName($normalized).EndsWith('~', [System.StringComparison]::Ordinal)) {
+        continue
+    }
+    Copy-FilePreservingPath -RelativePath $normalized -DestinationRoot $packageDir
+}
+
+$publishPackageDir = Join-Path $packageDir "dist\net10"
+New-Item -ItemType Directory -Path (Split-Path -Parent $publishPackageDir) -Force | Out-Null
+Copy-Item -LiteralPath $publishDir -Destination (Split-Path -Parent $publishPackageDir) -Recurse -Force
+Remove-PackagePath -RelativePath "dist\net10\runtime"
+
+# --- Bundled Python runtime ---------------------------------------------------
+# The package is self-contained: the pinned CPython staged by
+# scripts\stage_python_runtime.ps1 ships as runtime\python and
+# PythonPathResolver prefers it whenever runtime.python_path is left at its
+# default. -SkipBundledPython is the dev escape hatch for a package that relies
+# on a checkout's venv; a release without it must fail loudly instead of
+# silently shipping the old "install Python yourself" package.
+$bundledRuntimeSource = Join-Path $repoRoot "runtime\python"
+$bundledRuntimeDest = Join-Path $packageDir "runtime\python"
+if ($SkipBundledPython) {
+    Write-Host "Skipping bundled Python runtime (-SkipBundledPython)"
+} else {
+    $bundledPython = Join-Path $bundledRuntimeSource "python.exe"
+    $bundledStamp = Join-Path $bundledRuntimeSource "RUNTIME-STAMP.json"
+    if (-not (Test-Path $bundledPython)) {
+        throw "Bundled Python runtime is missing at $bundledPython. Run scripts\stage_python_runtime.ps1 first, or pass -SkipBundledPython for a dev package."
+    }
+    if (-not (Test-Path $bundledStamp)) {
+        throw "Bundled Python runtime has no RUNTIME-STAMP.json; re-run scripts\stage_python_runtime.ps1."
+    }
+    $bundledVersion = (& $bundledPython -c "import sys; print('.'.join(map(str, sys.version_info[:3])))").Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($bundledVersion)) {
+        throw "Bundled Python runtime failed to run: $bundledPython"
+    }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $bundledRuntimeDest) -Force | Out-Null
+    Copy-Item -LiteralPath $bundledRuntimeSource -Destination (Split-Path -Parent $bundledRuntimeDest) -Recurse -Force
+    Write-Host "Bundled CPython $bundledVersion -> runtime\python"
+}
+
+@"
+GPT-Register-Tool Windows package
+
+Start the desktop UI with:
+  dist\net10\SmsWorkbench.exe
+
+First-run setup:
+  1. The package ships a pinned CPython under runtime\python and uses it
+     automatically; Python does not need to be installed system-wide.
+     Node.js 20+ is still required for the Sentinel runner and is reported by
+     the built-in self-check.
+  2. config.json is created from config.example.json on install; edit it with
+     local mailbox, proxy, SMS, and payment settings (the desktop Settings
+     window can edit most of them).
+  3. Verify the environment any time with the built-in self-check:
+     runtime\python\python.exe chatgpt_phone_reg.py --doctor --json
+     The desktop app runs the same probe automatically on first launch.
+     To use a different interpreter (a development venv), set
+     runtime.python_path in Settings; an explicit path always wins.
+
+Local runtime data is written under runtime\ and sessions\.
+"@ | Set-Content -Path (Join-Path $packageDir "INSTALL-README.txt") -Encoding UTF8
+
+@"
+@echo off
+setlocal
+cd /d "%~dp0"
+start "" "%~dp0dist\net10\SmsWorkbench.exe"
+"@ | Set-Content -Path (Join-Path $packageDir "Start-SmsWorkbench.cmd") -Encoding ASCII
+
+# --- Release payload gate ----------------------------------------------------
+# The payload is collected from `git ls-files` but copied from the working tree,
+# so a file that git ignores can still be on disk and get shipped. On 2026-08-31
+# that is exactly how a deleted diagnostic script carrying real credential
+# prefixes reached the public release assets. Do not bypass this gate.
+$pythonExe = Join-Path $repoRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path $pythonExe)) {
+    $pythonExe = "python"
+}
+$gateScript = Join-Path $repoRoot "scripts\scan_release_payload.py"
+if (-not (Test-Path $gateScript)) {
+    throw "Release payload gate is missing: $gateScript"
+}
+Write-Host "Scanning release payload for ignored or credential-bearing files..."
+& $pythonExe $gateScript $packageDir
+if ($LASTEXITCODE -ne 0) {
+    throw "Release payload scan failed. Refusing to build the installer. Remove the flagged files and re-run the payload staging step."
+}
+
+# $Version 归一为不带 v（供 -p:Version= 用），文件名则统一带 v，与历史资产一致。
+# 兜底（2026-09-13 heisenbug）：带 publish 的运行曾三次观察到 $Version 在此处
+# 为空（:36 探针处却正确），产出无名资产。重派生一次；仍为空则硬失败——
+# 绝不产出无名资产。
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = (& git -C $repoRoot describe --tags --match='v*' --abbrev=0 2>$null)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($Version)) {
+        $Version = Get-Date -Format 'yyyy.MM.dd'
+    }
+    $Version = ([string]$Version).TrimStart('v')
+    Write-Host "version re-derived at naming point: $Version"
+}
+$safeVersion = 'v' + ($Version -replace '[^0-9A-Za-z_.-]', '-')
+$zipPath = Join-Path $releaseDir "GPT-Register-Tool-win-x64-$safeVersion.zip"
+$setupPath = Join-Path $releaseDir "GPT-Register-Tool-Setup-$safeVersion.exe"
+if (Test-Path $zipPath) {
+    Remove-Item -LiteralPath $zipPath -Force
+}
+if (Test-Path $setupPath) {
+    Remove-Item -LiteralPath $setupPath -Force
+}
+Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
+
+Copy-Item -LiteralPath $zipPath -Destination (Join-Path $repoRoot "scripts\installer\payload.zip") -Force
+try {
+    $installerPublishDir = Join-Path $installerRoot "setup-publish"
+    & $dotnet publish $installerProject `
+        -c Release `
+        -r win-x64 `
+        --self-contained true `
+        -p:PublishSingleFile=true `
+        -p:EnableCompressionInSingleFile=true `
+        -p:DebugType=none `
+        -p:DebugSymbols=false `
+        -o $installerPublishDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "installer publish failed with exit code $LASTEXITCODE"
+    }
+
+    Copy-Item -LiteralPath (Join-Path $installerPublishDir "GPTRegisterToolSetup.exe") -Destination $setupPath -Force
+    if ($SelfSign) {
+        Sign-FileWithCertificate -Path $setupPath -Certificate $signingCert
+        Assert-AuthenticodeSigned -Path $setupPath -Certificate $signingCert
+    }
+}
+finally {
+    Remove-Item -LiteralPath (Join-Path $repoRoot "scripts\installer\payload.zip") -Force -ErrorAction SilentlyContinue
+}
+
+$certificatePath = $null
+$trustScriptPath = $null
+if ($SelfSign) {
+    $certificatePath = Join-Path $releaseDir $CertificateExportName
+    Export-CodeSigningCertificate -Certificate $signingCert -Path $certificatePath
+    $trustScriptPath = Join-Path $releaseDir "trust_internal_certificate.ps1"
+    Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\installer\trust_internal_certificate.ps1") -Destination $trustScriptPath -Force
+}
+
+$hashLines = @(
+    "$(Get-FileHash -Algorithm SHA256 $setupPath | Select-Object -ExpandProperty Hash)  $(Split-Path -Leaf $setupPath)",
+    "$(Get-FileHash -Algorithm SHA256 $zipPath | Select-Object -ExpandProperty Hash)  $(Split-Path -Leaf $zipPath)"
+)
+if ($SelfSign -and $certificatePath) {
+    $hashLines += "$(Get-FileHash -Algorithm SHA256 $certificatePath | Select-Object -ExpandProperty Hash)  $(Split-Path -Leaf $certificatePath)"
+}
+if ($SelfSign -and $trustScriptPath) {
+    $hashLines += "$(Get-FileHash -Algorithm SHA256 $trustScriptPath | Select-Object -ExpandProperty Hash)  $(Split-Path -Leaf $trustScriptPath)"
+}
+$manifestPath = Join-Path $releaseDir "GPT-Register-Tool-$safeVersion.sha256.txt"
+$hashLines | Set-Content -Path $manifestPath -Encoding ASCII
+
+Write-Host "Built installer: $setupPath"
+Write-Host "Built portable zip: $zipPath"
+if ($SelfSign -and $certificatePath) {
+    Write-Host "Built signing certificate: $certificatePath"
+}
+if ($SelfSign -and $trustScriptPath) {
+    Write-Host "Built trust helper: $trustScriptPath"
+}
+Write-Host "Wrote checksums: $manifestPath"

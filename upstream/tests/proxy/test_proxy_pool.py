@@ -1,0 +1,1202 @@
+"""Unit tests for sms_tool.proxy.pool."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import struct
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from sms_tool.proxy.pool import (
+    _ATYP_DOMAIN,
+    _ATYP_IPV4,
+    _ATYP_IPV6,
+    _CMD_CONNECT,
+    _NO_AUTH,
+    _REP_GENERAL_FAILURE,
+    _SOCKS5_VER,
+    _USERPASS,
+    UpstreamProxy,
+    Socks5Server,
+    _build_socks5_reply,
+    _encode_socks5_addr,
+    _http_connect_authority,
+    _http_connect_handshake,
+)
+from sms_tool.proxy.health import ProxyHealthTracker
+
+
+def _pick(server, **kwargs):
+    """``_pick_upstream`` is typed ``UpstreamProxy | None``; these tests always
+    build a server with upstreams, so a None pick is a test bug."""
+    upstream = server._pick_upstream(**kwargs)
+    assert upstream is not None
+    return upstream
+
+
+class TestUpstreamProxy(unittest.TestCase):
+    def test_from_url_basic(self):
+        u = UpstreamProxy.from_url("socks5://127.0.0.1:7897")
+        self.assertEqual(u.host, "127.0.0.1")
+        self.assertEqual(u.port, 7897)
+        self.assertEqual(u.username, "")
+        self.assertEqual(u.password, "")
+
+    def test_from_url_with_auth(self):
+        u = UpstreamProxy.from_url("socks5://user:pass@proxy.example.com:1080")
+        self.assertEqual(u.host, "proxy.example.com")
+        self.assertEqual(u.port, 1080)
+        self.assertEqual(u.username, "user")
+        self.assertEqual(u.password, "pass")
+
+    def test_from_url_label(self):
+        u = UpstreamProxy.from_url("socks5://1.2.3.4:1080", label="my-proxy")
+        self.assertEqual(u.label, "my-proxy")
+
+    def test_from_url_default_label(self):
+        u = UpstreamProxy.from_url("socks5://1.2.3.4:1080")
+        self.assertEqual(u.label, "socks5://1.2.3.4:1080")
+
+    def test_from_url_socks5h(self):
+        u = UpstreamProxy.from_url("socks5h://127.0.0.1:17912")
+        self.assertEqual(u.host, "127.0.0.1")
+        self.assertEqual(u.port, 17912)
+
+    def test_from_url_raises_on_unparseable(self):
+        # A garbage upstream used to fall through to a permissive urlparse
+        # fallback and become a live 127.0.0.1:1080 entry; it must raise.
+        for bad in ("", "socks5://", "://", "http://[bad"):
+            with self.assertRaises(ValueError):
+                UpstreamProxy.from_url(bad)
+
+    def test_from_url_four_segment(self):
+        u = UpstreamProxy.from_url("gate.kookeey.info:1000:SYNTHACCT7-sess1:synthpass-JP")
+        self.assertEqual(u.host, "gate.kookeey.info")
+        self.assertEqual(u.port, 1000)
+        self.assertTrue(u.username)
+
+    def test_addr_property(self):
+        u = UpstreamProxy(host="10.0.0.1", port=3128)
+        self.assertEqual(u.addr, "10.0.0.1:3128")
+
+    def test_to_dict(self):
+        u = UpstreamProxy(host="1.2.3.4", port=1080, label="test", success_count=5)
+        d = u.to_dict()
+        self.assertEqual(d["label"], "test")
+        self.assertEqual(d["addr"], "1.2.3.4:1080")
+        self.assertTrue(d["healthy"])
+        self.assertEqual(d["success_count"], 5)
+        self.assertIsNone(d["last_check"])
+
+    def test_from_url_priority(self):
+        u = UpstreamProxy.from_url("socks5://1.2.3.4:1080", label="p", priority=2)
+        self.assertEqual(u.priority, 2)
+
+    def test_default_priority(self):
+        u = UpstreamProxy(host="1.1.1.1", port=1080)
+        self.assertEqual(u.priority, 0)
+
+    def test_to_dict_includes_priority(self):
+        u = UpstreamProxy(host="1.1.1.1", port=1080, label="x", priority=3)
+        self.assertEqual(u.to_dict()["priority"], 3)
+
+
+class TestUpstreamCredentialRedaction(unittest.TestCase):
+    """The label is a log/stats payload, so it must never carry a password.
+
+    ``from_url`` defaults the label to the caller's raw URL. For a residential
+    provider that URL is ``scheme://user:pass@host:port``, and the label is
+    consumed by the health/relay log lines, by ``to_dict`` and by the
+    (unauthenticated) stats endpoint -- three sinks that must stay
+    credential-free. Measured 2026-10-25: the password appeared in all three.
+    """
+
+    PASSWORD = "s3cret-marker"
+    # Separately: a password that itself contains '@'. ``urlsplit`` splits on the
+    # LAST '@', so the masker has to mask up to that one, not the first.
+    AT_PASSWORD = "p@ss-marker"
+
+    def test_url_form_label_masks_credentials(self):
+        u = UpstreamProxy.from_url(f"http://alice:{self.PASSWORD}@us.ipwo.net:7878")
+        self.assertNotIn(self.PASSWORD, u.label)
+        self.assertIn("us.ipwo.net:7878", u.label)
+        self.assertEqual(u.label, "http://***:***@us.ipwo.net:7878")
+
+    def test_url_form_label_masks_a_password_containing_an_at_sign(self):
+        u = UpstreamProxy.from_url(f"http://alice:{self.AT_PASSWORD}@us.ipwo.net:7878")
+        self.assertNotIn("ss-marker", u.label)
+        self.assertEqual(u.label, "http://***:***@us.ipwo.net:7878")
+
+    def test_four_segment_label_masks_password(self):
+        u = UpstreamProxy.from_url(f"us.ipwo.net:7878:alice_custom_zone_US:{self.PASSWORD}")
+        self.assertNotIn(self.PASSWORD, u.label)
+        self.assertIn("us.ipwo.net:7878", u.label)
+
+    def test_explicit_label_carrying_a_url_is_masked(self):
+        u = UpstreamProxy.from_url(
+            "socks5://1.2.3.4:1080",
+            label=f"http://alice:{self.PASSWORD}@us.ipwo.net:7878",
+        )
+        self.assertNotIn(self.PASSWORD, u.label)
+
+    def test_to_dict_masks_a_directly_constructed_label(self):
+        # ``from_url`` is not the only constructor: a loader or a test can build
+        # the dataclass directly, so serialisation is the second gate.
+        u = UpstreamProxy(host="1.2.3.4", port=1080, label=f"http://alice:{self.PASSWORD}@h:1")
+        self.assertNotIn(self.PASSWORD, u.to_dict()["label"])
+
+    def test_repr_does_not_leak_the_password(self):
+        u = UpstreamProxy(host="1.2.3.4", port=1080, username="alice", password=self.PASSWORD)
+        self.assertNotIn(self.PASSWORD, repr(u))
+
+    def test_stats_payload_never_carries_the_password(self):
+        u = UpstreamProxy.from_url(f"http://alice:{self.PASSWORD}@us.ipwo.net:7878")
+        payload = json.dumps(Socks5Server("127.0.0.1", 0, [u], stats_port=0)._stats_json())
+        self.assertNotIn(self.PASSWORD, payload)
+
+    def test_unparseable_url_error_message_is_masked(self):
+        # start_proxy_pool logs this message verbatim when it refuses an entry.
+        with self.assertRaises(ValueError) as caught:
+            UpstreamProxy.from_url(f"http://alice:{self.PASSWORD}@us.ipwo.net")
+        self.assertNotIn(self.PASSWORD, str(caught.exception))
+
+
+class TestStatsEndpointBinding(unittest.TestCase):
+    """The stats endpoint must not follow the SOCKS5 listener off loopback."""
+
+    def test_default_stats_host_is_loopback(self):
+        server = Socks5Server("0.0.0.0", 18080, [UpstreamProxy(host="1.2.3.4", port=1080)], stats_port=18081)
+        self.assertEqual(server._stats_bind_host(), "127.0.0.1")
+
+    def test_explicit_stats_host_wins(self):
+        server = Socks5Server("127.0.0.1", 18080, [], stats_port=18081, stats_host="127.0.0.2")
+        self.assertEqual(server._stats_bind_host(), "127.0.0.2")
+
+    def test_start_binds_stats_on_loopback_even_when_listening_on_all_interfaces(self):
+        async def _run():
+            server = Socks5Server("0.0.0.0", 18080, [UpstreamProxy(host="1.2.3.4", port=1080)], stats_port=18081)
+            bound: list[tuple[str, int]] = []
+
+            def _fake_start_server(handler, host, port):
+                bound.append((host, port))
+                fake = MagicMock()
+                fake.sockets = []
+                fake.close = MagicMock()
+                fake.wait_closed = AsyncMock()
+                return fake
+
+            with patch("sms_tool.proxy.pool.asyncio.start_server", side_effect=_fake_start_server):
+                await server.start()
+                await server.stop()
+            return bound
+
+        bound = asyncio.run(_run())
+        self.assertEqual(bound[0], ("0.0.0.0", 18080))  # SOCKS5 listener: as asked
+        self.assertEqual(bound[1], ("127.0.0.1", 18081))  # stats: loopback
+
+
+class TestSocks5AddrEncoding(unittest.TestCase):
+    def test_encode_ipv4(self):
+        data = _encode_socks5_addr("192.168.1.1", 8080)
+        self.assertEqual(data[0], _ATYP_IPV4)
+        self.assertEqual(len(data), 1 + 4 + 2)  # ATYP + 4 bytes IP + 2 bytes port
+        port = struct.unpack("!H", data[5:7])[0]
+        self.assertEqual(port, 8080)
+
+    def test_encode_ipv6(self):
+        data = _encode_socks5_addr("::1", 443)
+        self.assertEqual(data[0], _ATYP_IPV6)
+        self.assertEqual(len(data), 1 + 16 + 2)
+
+    def test_encode_domain(self):
+        data = _encode_socks5_addr("example.com", 443)
+        self.assertEqual(data[0], _ATYP_DOMAIN)
+        self.assertEqual(data[1], len("example.com"))
+        domain = data[2 : 2 + len("example.com")].decode()
+        self.assertEqual(domain, "example.com")
+        port = struct.unpack("!H", data[2 + len("example.com") :])[0]
+        self.assertEqual(port, 443)
+
+
+class TestSocks5Reply(unittest.TestCase):
+    def test_reply_structure(self):
+        reply = _build_socks5_reply(0x00, "0.0.0.0", 0)
+        self.assertEqual(reply[0], _SOCKS5_VER)
+        self.assertEqual(reply[1], 0x00)  # SUCCEEDED
+        self.assertEqual(reply[2], 0x00)  # RSV
+
+
+class TestPickUpstream(unittest.TestCase):
+    def _make_server(self, upstreams):
+        return Socks5Server("127.0.0.1", 0, upstreams, stats_port=0)
+
+    def test_round_robin(self):
+        u1 = UpstreamProxy(host="1.1.1.1", port=1080, label="a")
+        u2 = UpstreamProxy(host="2.2.2.2", port=1080, label="b")
+        server = self._make_server([u1, u2])
+
+        picks = [_pick(server).label for _ in range(4)]
+        self.assertEqual(picks, ["a", "b", "a", "b"])
+
+    def test_skips_unhealthy(self):
+        u1 = UpstreamProxy(host="1.1.1.1", port=1080, label="a", healthy=False)
+        u2 = UpstreamProxy(host="2.2.2.2", port=1080, label="b", healthy=True)
+        server = self._make_server([u1, u2])
+
+        pick = _pick(server)
+        self.assertEqual(pick.label, "b")
+
+    def test_fail_open_half_open_returns_single_candidate(self):
+        """P0-3 half-open: when the whole pool is unhealthy, _pick_upstream returns
+        a single candidate for incremental probing instead of mass-resurrecting every
+        dead upstream (which would spray all of them with live traffic at once)."""
+        u1 = UpstreamProxy(host="1.1.1.1", port=1080, label="a", healthy=False, fail_count=2)
+        u2 = UpstreamProxy(host="2.2.2.2", port=1080, label="b", healthy=False, fail_count=2)
+        server = self._make_server([u1, u2])
+
+        pick = server._pick_upstream()
+        self.assertIsNotNone(pick)
+        self.assertIn(pick, (u1, u2))
+        # The pool is NOT mass-resurrected: both upstreams stay unhealthy, only one
+        # candidate is handed back for a probe.
+        self.assertFalse(u1.healthy)
+        self.assertFalse(u2.healthy)
+
+    def test_fail_open_half_open_rotates_candidates(self):
+        """Across successive half-open picks the candidates rotate among the dead
+        set, so recovery of each upstream is discovered incrementally."""
+        u1 = UpstreamProxy(host="1.1.1.1", port=1080, label="a", healthy=False, fail_count=2)
+        u2 = UpstreamProxy(host="2.2.2.2", port=1080, label="b", healthy=False, fail_count=2)
+        server = self._make_server([u1, u2])
+
+        picks = [_pick(server).label for _ in range(4)]
+        # Both candidates appear, round-robin among the dead set.
+        self.assertEqual(sorted(set(picks)), ["a", "b"])
+
+    def test_no_upstreams(self):
+        server = self._make_server([])
+        self.assertIsNone(server._pick_upstream())
+
+    def test_single_upstream(self):
+        u = UpstreamProxy(host="1.1.1.1", port=1080, label="only")
+        server = self._make_server([u])
+        for _ in range(5):
+            self.assertEqual(_pick(server).label, "only")
+
+    def test_priority_prefers_higher(self):
+        """Lower priority number = higher priority, selected first."""
+        u0 = UpstreamProxy(host="1.1.1.1", port=1080, label="hi", priority=0)
+        u1 = UpstreamProxy(host="2.2.2.2", port=1080, label="lo", priority=1)
+        server = self._make_server([u0, u1])
+
+        picks = [_pick(server).label for _ in range(4)]
+        # should always pick the higher-priority (priority=0) upstream
+        self.assertEqual(picks, ["hi", "hi", "hi", "hi"])
+
+    def test_priority_round_robin_within_tier(self):
+        """Same priority = round-robin within that tier."""
+        u0a = UpstreamProxy(host="1.1.1.1", port=1080, label="a", priority=0)
+        u0b = UpstreamProxy(host="2.2.2.2", port=1080, label="b", priority=0)
+        u1 = UpstreamProxy(host="3.3.3.3", port=1080, label="c", priority=1)
+        server = self._make_server([u0a, u0b, u1])
+
+        picks = [_pick(server).label for _ in range(4)]
+        self.assertEqual(picks, ["a", "b", "a", "b"])
+
+    def test_priority_fallback_to_lower_tier(self):
+        """A dead higher-priority tier must not shadow a live lower one."""
+        dead = UpstreamProxy(host="1.1.1.1", port=1080, label="hi", priority=0, healthy=False)
+        live = UpstreamProxy(host="2.2.2.2", port=1080, label="lo", priority=1)
+        pick = _pick(self._make_server([dead, live]))
+        self.assertEqual(pick.label, "lo")
+
+
+class TestFailoverAcrossOneEndpoint(unittest.TestCase):
+    """A rotating provider pool is many sessions on **one** ``host:port``.
+
+    The live registration pool is ten lajiao ``region-VN`` entries on
+    ``us.lajiaohttp.net:2000`` that differ only in the sticky-session suffix.
+    ``tried`` used to be keyed by ``addr``, so the first failed session excluded
+    all ten: ``_pick_upstream`` returned ``None`` on the very next attempt and
+    the listener answered ``GENERAL_FAILURE`` without ever trying a sibling
+    session. Measured 2026-10-26. The exclusion key is now
+    ``UpstreamProxy.identity`` (the whole dialled route).
+    """
+
+    @staticmethod
+    def _sessions(count: int = 3) -> list[UpstreamProxy]:
+        return [
+            UpstreamProxy(
+                host="us.lajiaohttp.net",
+                port=2000,
+                username=f"acct-region-VN-sid-{index}",
+                password="pw",
+                label=f"sid-{index}",
+            )
+            for index in range(1, count + 1)
+        ]
+
+    def test_excluding_one_session_does_not_exclude_its_siblings(self):
+        sessions = self._sessions()
+        server = Socks5Server("127.0.0.1", 0, sessions, stats_port=0)
+
+        first = _pick(server)
+        second = _pick(server, exclude={first.identity})
+
+        self.assertIsNot(first, second)
+        self.assertEqual(second.addr, first.addr)
+        self.assertNotEqual(second.username, first.username)
+
+    def test_identity_separates_sessions_sharing_an_address(self):
+        a, b, c = self._sessions()
+        self.assertEqual(len({u.addr for u in (a, b, c)}), 1)
+        self.assertEqual(len({u.identity for u in (a, b, c)}), 3)
+
+    def test_a_failing_session_falls_through_to_the_next_one(self):
+        async def _run():
+            sessions = self._sessions()
+            server = Socks5Server("127.0.0.1", 0, sessions, stats_port=0)
+            attempted: list[str] = []
+
+            async def _fail(upstream, *_args, **_kwargs):
+                attempted.append(upstream.label)
+                raise ConnectionError("upstream blocked")
+
+            client_r = asyncio.StreamReader()
+            client_r.feed_data(bytes([_SOCKS5_VER, 0x01, _NO_AUTH]))
+            domain = b"cloudflare.com"
+            client_r.feed_data(
+                bytes([_SOCKS5_VER, _CMD_CONNECT, 0x00, _ATYP_DOMAIN, len(domain)]) + domain + struct.pack("!H", 443)
+            )
+            client_r.feed_eof()
+
+            client_w = AsyncMock()
+            client_w.write = MagicMock()
+            client_w.drain = AsyncMock()
+            client_w.close = MagicMock()
+            client_w.wait_closed = AsyncMock()
+
+            with patch.object(server, "_connect_through_upstream", side_effect=_fail):
+                await server._handle_client(client_r, client_w)
+
+            # Every session is tried, not just the first: the old addr-keyed
+            # exclusion stopped after one attempt. The *order* is the pool's
+            # round-robin (`_rr_idx` keeps advancing), so only the set is pinned.
+            self.assertEqual(sorted(attempted), ["sid-1", "sid-2", "sid-3"])
+            self.assertEqual(len(set(attempted)), 3)
+            writes = [call.args[0] for call in client_w.write.call_args_list]
+            self.assertEqual(writes[-1][1], _REP_GENERAL_FAILURE)
+
+        asyncio.run(_run())
+
+
+class TestHealthStrategy(unittest.TestCase):
+    """P0-3: consecutive-failure threshold + hysteresis recovery."""
+
+    def _make_server(self, fail_threshold=3, target="cloudflare.com", port=443):
+        return Socks5Server(
+            "127.0.0.1",
+            0,
+            [],
+            stats_port=0,
+            health_check_target_host=target,
+            health_check_target_port=port,
+            health_check_fail_threshold=fail_threshold,
+        )
+
+    def test_constructor_wires_probe_target_and_threshold(self):
+        server = self._make_server(fail_threshold=5, target="example.com", port=8443)
+        self.assertEqual(server._health_check_target_host, "example.com")
+        self.assertEqual(server._health_check_target_port, 8443)
+        self.assertEqual(server._health_check_fail_threshold, 5)
+
+    def test_healthy_survives_single_failure(self):
+        server = self._make_server(fail_threshold=3)
+        u = UpstreamProxy(host="1.1.1.1", port=1080, label="a", healthy=True)
+        server._apply_health(u, False)
+        self.assertTrue(u.healthy)
+        self.assertEqual(u.fail_count, 1)
+
+    def test_death_only_after_threshold_consecutive_failures(self):
+        server = self._make_server(fail_threshold=3)
+        u = UpstreamProxy(host="1.1.1.1", port=1080, label="a", healthy=True)
+        server._apply_health(u, False)  # 1
+        self.assertTrue(u.healthy)
+        server._apply_health(u, False)  # 2
+        self.assertTrue(u.healthy)
+        server._apply_health(u, False)  # 3 -> threshold reached
+        self.assertFalse(u.healthy)
+        self.assertEqual(u.fail_count, 3)
+
+    def test_recovery_requires_consecutive_successes(self):
+        server = self._make_server(fail_threshold=3)
+        u = UpstreamProxy(host="1.1.1.1", port=1080, label="a", healthy=False, fail_count=3)
+        # One lucky success is not enough (hysteresis): fail_count decrements by 1,
+        # but the upstream stays unhealthy until it reaches fail_count == 0.
+        server._apply_health(u, True)
+        self.assertEqual(u.fail_count, 2)
+        self.assertFalse(u.healthy)
+        server._apply_health(u, True)
+        self.assertEqual(u.fail_count, 1)
+        self.assertFalse(u.healthy)
+        server._apply_health(u, True)
+        self.assertEqual(u.fail_count, 0)
+        self.assertTrue(u.healthy)
+
+    def test_recovery_interrupted_by_failure_resets_progress(self):
+        server = self._make_server(fail_threshold=3)
+        u = UpstreamProxy(host="1.1.1.1", port=1080, label="a", healthy=False, fail_count=3)
+        server._apply_health(u, True)  # -> 2
+        server._apply_health(u, True)  # -> 1
+        self.assertFalse(u.healthy)
+        server._apply_health(u, False)  # -> 2 again
+        self.assertEqual(u.fail_count, 2)
+        self.assertFalse(u.healthy)
+
+    def test_success_on_healthy_does_not_mark_unhealthy(self):
+        server = self._make_server(fail_threshold=3)
+        u = UpstreamProxy(host="1.1.1.1", port=1080, label="a", healthy=True, fail_count=0)
+        server._apply_health(u, True)
+        self.assertTrue(u.healthy)
+        self.assertEqual(u.fail_count, 0)
+
+
+class TestHealthSyncP1_2(unittest.TestCase):
+    """P1-2 one-way sync: SOCKS5 pool health events mirror into ProxyHealthTracker."""
+
+    def _make_server_with_tracker(self, fail_threshold=3):
+        import tempfile
+        from pathlib import Path
+
+        d = Path(tempfile.mkdtemp())
+        tracker = ProxyHealthTracker({}, path=d / "registration_proxy_health.json")
+        server = Socks5Server(
+            "127.0.0.1",
+            0,
+            [],
+            stats_port=0,
+            health_check_fail_threshold=fail_threshold,
+            health_tracker=tracker,
+        )
+        return server, tracker
+
+    def test_proxy_url_format_no_auth(self):
+        u = UpstreamProxy(host="1.2.3.4", port=1080)
+        self.assertEqual(u.proxy_url, "socks5://1.2.3.4:1080")
+
+    def test_proxy_url_format_with_auth(self):
+        u = UpstreamProxy(host="1.2.3.4", port=1080, username="u", password="p")
+        self.assertEqual(u.proxy_url, "socks5://u:p@1.2.3.4:1080")
+
+    def test_proxy_url_key_matches_tracker_key(self):
+        u = UpstreamProxy(host="1.2.3.4", port=1080, username="u", password="p")
+        self.assertTrue(ProxyHealthTracker.key(u.proxy_url).startswith("1.2.3.4:1080#sid-"))
+
+    def test_apply_health_failure_mirrors_to_tracker(self):
+        server, tracker = self._make_server_with_tracker()
+        u = UpstreamProxy(host="1.2.3.4", port=1080, label="a", healthy=True)
+        server._apply_health(u, False, error="probe timeout")
+        data = tracker._read()
+        self.assertEqual(int(data["1.2.3.4:1080"]["failure"]), 1)
+        self.assertEqual(data["1.2.3.4:1080"]["last_error"], "probe timeout")
+
+    def test_apply_health_threshold_mirrors_cooldown(self):
+        server, tracker = self._make_server_with_tracker()
+        u = UpstreamProxy(host="1.2.3.4", port=1080, label="a", healthy=True)
+        for _ in range(3):
+            server._apply_health(u, False, error="x")
+        row = tracker._read()["1.2.3.4:1080"]
+        self.assertGreaterEqual(int(row["failure"]), 3)
+        self.assertGreater(float(row["cooldown_until"]), 0)
+
+    def test_apply_health_success_resets_cooldown_in_tracker(self):
+        server, tracker = self._make_server_with_tracker()
+        u = UpstreamProxy(host="1.2.3.4", port=1080, label="a", healthy=True)
+        for _ in range(3):
+            server._apply_health(u, False, error="x")
+        server._apply_health(u, True)
+        row = tracker._read()["1.2.3.4:1080"]
+        self.assertEqual(float(row["cooldown_until"]), 0)
+
+    def test_apply_health_without_tracker_is_noop(self):
+        server = Socks5Server("127.0.0.1", 0, [], stats_port=0)
+        u = UpstreamProxy(host="1.2.3.4", port=1080, label="a", healthy=True)
+        # Must not raise even when no tracker is configured.
+        server._apply_health(u, False, error="x")
+        self.assertEqual(u.fail_count, 1)
+
+    def test_async_health_update_persists_off_event_loop(self):
+        server, tracker = self._make_server_with_tracker()
+        u = UpstreamProxy(host="1.2.3.4", port=1080, label="a", healthy=True)
+
+        asyncio.run(server._apply_health_async(u, False, error="async timeout"))
+
+        row = tracker._read()["1.2.3.4:1080"]
+        self.assertEqual(int(row["failure"]), 1)
+        self.assertEqual(row["last_error"], "async timeout")
+
+
+class TestStatsJson(unittest.TestCase):
+    def test_stats_json_structure(self):
+        u = UpstreamProxy(host="1.1.1.1", port=1080, label="test-upstream")
+        server = Socks5Server("127.0.0.1", 0, [u], stats_port=0)
+        stats = server._stats_json()
+
+        self.assertIn("status", stats)
+        self.assertEqual(stats["status"], "running")
+        self.assertIn("uptime_seconds", stats)
+        self.assertIn("active_connections", stats)
+        self.assertIn("total_connections", stats)
+        self.assertIn("total_errors", stats)
+        self.assertIn("upstreams", stats)
+        self.assertEqual(len(stats["upstreams"]), 1)
+        self.assertEqual(stats["upstreams"][0]["label"], "test-upstream")
+
+
+class TestConfigLoading(unittest.TestCase):
+    def test_upstreams_from_proxy_cfg(self):
+        from start_proxy_pool import _upstreams_from_proxy_cfg
+
+        cfg = {
+            "proxy": {
+                "pool": [
+                    {"url": "socks5://127.0.0.1:7897", "label": "clash"},
+                    {"url": "socks5://10.0.0.1:1080", "label": "remote", "username": "u", "password": "p"},
+                    "socks5://plain:1080",
+                ]
+            }
+        }
+        upstreams = _upstreams_from_proxy_cfg(cfg)
+
+        self.assertEqual(len(upstreams), 3)
+        self.assertEqual(upstreams[0].host, "127.0.0.1")
+        self.assertEqual(upstreams[0].label, "clash")
+        self.assertEqual(upstreams[1].username, "u")
+        self.assertEqual(upstreams[1].password, "p")
+        self.assertEqual(upstreams[2].host, "plain")
+
+    def test_upstreams_from_proxy_cfg_skips_unsupported_scheme_and_empty(self):
+        """HTTP upstreams are accepted now; only unknown schemes are skipped.
+
+        A SOCKS5-only filter here emptied a 30-entry residential pool (all
+        ``http://``) down to zero upstreams, and the server exited.
+        """
+        from start_proxy_pool import _upstreams_from_proxy_cfg
+
+        cfg = {
+            "proxy": {
+                "pool": [
+                    "http://1.2.3.4:8080",
+                    "socks5://5.6.7.8:1080",
+                    "ftp://9.9.9.9:21",
+                    {"label": "no-url"},
+                    {"bogus": True},
+                ]
+            }
+        }
+        upstreams = _upstreams_from_proxy_cfg(cfg)
+        self.assertEqual([u.addr for u in upstreams], ["1.2.3.4:8080", "5.6.7.8:1080"])
+        self.assertEqual([u.scheme for u in upstreams], ["http", "socks5"])
+
+    def test_upstreams_priority_from_proxy_cfg(self):
+        from start_proxy_pool import _upstreams_from_proxy_cfg
+
+        cfg = {
+            "proxy": {
+                "pool": [
+                    {"url": "socks5://127.0.0.1:17912", "label": "jp", "priority": 0},
+                    {"url": "socks5://127.0.0.1:7897", "label": "clash", "priority": 1},
+                ]
+            }
+        }
+        upstreams = _upstreams_from_proxy_cfg(cfg)
+        self.assertEqual(upstreams[0].priority, 0)
+        self.assertEqual(upstreams[1].priority, 1)
+
+    def test_load_upstreams_from_str(self):
+        from start_proxy_pool import _load_upstreams_from_str
+
+        upstreams = _load_upstreams_from_str("socks5://a:1,socks5://b:2")
+        self.assertEqual(len(upstreams), 2)
+        self.assertEqual(upstreams[0].host, "a")
+        self.assertEqual(upstreams[1].host, "b")
+
+
+class TestSocks5Handshake(unittest.TestCase):
+    """Integration test: mock upstream and verify full handshake."""
+
+    def test_handle_client_connect(self):
+        async def _run():
+            # Mock upstream that accepts SOCKS5
+            upstream_r = asyncio.StreamReader()
+            # upstream greeting response (NO_AUTH)
+            upstream_r.feed_data(bytes([_SOCKS5_VER, _NO_AUTH]))
+            # upstream CONNECT reply (success, IPv4 bind 0.0.0.0:0)
+            upstream_r.feed_data(
+                bytes([_SOCKS5_VER, 0x00, 0x00, _ATYP_IPV4]) + bytes([0, 0, 0, 0]) + struct.pack("!H", 0)
+            )
+            upstream_r.feed_eof()
+
+            upstream_w = AsyncMock()
+            upstream_w.write = MagicMock()
+            upstream_w.drain = AsyncMock()
+            upstream_w.close = MagicMock()
+            upstream_w.wait_closed = AsyncMock()
+            upstream_w.can_write_eof = MagicMock(return_value=True)
+            upstream_w.write_eof = MagicMock()
+
+            # Build server with one upstream
+            u = UpstreamProxy(host="127.0.0.1", port=1080, label="mock")
+            server = Socks5Server("127.0.0.1", 0, [u], stats_port=0)
+
+            with patch.object(server, "_connect_through_upstream", return_value=(upstream_r, upstream_w)):
+                # Client reader: SOCKS5 greeting + CONNECT request for example.com:443
+                client_r = asyncio.StreamReader()
+                client_r.feed_data(bytes([_SOCKS5_VER, 0x01, _NO_AUTH]))  # greeting
+                domain = b"example.com"
+                client_r.feed_data(
+                    bytes([_SOCKS5_VER, _CMD_CONNECT, 0x00, _ATYP_DOMAIN, len(domain)])
+                    + domain
+                    + struct.pack("!H", 443)
+                )
+                client_r.feed_eof()
+
+                client_w = AsyncMock()
+                client_w.write = MagicMock()
+                client_w.drain = AsyncMock()
+                client_w.close = MagicMock()
+                client_w.wait_closed = AsyncMock()
+                client_w.can_write_eof = MagicMock(return_value=True)
+                client_w.write_eof = MagicMock()
+
+                await server._handle_client(client_r, client_w)
+
+            # Verify client received greeting response + success reply
+            writes = [call.args[0] for call in client_w.write.call_args_list]
+            self.assertTrue(len(writes) >= 2)
+            # first write: greeting response
+            self.assertEqual(writes[0][0], _SOCKS5_VER)
+            self.assertEqual(writes[0][1], _NO_AUTH)
+            # second write: CONNECT reply
+            self.assertEqual(writes[1][0], _SOCKS5_VER)
+            self.assertEqual(writes[1][1], 0x00)  # SUCCEEDED
+
+            # Verify stats
+            self.assertEqual(server._stats.total_connections, 1)
+
+        asyncio.run(_run())
+
+
+class _FakeHttpProxy:
+    """A stand-in HTTP CONNECT endpoint: records the request, then tunnels."""
+
+    def __init__(self, status=b"HTTP/1.1 200 Connection established", payload=b"TUNNELED"):
+        self.status = status
+        self.payload = payload
+        self.requests: list[tuple[str, list[str]]] = []
+        self._server = None
+        self.port = 0
+
+    async def start(self):
+        self._server = await asyncio.start_server(self._on_conn, "127.0.0.1", 0)
+        self.port = self._server.sockets[0].getsockname()[1]
+        return self
+
+    async def _on_conn(self, reader, writer):
+        request_line = (await reader.readline()).decode("ascii", "replace").strip()
+        headers = []
+        while True:
+            line = await reader.readline()
+            if line in (b"\r\n", b"\n", b""):
+                break
+            headers.append(line.decode("ascii", "replace").strip())
+        self.requests.append((request_line, headers))
+        writer.write(self.status + b"\r\n\r\n")
+        await writer.drain()
+        if self.payload:
+            writer.write(self.payload)
+            await writer.drain()
+        writer.close()
+
+    async def close(self):
+        if self._server is None:
+            return
+        self._server.close()
+        await self._server.wait_closed()
+
+
+class TestHttpConnectUpstream(unittest.TestCase):
+    """P3: the pool must be able to dial ``http://`` upstreams.
+
+    Every residential provider we buy hands out ``http://`` endpoints, so a
+    SOCKS5-only pool emptied a 30-entry pool file down to zero upstreams.
+    """
+
+    def test_authority_brackets_ipv6_only(self):
+        self.assertEqual(_http_connect_authority("cloudflare.com", 443), "cloudflare.com:443")
+        self.assertEqual(_http_connect_authority("2001:db8::1", 443), "[2001:db8::1]:443")
+
+    def test_from_url_keeps_the_http_scheme(self):
+        u = UpstreamProxy.from_url("http://user:pw@proxy.example:8080")
+        self.assertEqual(u.scheme, "http")
+        self.assertEqual((u.host, u.port), ("proxy.example", 8080))
+        self.assertEqual(u.proxy_url, "http://user:pw@proxy.example:8080")
+
+    def test_socks5_stays_the_default_scheme(self):
+        self.assertEqual(UpstreamProxy(host="1.2.3.4", port=1080).scheme, "socks5")
+        self.assertEqual(UpstreamProxy.from_url("socks5h://1.2.3.4:1080").scheme, "socks5h")
+
+    def test_handshake_sends_connect_and_basic_auth(self):
+        async def _run():
+            fake = await _FakeHttpProxy().start()
+            try:
+                r, w = await asyncio.open_connection("127.0.0.1", fake.port)
+                try:
+                    await _http_connect_handshake(
+                        r,
+                        w,
+                        UpstreamProxy(host="h", port=1, username="u", password="p", scheme="http"),
+                        "cloudflare.com",
+                        443,
+                        5.0,
+                    )
+                    self.assertEqual(await asyncio.wait_for(r.read(8), 5.0), b"TUNNELED")
+                finally:
+                    w.close()
+                request_line, headers = fake.requests[0]
+            finally:
+                await fake.close()
+            return request_line, headers
+
+        request_line, headers = asyncio.run(_run())
+        self.assertEqual(request_line, "CONNECT cloudflare.com:443 HTTP/1.1")
+        self.assertIn("Host: cloudflare.com:443", headers)
+        # base64("u:p")
+        self.assertIn("Proxy-Authorization: Basic dTpw", headers)
+
+    def test_no_credentials_sends_no_auth_header(self):
+        async def _run():
+            fake = await _FakeHttpProxy().start()
+            try:
+                r, w = await asyncio.open_connection("127.0.0.1", fake.port)
+                try:
+                    await _http_connect_handshake(
+                        r,
+                        w,
+                        UpstreamProxy(host="h", port=1, scheme="http"),
+                        "cloudflare.com",
+                        443,
+                        5.0,
+                    )
+                finally:
+                    w.close()
+                headers = fake.requests[0][1]
+            finally:
+                await fake.close()
+            return headers
+
+        headers = asyncio.run(_run())
+        self.assertFalse(any(h.lower().startswith("proxy-authorization") for h in headers))
+
+    def test_non_2xx_reply_raises(self):
+        async def _run():
+            fake = await _FakeHttpProxy(status=b"HTTP/1.1 407 Proxy Authentication Required", payload=b"").start()
+            try:
+                r, w = await asyncio.open_connection("127.0.0.1", fake.port)
+                try:
+                    with self.assertRaises(ConnectionError) as ctx:
+                        await _http_connect_handshake(
+                            r,
+                            w,
+                            UpstreamProxy(host="h", port=1, scheme="http"),
+                            "cloudflare.com",
+                            443,
+                            5.0,
+                        )
+                finally:
+                    w.close()
+            finally:
+                await fake.close()
+            return str(ctx.exception)
+
+        self.assertIn("HTTP 407", asyncio.run(_run()))
+
+    def test_handshake_dispatches_on_scheme(self):
+        """socks5 still sends 0x05; http sends a CONNECT line."""
+
+        async def _run():
+            seen: asyncio.Queue[bytes] = asyncio.Queue()
+
+            async def _record(reader, writer):
+                await seen.put(await reader.read(64))
+                writer.close()
+
+            srv = await asyncio.start_server(_record, "127.0.0.1", 0)
+            port = srv.sockets[0].getsockname()[1]
+            server = Socks5Server("127.0.0.1", 0, [], stats_port=0)
+            out = {}
+            try:
+                for scheme in ("socks5", "http"):
+                    r, w = await asyncio.open_connection("127.0.0.1", port)
+                    try:
+                        with self.assertRaises(Exception):
+                            await server._handshake(
+                                r,
+                                w,
+                                UpstreamProxy(host="127.0.0.1", port=port, scheme=scheme),
+                                "cloudflare.com",
+                                443,
+                                _ATYP_DOMAIN,
+                                2.0,
+                            )
+                    finally:
+                        w.close()
+                    out[scheme] = await asyncio.wait_for(seen.get(), 2.0)
+            finally:
+                srv.close()
+                await srv.wait_closed()
+            return out
+
+        out = asyncio.run(_run())
+        self.assertEqual(out["socks5"][:1], b"\x05")
+        self.assertTrue(out["http"].startswith(b"CONNECT "), out["http"])
+
+    def test_socks5_client_tunnels_through_an_http_upstream(self):
+        """End-to-end: SOCKS5 in, HTTP CONNECT out, bytes both ways."""
+
+        async def _run():
+            fake = await _FakeHttpProxy().start()
+            server = Socks5Server(
+                "127.0.0.1",
+                0,
+                [UpstreamProxy(host="127.0.0.1", port=fake.port, scheme="http", label="http-up")],
+                stats_port=0,
+                health_check_interval=3600.0,
+            )
+            await server.start()
+            assert server._server is not None
+            listen_port = server._server.sockets[0].getsockname()[1]
+            try:
+                r, w = await asyncio.open_connection("127.0.0.1", listen_port)
+                try:
+                    w.write(bytes([_SOCKS5_VER, 0x01, _NO_AUTH]))
+                    await w.drain()
+                    self.assertEqual((await r.readexactly(2))[1], _NO_AUTH)
+
+                    domain = b"cloudflare.com"
+                    req = bytearray([_SOCKS5_VER, _CMD_CONNECT, 0x00, _ATYP_DOMAIN])
+                    req.append(len(domain))
+                    req.extend(domain)
+                    req.extend(struct.pack("!H", 443))
+                    w.write(bytes(req))
+                    await w.drain()
+
+                    reply = await asyncio.wait_for(r.readexactly(4), 5.0)
+                    self.assertEqual(reply[1], 0x00)  # SUCCEEDED
+                    await asyncio.wait_for(r.readexactly(6), 5.0)  # bound addr + port
+                    payload = await asyncio.wait_for(r.read(8), 5.0)
+                finally:
+                    w.close()
+            finally:
+                await server.stop()
+                await fake.close()
+            return payload, fake.requests[0]
+
+        payload, (request_line, _headers) = asyncio.run(_run())
+        self.assertEqual(payload, b"TUNNELED")
+        self.assertEqual(request_line, "CONNECT cloudflare.com:443 HTTP/1.1")
+
+
+class TestStickySessions(unittest.TestCase):
+    """P2-5: optional sticky sessions keyed by the SOCKS5 auth username.
+
+    Per-connection round-robin is right for a rotating fetch pool but wrong for
+    a registration: one account would hop exits mid-flow.  A client that offers
+    SOCKS5 username/password auth now names its session by username and is
+    pinned to one upstream for the TTL.  The default (``ttl=0``) is unchanged.
+    """
+
+    def _pair(self, ttl):
+        a = UpstreamProxy(host="1.1.1.1", port=1080, label="a")
+        b = UpstreamProxy(host="2.2.2.2", port=1080, label="b")
+        server = Socks5Server("127.0.0.1", 0, [a, b], stats_port=0, sticky_session_ttl=ttl)
+        return server, a, b
+
+    def test_disabled_ttl_preserves_round_robin_even_with_a_key(self):
+        server, _a, _b = self._pair(ttl=0.0)
+        picks = [_pick(server, sticky_key="acct-1").label for _ in range(4)]
+        self.assertEqual(picks, ["a", "b", "a", "b"])
+        self.assertEqual(server._sticky_sessions, {})
+
+    def test_same_key_reuses_one_upstream(self):
+        server, _a, _b = self._pair(ttl=300.0)
+        first = _pick(server, sticky_key="acct-1")
+        second = _pick(server, sticky_key="acct-1")
+        self.assertIs(first, second)
+        self.assertEqual(first.label, "a")
+
+    def test_distinct_keys_get_independent_upstreams(self):
+        server, _a, _b = self._pair(ttl=300.0)
+        self.assertEqual(_pick(server, sticky_key="acct-1").label, "a")
+        self.assertEqual(_pick(server, sticky_key="acct-2").label, "b")
+        # ...and acct-1 is still pinned.
+        self.assertEqual(_pick(server, sticky_key="acct-1").label, "a")
+
+    def test_empty_key_falls_back_to_round_robin(self):
+        server, _a, _b = self._pair(ttl=300.0)
+        picks = [_pick(server).label for _ in range(4)]
+        self.assertEqual(picks, ["a", "b", "a", "b"])
+
+    def test_expired_binding_is_dropped_and_rebound(self):
+        import time as _time
+
+        server, a, b = self._pair(ttl=300.0)
+        server._sticky_sessions["acct-1"] = (a, _time.monotonic() - 1)
+        server._rr_idx = 1  # deterministic: the re-pick starts at the second upstream
+        self.assertEqual(_pick(server, sticky_key="acct-1").label, "b")
+        self.assertIs(server._sticky_sessions["acct-1"][0], b)
+
+    def test_unhealthy_binding_is_dropped_and_rebound(self):
+        server, a, b = self._pair(ttl=300.0)
+        self.assertEqual(_pick(server, sticky_key="acct-1").label, "a")
+        a.healthy = False
+        self.assertEqual(_pick(server, sticky_key="acct-1").label, "b")
+
+    def test_excluded_binding_is_dropped_for_the_retry(self):
+        server, a, b = self._pair(ttl=300.0)
+        self.assertEqual(_pick(server, sticky_key="acct-1").label, "a")
+        picked = server._pick_upstream(sticky_key="acct-1", exclude={a.identity})
+        self.assertIs(picked, b)
+
+    def test_prune_drops_only_expired_bindings(self):
+        import time as _time
+
+        server, a, b = self._pair(ttl=300.0)
+        server._sticky_sessions["fresh"] = (a, _time.monotonic() + 100)
+        server._sticky_sessions["stale"] = (b, _time.monotonic() - 1)
+        server._prune_sticky_sessions()
+        self.assertIn("fresh", server._sticky_sessions)
+        self.assertNotIn("stale", server._sticky_sessions)
+
+    def test_stats_reports_sticky_session_count(self):
+        server, _a, _b = self._pair(ttl=300.0)
+        self.assertEqual(server._stats_json()["sticky_sessions"], 0)
+        server._pick_upstream(sticky_key="acct-1")
+        self.assertEqual(server._stats_json()["sticky_sessions"], 1)
+
+    # ── integration: the full SOCKS5 greeting negotiates the key ──
+
+    @staticmethod
+    def _writer():
+        w = AsyncMock()
+        w.write = MagicMock()
+        w.drain = AsyncMock()
+        w.close = MagicMock()
+        w.wait_closed = AsyncMock()
+        w.can_write_eof = MagicMock(return_value=True)
+        w.write_eof = MagicMock()
+        return w
+
+    @staticmethod
+    def _client_reader(method, username="", password=""):
+        r = asyncio.StreamReader()
+        r.feed_data(bytes([_SOCKS5_VER, 0x01, method]))
+        if method == _USERPASS:
+            user = username.encode()
+            pwd = password.encode()
+            r.feed_data(bytes([0x01, len(user)]) + user + bytes([len(pwd)]) + pwd)
+        domain = b"example.com"
+        r.feed_data(
+            bytes([_SOCKS5_VER, _CMD_CONNECT, 0x00, _ATYP_DOMAIN, len(domain)]) + domain + struct.pack("!H", 443)
+        )
+        r.feed_eof()
+        return r
+
+    def _run_handshake(self, server, reader_factories):
+        """Drive full handshakes, building each client reader *inside* the loop.
+
+        A ``StreamReader`` built in the test body binds to whatever loop exists
+        then; after an earlier test calls ``asyncio.run`` the default loop is
+        closed and construction raises.  Factories defer that into the coroutine.
+        """
+        picked: list[str] = []
+
+        async def _record(upstream, _host, _port, _atyp):
+            picked.append(upstream.label)
+            empty = asyncio.StreamReader()
+            empty.feed_eof()
+            return empty, self._writer()
+
+        async def _drive():
+            with patch.object(server, "_connect_through_upstream", side_effect=_record):
+                for make_reader in reader_factories:
+                    await server._handle_client(make_reader(), self._writer())
+
+        asyncio.run(_drive())
+        return picked
+
+    def test_handshake_pins_by_username_across_connections(self):
+        server, _a, _b = self._pair(ttl=300.0)
+        picked = self._run_handshake(
+            server,
+            [
+                lambda: self._client_reader(_USERPASS, "acct-1", "secret"),
+                lambda: self._client_reader(_USERPASS, "acct-1", "secret"),
+                lambda: self._client_reader(_USERPASS, "acct-2", "secret"),
+            ],
+        )
+        self.assertEqual(picked, ["a", "a", "b"])
+
+    def test_handshake_without_userpass_still_round_robins(self):
+        server, _a, _b = self._pair(ttl=300.0)
+        picked = self._run_handshake(
+            server,
+            [lambda: self._client_reader(_NO_AUTH), lambda: self._client_reader(_NO_AUTH)],
+        )
+        self.assertEqual(picked, ["a", "b"])
+
+    def test_handshake_sends_rfc1929_success_before_connect(self):
+        async def _run():
+            server, _a, _b = self._pair(ttl=300.0)
+            writer = self._writer()
+
+            async def _record(_upstream, _host, _port, _atyp):
+                empty = asyncio.StreamReader()
+                empty.feed_eof()
+                return empty, self._writer()
+
+            with patch.object(server, "_connect_through_upstream", side_effect=_record):
+                await server._handle_client(self._client_reader(_USERPASS, "acct-1", "secret"), writer)
+            return [call.args[0] for call in writer.write.call_args_list]
+
+        writes = asyncio.run(_run())
+        self.assertEqual(writes[0], bytes([_SOCKS5_VER, _USERPASS]))
+        self.assertEqual(writes[1], bytes([0x01, 0x00]))  # RFC 1929 success
+        self.assertEqual(writes[2][:2], bytes([_SOCKS5_VER, 0x00]))  # CONNECT success
+
+
+class TestEdgeHealthProbe(unittest.TestCase):
+    """P1-3: opt-in real-HTTP health probe, injected (proxy_pool imports nothing)."""
+
+    def _server(self, probe=None, timeout=5.0):
+        return Socks5Server("127.0.0.1", 0, [], stats_port=0, health_check_timeout=timeout, edge_probe=probe)
+
+    def test_default_is_tunnel_only(self):
+        server = self._server()
+        self.assertIsNone(server._edge_probe)
+        self.assertEqual(server._stats_json()["health_probe"], "tunnel")
+
+    def test_stats_reports_edge_mode(self):
+        server = self._server(probe=lambda _url, _timeout: (True, ""))
+        self.assertEqual(server._stats_json()["health_probe"], "edge")
+
+    def test_edge_success_is_healthy(self):
+        server = self._server(probe=lambda _url, _timeout: (True, ""))
+        ok, error = asyncio.run(server._check_upstream(UpstreamProxy(host="1.1.1.1", port=1080), "cloudflare.com", 443))
+        self.assertTrue(ok)
+        self.assertEqual(error, "")
+
+    def test_edge_failure_carries_the_detail(self):
+        server = self._server(probe=lambda _url, _timeout: (False, "edge:blocked:http_403:cloudflare"))
+        ok, error = asyncio.run(server._check_upstream(UpstreamProxy(host="1.1.1.1", port=1080), "cloudflare.com", 443))
+        self.assertFalse(ok)
+        self.assertEqual(error, "edge:blocked:http_403:cloudflare")
+
+    def test_a_raising_probe_does_not_kill_the_loop(self):
+        def _boom(_url, _timeout):
+            raise RuntimeError("nope")
+
+        server = self._server(probe=_boom)
+        ok, error = asyncio.run(server._check_upstream(UpstreamProxy(host="1.1.1.1", port=1080), "cloudflare.com", 443))
+        self.assertFalse(ok)
+        self.assertEqual(error, "edge_probe_error:RuntimeError")
+
+    def test_edge_probe_receives_the_upstream_url_and_timeout(self):
+        seen: dict = {}
+
+        def _probe(url, timeout):
+            seen["url"] = url
+            seen["timeout"] = timeout
+            return True, ""
+
+        server = self._server(probe=_probe, timeout=7.5)
+        asyncio.run(
+            server._check_upstream(UpstreamProxy(host="h", port=1, username="u", password="p"), "cloudflare.com", 443)
+        )
+        self.assertEqual(seen["url"], "socks5://u:p@h:1")
+        self.assertEqual(seen["timeout"], 7.5)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestHealthLoopOrdering(unittest.TestCase):
+    """The first health round must run before the first interval, not after it.
+
+    ``UpstreamProxy.healthy`` defaults to ``True`` and ``start()`` launches this
+    loop as a task.  With the loop's sleep first in the body, a pool that came up
+    holding dead exits served live traffic for a full ``health_check_interval``
+    (30s by default) on a "healthy" verdict nothing had measured.  The hysteresis
+    below is careful never to kill an upstream on one blip; it should not also
+    have to compensate for a first round that never ran.
+    """
+
+    def _server(self, interval=3600.0):
+        upstream = UpstreamProxy(host="1.1.1.1", port=1080, label="a", healthy=True)
+        server = Socks5Server(
+            "127.0.0.1",
+            0,
+            upstreams=[upstream],
+            stats_port=0,
+            health_check_interval=interval,
+        )
+        return server, upstream
+
+    def test_first_probe_happens_before_any_interval_elapses(self):
+        async def _run():
+            server, upstream = self._server(interval=3600.0)
+            server._check_upstream = AsyncMock(return_value=(False, "dead"))
+            task = asyncio.create_task(server._health_check_loop())
+            # The interval is an hour, so any probe seen now can only come from a
+            # round that ran ahead of the sleep.
+            for _ in range(10):
+                await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return server._check_upstream.await_count, upstream
+
+        probes, upstream = asyncio.run(_run())
+        self.assertGreaterEqual(probes, 1, "the loop slept before its first health round")
+        self.assertEqual(upstream.fail_count, 1)
+
+    def test_shutdown_while_sleeping_stops_the_loop(self):
+        """Cancellation now lands in the sleep arm, which catches it and breaks.
+
+        The loop therefore *returns* rather than propagating ``CancelledError`` --
+        the same contract the pre-move-``sleep`` version had, because its single
+        ``except asyncio.CancelledError`` wrapped the sleep too. The assertion is
+        on the loop stopping, not on an exception escaping.
+        """
+
+        async def _run():
+            server, _upstream = self._server(interval=3600.0)
+            server._check_upstream = AsyncMock(return_value=(True, ""))
+            task = asyncio.create_task(server._health_check_loop())
+            for _ in range(10):
+                await asyncio.sleep(0)
+            probes_before = server._check_upstream.await_count
+            task.cancel()
+            await asyncio.wait_for(task, timeout=5)
+            for _ in range(5):
+                await asyncio.sleep(0)
+            return task.done(), probes_before, server._check_upstream.await_count
+
+        done, probes_before, probes_after = asyncio.run(_run())
+        self.assertTrue(done, "the loop did not stop after cancellation")
+        self.assertGreaterEqual(probes_before, 1)
+        self.assertEqual(probes_after, probes_before, "the loop kept probing after cancellation")

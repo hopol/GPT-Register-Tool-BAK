@@ -1,0 +1,615 @@
+import base64
+import json
+from pathlib import Path
+
+from sms_tool.desktop_read import (
+    _mailbox_line,
+    create_account_file,
+    create_mailbox_file,
+    create_payment_url_file,
+    read_account,
+    read_accounts,
+    read_mailbox_pool,
+)
+from sms_tool.storage import mark_promotion_status, upsert_account
+
+
+def _config(tmp_path: Path) -> dict:
+    return {
+        "chatgpt": {},
+        "storage": {"sqlite_path": str(tmp_path / "accounts.sqlite3")},
+        "runtime": {"directory": str(tmp_path)},
+    }
+
+
+def _access_token(plan_type: str) -> str:
+    payload = (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                {
+                    "https://api.openai.com/auth": {"chatgpt_plan_type": plan_type},
+                }
+            ).encode()
+        )
+        .decode()
+        .rstrip("=")
+    )
+    return "header." + payload + ".signature"
+
+
+def _seed(tmp_path: Path) -> tuple[dict, Path]:
+    session = {
+        "email": "reader@example.test",
+        "password": "account-password",
+        "success": True,
+        "status": "registered",
+        "access_token": "access-secret-value",
+        "refresh_token": "rt_refresh-secret-value",
+        "totp_secret": "totp-secret-value",
+        "mailbox": {
+            "email": "reader@example.test",
+            "provider": "remail",
+            "source": "purchase",
+            "token": "mailbox-secret-value",
+            "purchase_id": "purchase-fixture",
+        },
+        "paypal": {
+            "ok": True,
+            "status": "link_ready",
+            "url": "https://www.paypal.com/agreements/approve?ba_token=BA-FIXTURE-SECRET",
+        },
+    }
+    session_path = tmp_path / "session_reader.json"
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+    assert upsert_account(session, json_path=str(session_path), runtime_config=_config(tmp_path))
+    return session, session_path
+
+
+def test_public_desktop_reads_expose_presence_not_credentials(tmp_path):
+    session, _ = _seed(tmp_path)
+
+    rows = read_accounts(_config(tmp_path))
+    detail = read_account(email=session["email"], runtime_config=_config(tmp_path))
+
+    assert len(rows) == 1
+    assert detail["has_access_token"] is True
+    assert detail["has_refresh_token"] is True
+    assert detail["has_payment_url"] is True
+    assert detail["access_token_present"] is True
+    assert detail["refresh_token_present"] is True
+    assert detail["payment_url_present"] is True
+    rendered = json.dumps({"rows": rows, "detail": detail})
+    for secret in (
+        "access-secret-value",
+        "refresh-secret-value",
+        "totp-secret-value",
+        "mailbox-secret-value",
+        "BA-FIXTURE-SECRET",
+    ):
+        assert secret not in rendered
+    for forbidden_key in ("access_token", "refresh_token", "totp_secret", "paypal_url"):
+        assert forbidden_key not in detail
+
+
+def test_sensitive_exports_use_temporary_files(tmp_path):
+    session, _ = _seed(tmp_path)
+
+    account_result = create_account_file(email=session["email"], runtime_config=_config(tmp_path))
+    mailbox_result = create_mailbox_file(email=session["email"], runtime_config=_config(tmp_path))
+    payment_result = create_payment_url_file(email=session["email"], runtime_config=_config(tmp_path))
+    paths = [Path(item["path"]) for item in (account_result, mailbox_result, payment_result)]
+    try:
+        exported = json.loads(paths[0].read_text(encoding="utf-8"))
+        assert exported["access_token"] == session["access_token"]
+        assert paths[1].read_text(encoding="utf-8").strip().startswith("remail://reader@example.test---")
+        assert paths[2].read_text(encoding="utf-8").strip() == session["paypal"]["url"]
+    finally:
+        for path in paths:
+            path.unlink(missing_ok=True)
+
+
+def test_public_read_prefers_current_token_plan_over_stale_database(tmp_path):
+    session = {
+        "email": "upgraded@example.test",
+        "success": True,
+        "access_token": "old-token",
+        "auth_session": {"account": {"planType": "free"}},
+    }
+    session_path = tmp_path / "session_upgraded.json"
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+    assert upsert_account(session, json_path=str(session_path), runtime_config=_config(tmp_path))
+
+    session["access_token"] = _access_token("plus")
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+
+    row = read_account(email=session["email"], runtime_config=_config(tmp_path))
+    assert row["account_type"] == "plus"
+
+
+def test_lightweight_account_read_skips_full_session_sanitization(tmp_path, monkeypatch):
+    session, _ = _seed(tmp_path)
+    from sms_tool import desktop_read
+
+    def fail_sanitize(*args, **kwargs):
+        raise AssertionError("list reads must not sanitize the full session")
+
+    monkeypatch.setattr(desktop_read, "sanitize", fail_sanitize)
+    rows = desktop_read.read_accounts(_config(tmp_path), include_session=False)
+
+    assert rows[0]["imported_status"] == ""
+    assert rows[0]["paypal_amount"] == ""
+    assert "session" not in rows[0]
+
+
+def test_public_read_exposes_latest_access_token_probe_status_code(tmp_path):
+    session = {
+        "email": "invalid-at@example.test",
+        "success": False,
+        "status": "at_invalid",
+        "access_token": "expired-access-token",
+        "account_scan": {
+            "token_probe": {"status": "token_invalid", "status_code": 401},
+        },
+    }
+    session_path = tmp_path / "session_invalid_at.json"
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+    assert upsert_account(session, json_path=str(session_path), runtime_config=_config(tmp_path))
+
+    row = read_account(email=session["email"], runtime_config=_config(tmp_path))
+
+    assert row["access_token_present"] is True
+    assert row["at_probe_status_code"] == "401"
+
+
+def test_smailr_mailbox_line_falls_back_to_source_id(tmp_path):
+    source = json.dumps(
+        {
+            "address": "reuse@smailr.com",
+            "id": "b2432eb0-2bd2-43a3-93ac-20c57ff4f76e",
+            "user_id": "ffcaec5b-5e12-4bbc-9ec4-000000000000",
+            "mail_count": 4,
+        }
+    )
+    session = {
+        "email": "reuse@smailr.com",
+        "password": "account-password",
+        "success": True,
+        "status": "registered",
+        "mailbox": {
+            "email": "reuse@smailr.com",
+            "provider": "smailr",
+            "source": source,
+        },
+    }
+    session_path = tmp_path / "session_reuse.json"
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+    assert upsert_account(session, json_path=str(session_path), runtime_config=_config(tmp_path))
+
+    result = create_mailbox_file(email="reuse@smailr.com", runtime_config=_config(tmp_path))
+    assert result["ok"] is True
+    line = Path(result["path"]).read_text(encoding="utf-8").strip()
+    assert line == "smailr://reuse@smailr.com---b2432eb0-2bd2-43a3-93ac-20c57ff4f76e"
+
+
+def test_remail_mailbox_line_never_emits_incomplete_pickup_credential():
+    assert (
+        _mailbox_line(
+            {
+                "email": "user@icloud.com",
+                "provider": "remail",
+                "purchase_id": "1063043",
+            }
+        )
+        == ""
+    )
+
+
+def test_public_read_prefers_newer_relogin_probe_over_stale_401(tmp_path):
+    session = {
+        "email": "relogin@example.test",
+        "success": False,
+        "status": "at_invalid",
+        "access_token": "old-access-token",
+        "account_scan_updated_at": 100,
+        "account_scan": {
+            "token_probe": {"status": "token_invalid", "status_code": 401},
+        },
+    }
+    session_path = tmp_path / "session_relogin.json"
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+    assert upsert_account(session, json_path=str(session_path), runtime_config=_config(tmp_path))
+
+    # Relogin has updated the session file, while SQLite still contains the
+    # previous 401 snapshot.
+    session.update(
+        {
+            "success": True,
+            "status": "registered",
+            "access_token": "new-access-token",
+            "quota_updated_at": 200,
+            "quota": {
+                "updated_at": 200,
+                "last_result": {"status": "active", "status_code": 200},
+            },
+        }
+    )
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+
+    row = read_account(email=session["email"], runtime_config=_config(tmp_path))
+
+    assert row["at_probe_status_code"] == "200"
+
+
+def _pool_config(tmp_path: Path, token_name: str = "mailbox_tokens.txt") -> dict:
+    config = _config(tmp_path)
+    config["email_registration"] = {"token_file": token_name}
+    return config
+
+
+def test_mailbox_pool_parses_every_supported_format(tmp_path):
+    (tmp_path / "mailbox_tokens.txt").write_text(
+        "\n".join(
+            [
+                "# comment",
+                "cfworker://worker@example.test",
+                "bare@edu.liziai.cloud",
+                "remail://remail@example.test---service-token---order-1---purchase-9",
+                "smailr://smailr@example.test---mailbox-id",
+                "user@icloud.com----https://mail.example/inbox/private-token",
+                "gmail://app@gmail.com---app-password",
+                "gmail://oauth@gmail.com----client-id----client-secret----refresh-token",
+                "chatai@example.test----password----9f8b4c2a-1234-4bcd-8efa-0123456789ab----chatai-refresh",
+                "graph@example.test---password---graph-refresh---graph-access---0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = read_mailbox_pool(_pool_config(tmp_path), root_dir=tmp_path)
+
+    assert len(result["files"]) == 1
+    pool_file = result["files"][0]
+    assert pool_file["name"] == "mailbox_tokens.txt"
+    lines = pool_file["lines"]
+    assert [line["provider"] for line in lines] == [
+        "cfworker",
+        "cfworker",
+        "remail",
+        "smailr",
+        "icloud_url",
+        "gmail",
+        "gmail",
+        "chatai",
+        "graph",
+    ]
+    by_email = {line["email"]: line for line in lines}
+    assert by_email["worker@example.test"]["raw_line"] == "cfworker://worker@example.test"
+    assert by_email["bare@edu.liziai.cloud"]["raw_line"] == "bare@edu.liziai.cloud"
+    remail = by_email["remail@example.test"]
+    assert remail["token"] == "service-token"
+    assert remail["order_no"] == "order-1"
+    assert remail["purchase_id"] == "purchase-9"
+    assert by_email["smailr@example.test"]["token"] == "mailbox-id"
+    assert by_email["user@icloud.com"]["token"] == "https://mail.example/inbox/private-token"
+    assert by_email["user@icloud.com"]["auth_mode"] == "otp_url"
+    gmail_app = by_email["app@gmail.com"]
+    assert gmail_app["password"] == "app-password"
+    assert gmail_app["auth_mode"] == "app_password"
+    assert gmail_app["client_id"] == ""
+    gmail_oauth = by_email["oauth@gmail.com"]
+    assert gmail_oauth["client_id"] == "client-id"
+    assert gmail_oauth["client_secret"] == "client-secret"
+    assert gmail_oauth["refresh_token"] == "refresh-token"
+    assert gmail_oauth["auth_mode"] == "oauth_refresh"
+    chatai = by_email["chatai@example.test"]
+    assert chatai["client_id"] == "9f8b4c2a-1234-4bcd-8efa-0123456789ab"
+    assert chatai["refresh_token"] == "chatai-refresh"
+    graph = by_email["graph@example.test"]
+    assert graph["refresh_token"] == "graph-refresh"
+    assert graph["access_token"] == "graph-access"
+
+
+def test_mailbox_pool_skips_malformed_lines(tmp_path):
+    (tmp_path / "mailbox_tokens.txt").write_text(
+        "\n".join(
+            [
+                "remail://missing-order---service-token",
+                "smailr://missing-id",
+                "gmail://",
+                "not-an-email----password----client----refresh",
+                "two---parts",
+                "graph@example.test---password---",
+                "ok@example.test---password---refresh",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = read_mailbox_pool(_pool_config(tmp_path), root_dir=tmp_path)
+
+    lines = result["files"][0]["lines"]
+    assert [line["email"] for line in lines] == ["ok@example.test"]
+    assert lines[0]["line_no"] == 7
+
+
+def test_mailbox_pool_tolerates_missing_files(tmp_path):
+    result = read_mailbox_pool(
+        _pool_config(tmp_path),
+        extra_files=(str(tmp_path / "absent_selected.txt"),),
+        root_dir=tmp_path,
+    )
+
+    assert result == {"files": []}
+
+
+def test_mailbox_pool_enumerates_known_files_once(tmp_path):
+    selected = tmp_path / "selected.txt"
+    selected.write_text("sel@example.test---password---refresh", encoding="utf-8")
+    (tmp_path / "mailbox_tokens.txt").write_text("tok@example.test---password---refresh", encoding="utf-8")
+    (tmp_path / "hotmail.txt").write_text("hot@example.test----password----client----refresh", encoding="utf-8")
+    (tmp_path / "my_chatai_export.txt").write_text("cfworker://glob@example.test", encoding="utf-8")
+    (tmp_path / "notes.md").write_text("ignored@example.test---p---r", encoding="utf-8")
+
+    result = read_mailbox_pool(
+        _pool_config(tmp_path),
+        extra_files=(str(selected), str(tmp_path / "mailbox_tokens.txt")),
+        root_dir=tmp_path,
+    )
+
+    names = [entry["name"] for entry in result["files"]]
+    assert names == ["selected.txt", "mailbox_tokens.txt", "hotmail.txt", "my_chatai_export.txt"]
+    emails = {entry["name"]: [line["email"] for line in entry["lines"]] for entry in result["files"]}
+    assert emails["selected.txt"] == ["sel@example.test"]
+    assert emails["mailbox_tokens.txt"] == ["tok@example.test"]
+    assert emails["hotmail.txt"] == ["hot@example.test"]
+    assert emails["my_chatai_export.txt"] == ["glob@example.test"]
+
+
+def test_public_read_surfaces_promotion_state_and_clears_stale_marker(tmp_path):
+    """机器状态 promotion_state 随桌面读透出；401 标记遇后续 AT 200 被判定过期。
+
+    共享 stale 规则在 sms_tool/promotion_states.promotion_marker_is_stale，
+    桌面读与 account_recovery 持久化两侧共用。
+    """
+    stale_probe = {"status": "active", "status_code": 200}
+    accounts = {
+        "promo-fresh@example.test": {},
+        "promo-stale@example.test": {"account_scan": {"token_probe": stale_probe}},
+    }
+    for email, extra in accounts.items():
+        session = {
+            "email": email,
+            "success": True,
+            "access_token": "access-token-value",
+            **extra,
+        }
+        path = tmp_path / f"session_{email}.json"
+        path.write_text(json.dumps(session), encoding="utf-8")
+        assert upsert_account(session, json_path=str(path), runtime_config=_config(tmp_path))
+        assert mark_promotion_status(
+            email,
+            "AT失效",
+            {"ok": False, "promotion_status": "AT失效", "promotion_state": "auth_invalid"},
+            runtime_config=_config(tmp_path),
+        )
+
+    fresh_row = read_account(email="promo-fresh@example.test", runtime_config=_config(tmp_path))
+    assert fresh_row["promotion_status"] == "AT失效"
+    assert fresh_row["promotion_state"] == "auth_invalid"
+
+    stale_row = read_account(email="promo-stale@example.test", runtime_config=_config(tmp_path))
+    assert "promotion_status" not in stale_row
+    assert "promotion_state" not in stale_row
+
+
+def test_public_read_does_not_surface_payment_methods(tmp_path):
+    email = "trial-methods@example.test"
+    session = {
+        "email": email,
+        "success": True,
+        "access_token": "access-token-value",
+    }
+    path = tmp_path / f"session_{email}.json"
+    path.write_text(json.dumps(session), encoding="utf-8")
+    assert upsert_account(
+        session,
+        json_path=str(path),
+        runtime_config=_config(tmp_path),
+    )
+    assert mark_promotion_status(
+        email,
+        "可试用Plus·-100%",
+        {
+            "ok": True,
+            "promotion_status": "可试用Plus·-100%",
+            "promotion_state": "trial_eligible",
+            "payment_methods": ["card", "link", "momo"],
+            "payment_methods_label": "银行卡/Link/MoMo",
+        },
+        runtime_config=_config(tmp_path),
+    )
+
+    row = read_account(email=email, runtime_config=_config(tmp_path))
+
+    assert row["promotion_status"] == "可试用Plus·-100%"
+    assert "payment_methods_label" not in row
+
+
+def test_public_read_drops_legacy_payment_suffix(tmp_path):
+    email = "legacy-methods@example.test"
+    session = {
+        "email": email,
+        "success": True,
+        "access_token": "access-token-value",
+        "promotion_status": "可试用Plus·-100%｜可支付:银行卡/MoMo",
+        "promotion_state": "trial_eligible",
+    }
+    path = tmp_path / f"session_{email}.json"
+    path.write_text(json.dumps(session), encoding="utf-8")
+    assert upsert_account(
+        session,
+        json_path=str(path),
+        runtime_config=_config(tmp_path),
+    )
+    assert mark_promotion_status(
+        email,
+        "可试用Plus·-100%｜可支付:银行卡/MoMo",
+        {"ok": True, "promotion_state": "trial_eligible"},
+        runtime_config=_config(tmp_path),
+    )
+
+    row = read_account(email=email, runtime_config=_config(tmp_path))
+
+    assert row["promotion_status"] == "可试用Plus·-100%"
+    assert "payment_methods_label" not in row
+
+
+def test_desktop_read_is_reported_as_handled(monkeypatch):
+    """A handled desktop read must stop `main`, not fall through to registration.
+
+    Regression for 2026-10-18: the branch ended with a bare `return`, i.e. None,
+    which is falsy. `main` therefore kept going into `_load_heavy_deps` and the
+    registration pipeline after the result frame was already emitted --
+    `--desktop-read accounts --desktop-ipc` printed extra error frames and
+    exited 2. The docstring has always promised True for a handled command.
+    """
+    from types import SimpleNamespace
+
+    import sms_tool.cli as cli
+
+    args = SimpleNamespace(
+        desktop_read="accounts",
+        desktop_ipc=True,
+        account_id=None,
+        email=None,
+        chatai_mailbox_file=None,
+        json_output=False,
+    )
+    monkeypatch.setattr("sms_tool.desktop_read.read_accounts", lambda *_a, **_k: [])
+
+    assert cli._main_early_commands(args) is True
+
+
+def test_session_state_cache_stays_bounded(tmp_path, monkeypatch):
+    """The resident desktop channel must not remember every session file forever.
+
+    The cache is keyed by session-file path and was never evicted; a long-lived
+    desktop server over a growing accounts directory therefore held one parsed
+    state dict per session the process had ever read. The bound mirrors the
+    parse/sanitize caches above: on overflow the cache is cleared, and the only
+    cost is one re-read per file.
+    """
+    from sms_tool import desktop_read
+
+    monkeypatch.setattr(desktop_read, "_SESSION_STATE_CACHE_LIMIT", 3)
+    desktop_read._SESSION_STATE_CACHE.clear()
+    for index in range(5):
+        path = tmp_path / f"session_bound_{index}.json"
+        path.write_text(json.dumps({"access_token": f"at-{index}"}), encoding="utf-8")
+        desktop_read._session_file_state({"json_path": str(path)})
+        assert len(desktop_read._SESSION_STATE_CACHE) <= 3
+
+    # A re-read after the clear still answers from the file itself.
+    last = tmp_path / "session_bound_4.json"
+    assert desktop_read._session_file_state({"json_path": str(last)})["has_access_token"] is True
+    desktop_read._SESSION_STATE_CACHE.clear()
+
+
+# ── identity provenance ──────────────────────────────────────────────────────
+#
+# The detail panel now shows the exit an account was registered through and the
+# fingerprint it was bound to. Both were already in `identity_context`; the point
+# of these tests is that the *new* payload keeps them credential-free and never
+# becomes a pass-through for whatever the registration lane writes next.
+
+
+_IDENTITY_SESSION = {
+    "email": "identity@example.test",
+    "success": True,
+    "status": "registered",
+    "registration_country": "IN",
+    "identity_context": {
+        "version": 1,
+        "proxy_affinity": {
+            "pool_index": 8,
+            "scheme": "http",
+            "host": "proxysg.example.test",
+            "port": 2000,
+            "country": "IN",
+            "session_kind": "username_sid",
+            "session_id": "SID-MUST-NOT-LEAK",
+        },
+        "fingerprint_key": "firefox133",
+        "device_id": "device-fixture",
+        "auth_session_logging_id": "logging-fixture",
+        # A field added by a future lane: the payload must not relay it.
+        "unexpected_secret": "future-secret-value",
+    },
+}
+
+
+def _seed_identity(tmp_path: Path) -> dict:
+    session = json.loads(json.dumps(_IDENTITY_SESSION))
+    session_path = tmp_path / "session_identity.json"
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+    assert upsert_account(session, json_path=str(session_path), runtime_config=_config(tmp_path))
+    return session
+
+
+def test_identity_payload_exposes_egress_and_fingerprint(tmp_path):
+    _seed_identity(tmp_path)
+
+    detail = read_account(email=_IDENTITY_SESSION["email"], runtime_config=_config(tmp_path))
+    identity = detail["identity"]
+
+    assert identity["fingerprint_profile"] == "firefox133"
+    assert identity["registration_country"] == "IN"
+    assert identity["proxy_scheme"] == "http"
+    assert identity["proxy_host"] == "proxysg.example.test"
+    assert identity["proxy_port"] == 2000
+    assert identity["proxy_country"] == "IN"
+    assert identity["proxy_pool_index"] == 8
+    assert identity["bound"] is True
+    assert identity["device_id"] == "device-fixture"
+    assert identity["auth_session_logging_id"] == "logging-fixture"
+
+
+def test_identity_payload_is_whitelisted_not_a_pass_through(tmp_path):
+    """A field the registration lane adds later must not reach the desktop by accident."""
+    _seed_identity(tmp_path)
+
+    detail = read_account(email=_IDENTITY_SESSION["email"], runtime_config=_config(tmp_path))
+    identity = detail["identity"]
+
+    assert set(identity) == {
+        "fingerprint_profile",
+        "device_id",
+        "auth_session_logging_id",
+        "registration_country",
+        "proxy_scheme",
+        "proxy_host",
+        "proxy_port",
+        "proxy_country",
+        "proxy_pool_index",
+        "bound",
+    }
+    # session_id names a live sticky session; the panel has no use for it.
+    rendered = json.dumps(identity)
+    assert "SID-MUST-NOT-LEAK" not in rendered
+    assert "future-secret-value" not in rendered
+
+
+def test_identity_payload_reports_unbound_without_a_recorded_exit(tmp_path):
+    """No proxy affinity is a real state, not missing data: `bound` says which."""
+    session = {"email": "direct@example.test", "success": True, "status": "registered"}
+    session_path = tmp_path / "session_direct.json"
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+    assert upsert_account(session, json_path=str(session_path), runtime_config=_config(tmp_path))
+
+    detail = read_account(email="direct@example.test", runtime_config=_config(tmp_path))
+    identity = detail["identity"]
+
+    assert identity["bound"] is False
+    assert identity["proxy_host"] == ""
+    assert identity["proxy_pool_index"] == -1

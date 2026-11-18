@@ -1,0 +1,260 @@
+"""base submodule of the former payment/link_manager.py (mechanical split, bodies unchanged)."""
+
+from __future__ import annotations
+import inspect
+import json
+import logging
+import re
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+from ..config import current_config_data, resolve_runtime_config
+from ..kernel.paths import project_path, runtime_file
+from ..payment.catalog import (
+    PAYMENT_METHODS as CATALOG_METHODS,
+    normalize_payment_method as normalize_catalog_payment_method,
+    offline_method_error,
+    validate_catalog_consistency,
+)
+from ..payment.operation import (
+    PaymentOperationConflict,
+    PaymentOperationStore,
+    conflict_result as payment_operation_conflict_result,
+)
+from ..payment.routing import (
+    PaymentRoutePlan,
+    PaymentRoutePlanner,
+    parse_proxy_pool,
+    payment_proxy_pools as canonical_payment_proxy_pools,
+)
+from ..kernel.sanitizer import sanitize as _canonical_sanitize, sanitize_text as _canonical_sanitize_text
+
+
+def _offline_refusal(method: str, *, probe_only: bool = False) -> ValueError | None:
+    return offline_method_error(method, probe_only=probe_only)
+
+
+def _config_data(runtime_config: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+    if runtime_config is not None:
+        return resolve_runtime_config(runtime_config).data
+    return current_config_data()
+
+
+@dataclass(frozen=True)
+class PaymentMethodSpec:
+    key: str
+    label: str
+    country: str
+    currency: str
+    adapter: str
+    script: str = ""
+    artifact_validator: str = "http_url"
+
+
+def _as_bool(value: Any) -> bool | None:
+    """Delegate to :func:`sms_tool.payment.contracts.as_bool`.
+
+    The two-sided spelling parser used to be copied here and in
+    ``payment.contracts``; the copies agreed, but only because nobody had edited
+    one. The private name stays because ``pay_link.__all__`` exports it and
+    ``normalize`` / ``adapters`` import it.
+
+    The import is function-local on purpose: ``pay_link -> payment`` is an
+    already-frozen facade edge, and a module-level import of one more
+    ``payment`` module would grow the layer ratchet for a one-line helper. The
+    delayed-import ratchet records this edge with its reason instead.
+    """
+    from ..payment.contracts import as_bool
+
+    return as_bool(value)
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    """``int(value)`` that never raises (missing/garbage -> ``default``).
+
+    Adapter options come from CLI/store/config and can be absent or
+    non-numeric; raising there loses the whole run to a ValueError.
+    """
+    if isinstance(value, bool):
+        return 1 if value else 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    """``float(value)`` that never raises (missing/garbage -> ``default``)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def is_true(value: Any) -> bool:
+    """True only when ``value`` is the bool ``True`` (not 1/"yes")."""
+    return isinstance(value, bool) and value
+
+
+def is_false(value: Any) -> bool:
+    """True only when ``value`` is the bool ``False`` (not 0/None/"")."""
+    return isinstance(value, bool) and not value
+
+
+def _select_kwargs(values: dict[str, Any], allowed: set[str]) -> dict[str, Any]:
+    return {key: value for key, value in values.items() if key in allowed and value is not None}
+
+
+def _forwardable_kwargs(
+    function: Any, values: Mapping[str, Any], *, skip: frozenset[str] | set[str] = frozenset()
+) -> dict[str, Any]:
+    """Keyword arguments ``function`` actually declares, dropping ``None`` values.
+
+    The PayPal adapter used to keep its own literal copy of the callee's option
+    names. A hand-maintained copy drifts both ways -- it forwarded
+    ``max_stage_retries`` to a function that never accepted it (TypeError on the
+    first caller who set the option) and it would silently drop a newly added
+    parameter. Asking the callable's signature makes drift impossible: an
+    unknown name is dropped, a declared one is forwarded, and neither list needs
+    maintenance.
+
+    ``skip`` names are passed positionally/by their own keyword by the runner and
+    must not be repeated (a duplicate keyword is a ``TypeError``, the exact
+    failure this replaces).
+    """
+    parameters = inspect.signature(function).parameters
+    # A callee that declares ``**kwargs`` accepts every name, so nothing is
+    # "unknown" to it. This also keeps test doubles working: a ``Mock`` has the
+    # signature ``(*args, **kwargs)``, and filtering it down to zero keywords
+    # would make every adapter test silently assert on an empty call.
+    takes_anything = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    accepted = None if takes_anything else set(parameters)
+    return {
+        key: value
+        for key, value in values.items()
+        if key not in skip and value is not None and (accepted is None or key in accepted)
+    }
+
+
+def _protocol_cfg(runtime_config: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+    source = _config_data(runtime_config)
+    value = source.get("protocol_payments")
+    return value if isinstance(value, Mapping) else {}
+
+
+def _reference_root(runtime_config: Mapping[str, Any] | None = None) -> Path:
+    configured = _protocol_cfg(runtime_config).get("reference_root") or "services/protocol-payment"
+    return project_path(configured)
+
+
+def _state_path() -> Path:
+    configured = str(_protocol_cfg().get("state_file") or "").strip()
+    return project_path(configured) if configured else runtime_file(_config_data(), "payment_link_runs.jsonl")
+
+
+def _last_json_object(text: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    for index in reversed([i for i, char in enumerate(text) if char == "{"]):
+        try:
+            value, end = decoder.raw_decode(text[index:])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if isinstance(value, dict) and not text[index + end :].strip():
+            return value
+    return {}
+
+
+def _tail(text: str, limit: int = 1200) -> str:
+    value = str(text or "").strip()
+    return value[-limit:]
+
+
+def _blik_completion(stdout: str) -> dict[str, Any]:
+    """Parse the BLIK auto-submit completion sentinel from stdout.
+
+    BLIK 自动提交模式完成支付后没有可分享 URL，成功信号是 ``print_result_url`` 打印的
+    ``BLIK_RESULT:{...}`` 结构化行（status=completed）。返回最后一个完成哨兵，否则空 dict。
+    """
+    for raw in reversed(_BLIK_RESULT_RE.findall(stdout or "")):
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if (
+            isinstance(value, dict)
+            and is_true(value.get("ok"))
+            and str(value.get("payment_method") or "").lower() == "blik"
+            and str(value.get("status") or "").lower() == "completed"
+            and value.get("link_type") == "blik_protocol_completed"
+        ):
+            return value
+    return {}
+
+
+def _mask_ba_token(token: str) -> str:
+    return "[REDACTED]" if token else ""
+
+
+def _redact_sensitive_text(value: str) -> str:
+    return _canonical_sanitize_text(value)
+
+
+def _redact_sensitive_values(value: Any) -> Any:
+    """Mask credentials anywhere inside a persisted payment-run value.
+
+    ``ba_token`` 键本身已被 :func:`_persist_run` 的键名过滤丢弃，但 approve URL
+    （如 ``.../agreements/approve?ba_token=BA-...``）会以 ``url``/``fallback_url`` 字段
+    保留，需按值脱敏后再落盘。日志和错误文本还可能包含 Bearer/JWT、代理认证或
+    其他命名凭据，因此统一递归清洗。仅影响持久化记录，不改动返回给调用方的结果。
+    """
+    return _canonical_sanitize(value)
+
+
+_LOGGER = logging.getLogger("sms_tool.payment.link_manager")
+
+
+GOPAY_DEFAULT_APPROVE_COUNTRIES = ("JP", "TR")
+
+
+PAYMENT_METHODS = {
+    key: PaymentMethodSpec(
+        key,
+        definition.label,
+        definition.country,
+        definition.currency,
+        {"native_paypal": "native", "native_upi": "native"}.get(definition.adapter, definition.adapter),
+        definition.script,
+        definition.artifact_validator,
+    )
+    for key, definition in CATALOG_METHODS.items()
+}
+
+
+_STATE_LOCK = threading.Lock()
+
+
+_BLIK_RESULT_RE = re.compile(r"BLIK_RESULT:(\{.*\})")
+
+
+_DIRECT_CARD_CURRENCY = {
+    "PH": "PHP",
+    "US": "USD",
+    "GB": "GBP",
+    "JP": "JPY",
+    "DE": "EUR",
+    "FR": "EUR",
+    "IE": "EUR",
+    "NL": "EUR",
+    "AU": "AUD",
+    "CA": "CAD",
+    "SG": "SGD",
+    "IN": "INR",
+    "TR": "TRY",
+    "BR": "BRL",
+    "KR": "KRW",
+    "PL": "PLN",
+    "CH": "CHF",
+    "VN": "VND",
+    "NZ": "NZD",
+}

@@ -1,0 +1,92 @@
+// Opted into nullable reference checking file-by-file - see the note in
+// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
+#nullable enable
+
+using Serilog.Events;
+
+namespace SmsWorkbench
+{
+    public static class AppHost
+    {
+        public static IHost Build(string baseDirectory)
+        {
+            var paths = new ApplicationPaths(baseDirectory);
+            var logDirectory = Path.Combine(paths.RootDirectory, "runtime");
+            Directory.CreateDirectory(logDirectory);
+
+            Log.Logger = new LoggerConfiguration()
+                .MinimumLevel.Is(ResolveMinimumLevel())
+                .WriteTo.Async(sink => sink.File(
+                    Path.Combine(logDirectory, "app_.log"),
+                    rollingInterval: RollingInterval.Day,
+                    retainedFileCountLimit: 14,
+                    encoding: Encoding.UTF8,
+                    formatProvider: CultureInfo.InvariantCulture,
+                    outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss}] [{Level:u3}] {Message:lj}{NewLine}{Exception}"))
+                .CreateLogger();
+
+            return Host.CreateDefaultBuilder()
+                .UseSerilog(Log.Logger, dispose: false)
+                .ConfigureServices(services =>
+                {
+                    services.AddSingleton<Serilog.ILogger>(Log.Logger);
+                    services.AddSingleton<IApplicationPaths>(paths);
+                    services.AddSingleton<IBackendClient, PythonBackendClient>();
+                    services.AddSingleton<IBackendTaskCoordinator, BackendTaskCoordinator>();
+                    services.AddSingleton<IDesktopReadClient, DesktopReadClient>();
+                    services.AddSingleton<Wpf.Ui.ISnackbarService, Wpf.Ui.SnackbarService>();
+                    services.AddSingleton<IFileLauncher, FileLauncher>();
+                    services.AddSingleton<IPaymentBatchService, PaymentBatchService>();
+                    services.AddSingleton<IPaymentBatchDialogService, PaymentBatchDialogService>();
+                    services.AddSingleton<IProxyPoolService, ProxyPoolService>();
+                    services.AddSingleton<IProxyPoolDialogService, ProxyPoolDialogService>();
+                    services.AddSingleton<ISettingsService, SettingsService>();
+                    services.AddSingleton<ISettingsDialogService, SettingsDialogService>();
+                    services.AddSingleton<IRegisterDialogService, RegisterDialogService>();
+                    // The desktop's only direct-HTTP entry point (vendor catalog +
+                    // release feed): one allowlist, one proxy decision, one log line.
+                    services.AddSingleton<IDesktopEgress, DesktopEgress>();
+                    // Factory, not AddSingleton<IUpdateChecker, GitHubReleaseUpdateChecker>():
+                    // the concrete type takes optional feed/throttle parameters that
+                    // the container would have to leave to defaults, and spelling the
+                    // wiring out keeps the one default that matters (the GitHub feed)
+                    // visible at the composition root.
+                    services.AddSingleton<IUpdateChecker>(provider =>
+                        new GitHubReleaseUpdateChecker(
+                            provider.GetRequiredService<IApplicationPaths>(),
+                            egress: provider.GetRequiredService<IDesktopEgress>()));
+                    // Shell chrome that outlives the window: the tray icon and the
+                    // global hotkey are singletons because both hold an OS handle.
+                    services.AddSingleton<IWorkspaceBackupService, WorkspaceBackupService>();
+                    services.AddSingleton<ITrayIconService, TrayIconService>();
+                    services.AddSingleton<IGlobalHotkeyService, GlobalHotkeyService>();
+                    services.AddSingleton<MainWindow>();
+                })
+                .Build();
+        }
+
+        /// <summary>
+        /// The panel log (<c>MainWindow.UiLog</c>) writes at <c>Debug</c> while
+        /// the file sink's floor is <c>Information</c>, so panel content never
+        /// reached <c>runtime/app_*.log</c> -- and there was no environment
+        /// override, which left offline replay as the only way to read it.
+        /// </summary>
+        /// <remarks>
+        /// <c>SMSWORKBENCH_LOG_LEVEL</c> lowers (or raises) that floor.  Any
+        /// <see cref="LogEventLevel"/> name is accepted
+        /// (<c>Verbose</c>/<c>Debug</c>/<c>Information</c>/<c>Warning</c>/
+        /// <c>Error</c>/<c>Fatal</c>); <c>Debug</c> is what persists the panel.
+        /// Unset, blank or unparsable keeps the previous <c>Information</c>
+        /// behaviour, so the default is unchanged.
+        /// </remarks>
+        public static LogEventLevel ResolveMinimumLevel()
+        {
+            var raw = Environment.GetEnvironmentVariable("SMSWORKBENCH_LOG_LEVEL");
+            if (string.IsNullOrWhiteSpace(raw))
+                return LogEventLevel.Information;
+            return Enum.TryParse<LogEventLevel>(raw.Trim(), ignoreCase: true, out var level)
+                ? level
+                : LogEventLevel.Information;
+        }
+    }
+}

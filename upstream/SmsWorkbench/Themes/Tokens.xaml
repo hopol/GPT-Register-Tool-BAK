@@ -1,0 +1,122 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=System.Runtime">
+  <!--
+    Theme-independent tokens: spacing, corner radius, type ramp.
+
+    Nothing here carries a colour, so this dictionary is merged ONCE and is never
+    swapped when the theme changes. Colour tokens live in Colors.Light.xaml /
+    Colors.Dark.xaml (same key set) and are swapped as a unit.
+
+    Merge order is fixed by App.xaml: Wpf.Ui -> Tokens -> Colors.* -> Controls.
+    A StaticResource into this file therefore resolves before any control style
+    is built; reordering App.xaml would make the first parse fail loudly rather
+    than silently fall back, which is the failure mode we want.
+
+    One condition for the type ramp: WPF has no Dynamic Type, so a token is a
+    size, not a size+leading pair. Line height is left to layout (TextBlock
+    measures from FontSize); the numbers below are the sizes only.
+  -->
+
+  <!-- ═══ Corner radius ═══════════════════════════════════════════════════
+       Picked by the control's SHORTEST side, never per call site:
+       Xs=4   inset marks, badges
+       Sm=6   chips, small square buttons
+       Md=8   inputs, buttons, menus
+       Lg=10  sidebar rows, toolbars
+       Xl=12  cards, panels, console
+       Full   pills (pagers, status dots)
+       Derived radii are computed (outer = inner + inset), never added here. -->
+  <sys:Double x:Key="Radius.Xs">4</sys:Double>
+  <sys:Double x:Key="Radius.Sm">6</sys:Double>
+  <sys:Double x:Key="Radius.Md">8</sys:Double>
+  <sys:Double x:Key="Radius.Lg">10</sys:Double>
+  <sys:Double x:Key="Radius.Xl">12</sys:Double>
+  <sys:Double x:Key="Radius.Full">999</sys:Double>
+
+  <CornerRadius x:Key="Corner.Xs">4</CornerRadius>
+  <CornerRadius x:Key="Corner.Sm">6</CornerRadius>
+  <CornerRadius x:Key="Corner.Md">8</CornerRadius>
+  <CornerRadius x:Key="Corner.Lg">10</CornerRadius>
+  <CornerRadius x:Key="Corner.Xl">12</CornerRadius>
+  <!-- Capsule radius, but only for shapes whose short side is at least
+       ``2 * radius``. WPF does not clamp a corner radius the way CSS does: when it
+       exceeds half the short side the corner arcs overlap and the rectangle is
+       drawn as a lens (thin at both ends, thick in the middle). Every rounded bar
+       thinner than 8px therefore uses ``Corner.Hairline``. -->
+  <CornerRadius x:Key="Corner.Full">999</CornerRadius>
+  <!-- Half of a 3px mark (selection bars, splitter grip): the largest radius that
+       still draws a rectangle with rounded ends instead of a lens. -->
+  <CornerRadius x:Key="Corner.Hairline">1.5</CornerRadius>
+  <!-- Field wells inside a rounded card keep the card's curve minus the inset. -->
+  <CornerRadius x:Key="Corner.Inset">6</CornerRadius>
+  <!-- Top-only variant for a dialog's title strip. The strip is flush with the
+       window card (inset 0), so its radius must equal the card's Xl. It used to be a
+       literal `10,10,0,0` under a `Corner.Xl` card, which left a 2px card-coloured
+       sliver in each top corner. Outer radius = inner radius + inset, so the token
+       is derived from Xl rather than being a new step on the scale. -->
+  <CornerRadius x:Key="Corner.TopXl">12,12,0,0</CornerRadius>
+
+  <!-- ═══ Spacing (4px grid) ══════════════════════════════════════════════ -->
+  <sys:Double x:Key="Space.1">4</sys:Double>
+  <sys:Double x:Key="Space.2">8</sys:Double>
+  <sys:Double x:Key="Space.3">12</sys:Double>
+  <sys:Double x:Key="Space.4">16</sys:Double>
+  <sys:Double x:Key="Space.5">24</sys:Double>
+  <sys:Double x:Key="Space.6">32</sys:Double>
+
+  <Thickness x:Key="Space.All1">4</Thickness>
+  <Thickness x:Key="Space.All2">8</Thickness>
+  <Thickness x:Key="Space.All3">12</Thickness>
+  <Thickness x:Key="Space.All4">16</Thickness>
+  <Thickness x:Key="Space.Right2">0,0,8,0</Thickness>
+  <Thickness x:Key="Space.Left2">8,0,0,0</Thickness>
+  <Thickness x:Key="Space.Bottom1">0,0,0,4</Thickness>
+  <Thickness x:Key="Space.Bottom2">0,0,0,8</Thickness>
+  <Thickness x:Key="Space.Bottom3">0,0,0,12</Thickness>
+  <Thickness x:Key="Space.Row2">0,0,0,8</Thickness>
+
+  <!-- ═══ Scrollbar / splitter ═══════════════════════════════════════════
+       These numbers used to be literals inside the ControlTemplates, which is why
+       the scrollbars were the last place a size could only be changed by editing a
+       template (docs/current/ui-architecture.md §7). 12/6 gives an 8px pill inside
+       a 12px track, and the thumb thickens to 10px on hover so the control reacts
+       without spending a colour. -->
+  <sys:Double x:Key="Size.ScrollBar.Track">12</sys:Double>
+  <sys:Double x:Key="Size.ScrollBar.Thumb">6</sys:Double>
+  <sys:Double x:Key="Size.ScrollBar.ThumbMinLength">18</sys:Double>
+  <sys:Double x:Key="Size.Splitter.GripLength">32</sys:Double>
+  <sys:Double x:Key="Size.Splitter.GripThickness">3</sys:Double>
+
+  <!-- ═══ Type ramp ═══════════════════════════════════════════════════════
+       Display 28 / Title 20 / Subtitle 15 / Data 14 / Body 13 / Caption 11.
+       Views must not write a bare FontSize; a new size means a new token (and a
+       reason), not a literal at the call site.
+
+       Data is the one step added after the first sweep: the account grid is a
+       dense read-across table, and at the 1220px minimum window width Body (13)
+       read small in every column while Subtitle (15) would have cost rows. 14 is
+       the size the grid renders at; the context menu that acts on those rows uses
+       it too, so a row and its menu agree. -->
+  <sys:Double x:Key="Type.Display.Size">28</sys:Double>
+  <sys:Double x:Key="Type.Title.Size">20</sys:Double>
+  <sys:Double x:Key="Type.Subtitle.Size">15</sys:Double>
+  <sys:Double x:Key="Type.Data.Size">14</sys:Double>
+  <sys:Double x:Key="Type.Body.Size">13</sys:Double>
+  <sys:Double x:Key="Type.Caption.Size">11</sys:Double>
+
+  <!-- ═══ Fonts ═══════════════════════════════════════════════════════════
+       Monospace for logs and pasted proxy lists. The CJK fallback is load-bearing:
+       Consolas has no Chinese glyphs, so every log line WPF drew in it fell back
+       per-character to another family and mixed two sets of metrics mid-line.
+       Cascadia Mono is present on Windows 11/10 21H2+; Consolas and YaHei UI cover
+       the rest. -->
+  <FontFamily x:Key="Font.Mono">Cascadia Mono, Consolas, Microsoft YaHei UI</FontFamily>
+
+  <!-- ═══ Motion ══════════════════════════════════════════════════════════
+       WPF has no implicit transitions: a Setter trigger is instantaneous. These
+       durations are for the explicit Storyboards (sidebar collapse) and document
+       the intended feel for anything added later. -->
+  <Duration x:Key="Motion.Fast">0:0:0.12</Duration>
+  <Duration x:Key="Motion.Normal">0:0:0.18</Duration>
+</ResourceDictionary>

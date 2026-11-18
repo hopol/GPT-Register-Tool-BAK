@@ -1,0 +1,203 @@
+# Documentation Index
+
+This directory contains source-owned project documentation. Runtime files, local
+configuration, generated sessions, and debug output stay outside this directory.
+
+Directory layout (since 2026-09-06):
+
+- `docs/*.md` — living documents only (architecture, directory map, CONTEXT,
+  current feature guides). Dated snapshots are archived.
+- `docs/releases/` — one release note per published tag；**格式规范见
+  [`releases/README.md`](releases/README.md)**（只列新增功能与修复问题，覆盖上一版以来的
+  全部提交）。历史说明不回写。
+- `docs/audits/` — historical audit rounds, scans, and assessments, grouped into
+  `rounds/`, `scans/`, `plans/`, `landings/` and `records/` (index in
+  `docs/audits/README.md`; every plan opens with a status line).
+- `docs/adr/` — accepted architecture decisions.
+- `docs/specs/` — 边界 spec 图：一个文件一个边界，frontmatter 声明 `id` / `type` /
+  `status` / `owner` / `implements`（引用 `rule-NN`）/ `depends-on`（引用 `adr-NNNN`
+  或另一个 spec），`scripts/spec_validate.py` 解析并校验悬空引用与环。
+- `docs/current/` — current-state entry points.
+
+## Core documents
+
+- [Architecture and Boundaries](architecture.md) - module ownership, command
+  seams, state flow, Checkout/capability and wallet contracts, PayPal return
+  reconciliation, Agent Identity/SUB2API boundaries, and forbidden cross-module
+  dependencies.
+- [Directory Map](directory-map.md) - physical repository classification and
+  where new code should be placed.
+- [Boundary Rules](rules/) - one file per numbered rule (`rule-NN-*.md`): the
+  forbidden dependency, the check that proves it, and its source section. The
+  numbering is referenced from tests and scripts, so it is append-only.
+- [Boundary Specs](specs/) - one file per boundary (`spec-NN-*.md`), with
+  frontmatter that resolves to the rule it implements and the ADR that shaped
+  it. `scripts/spec_validate.py` fails on a dangling reference or a cycle.
+- [Project Context](CONTEXT.md) - 领域术语与模块归属规则。
+- [Architecture Decisions](adr/README.md) - 已接受的架构决策。
+- [Registration Recovery & Cancellation](current/registration-recovery.md) -
+  注册恢复、邮箱验证卡死重试与协作取消的当前行为。
+- [Desktop UI Architecture](current/ui-architecture.md) - WPF 桌面端的层次与所有权、资源字典拆分（`Tokens` / `Glyphs` / `Colors.Light|Dark` / `Controls`）、`MainWindow` 分部类职责、命令→后端结果路径与 UI 门禁。
+- [Protocol Registration](current/protocol-registration.md) - 协议注册的端点、
+  两条泳道、Sentinel 与落地页词汇契约。
+- [Registration & Proxy Architecture](current/registration-and-proxy-architecture.md) -
+  注册与代理链路的设计与风险控制说明。
+- [Mailbox Architecture](current/mailbox.md) - provider 能力解析、配置与
+  OTP 轮询错误契约。
+- [One-click SMS](current/one-click-sms.md) - 供应商协议族、租号与失败结果持久化。
+- [PayPal Zero-Due Link](current/paypal-zero-due-link.md) - promotion-update stage
+  protocol, config keys, and region matrix search.
+- [Protocol Payment Architecture](current/protocol-payment-enhancement.md) - 协议支付提链的现行路由/执行/归一契约
+  提取器与终端报告契约。
+- [Troubleshooting](TROUBLESHOOTING.md) - 故障 → 编号检查清单（先跑
+  `python -m sms_tool --doctor`）。每条清单按顺序可执行，并指向负责该行为的
+  `file.py:line`。排错时**先读这个**，再去读契约文档。
+- [Type Checking](current/typing.md) - pyright 逐文件 ratchet：为什么是 ratchet、
+  如何安装与运行、修一条类型错误的首选写法。
+- [C# Gates](current/dotnet-gates.md) - C# 构建告警门禁：零基线、为什么解析控制台
+  而不是编译器 SARIF、`--update-baseline` 的使用条件与修复一条告警的写法。
+- [Testing](current/testing.md) - 测试执行：并行分片（`-n 4 --dist loadfile`）
+  的实测收益、为什么 `tests/registration` + `tests/workbench` 仍是独立串行进程。
+- [Randomness](current/randomness.md) - `random` vs `secrets` 的判据、已复核调用点与
+  新增敏感标识时的约定。
+
+## Release notes（docs/releases/，一个发布标签一份，不回写）
+
+- [v2026.11.12 发布说明](releases/release-v2026.11.12.md) - requirements token 与真实
+  `sdk.js` 逐槽对齐（随机环境探针、平台门控、页面时钟、Safari 编码），
+  以及一次 10 账号线上验证（10/10 成功、AT 200、2FA、查优惠）。
+- [v2026.11.11 发布说明](releases/release-v2026.11.11.md) - 自 v2026.11.02 以来的收口：
+  协议注册每账号一套 TLS 指纹、指纹档位随平台走、Sentinel 离线自检，账号恢复链的三个
+  假成功，以及 ReMail 取件降速与批量下单不重试。
+- [v2026.11.02 发布说明](releases/release-v2026.11.02.md) - 自 v2026.10.28 以来的收口：
+  修掉「声明了 mailbox lane 就开不了窗」与「更新检查被限流后永久刷屏」两个阻断缺陷、
+  客户端指纹对齐 10-31 HAR、两个注册 A/B 开关，以及一次凭据暴露面清理。
+- [v2026.10.28 发布说明](releases/release-v2026.10.28.md) - 上一轮扫描的 P0–P3 落地：
+  账号详情页「身份」分组、lane 隔离可见可声明、结构性描边清零、设计令牌覆盖代码构建的 UI、
+  `max_retries` 死参数与首轮健康探针缺失的修复。
+- [v2026.10.27 发布说明](releases/release-v2026.10.27.md) - 自 v2026.10.24 以来的收口：
+  三模块（协议注册 / 代理池与指纹库 / 支付资格检测）专项扫描与落地、支付资格按契约复用 Checkout、
+  出口轮换与脱敏修复，以及品牌 Logo 更换。
+- [v2026.10.24 发布说明](releases/release-v2026.10.24.md) - 自 v2026.10.23 以来的收口：
+  桌面端中英双语与主窗口控件化、注册阶段体拆分，以及英文界面残留中文、语言切换卡死与失败分类双向漂移的修复。
+- [v2026.10.23 发布说明](releases/release-v2026.10.23.md) - 自 v2026.10.19 以来的收口：
+  按 Chrome 155 HAR 更新客户端指纹与认证头、支付批量单行故障隔离、提取器超时预算与启动成本收紧。
+- [v2026.10.19 发布说明](releases/release-v2026.10.19.md) - 自 v2026.10.15 以来的收口：
+  安装包内置 CPython、桌面账号列表增量刷新与 CLI/doctor 提速、进程级缓存上界、浏览器池内存上限，以及可选 Sentinel worker。
+- [v2026.10.15 发布说明](releases/release-v2026.10.15.md) - 自 v2026.10.12 以来的收口：
+  配置与凭据自动迁出仓库根目录、ReMail 批量取号幂等键跨批次碰撞修复、支付提取器 94 处 URL 单源化与
+  Kakao 代理池优先级修复、`mail-otp-web` 鉴权门禁，以及 WPF MVVM 拆分与 69 个 C# 警告清零。
+- [v2026.10.12 发布说明](releases/release-v2026.10.12.md) - 自 v2026.10.08 以来的收口：
+  协议注册默认栈换为实测可存活的新 Sentinel SDK + SO、401 重登两个失败原因（探针误拒 passwordless
+  账号、`account_deactivated` 被吞）的修复，以及 AT 存活调查的审计记录。
+- [v2026.10.08 发布说明](releases/release-v2026.10.08.md) - 自 v2026.09.23 以来的收口：
+  协议注册硬化与 signin 形状实验系列、支付提取器的 Sentinel 门禁与 `protocol_payment.v1`
+  结果契约、代理/指纹单一权威接线，以及把大文件拆成有边界模块的结构性重构。
+- [v2026.09.23 发布说明](releases/release-v2026.09.23.md) - 自 v2026.09.14 以来的收口：
+  第二接码协议族 NexSMS、带 TTL 的环境账本、供应商中立化、一键接码接通在线目录及一批缺陷修复。
+- [v2026.09.14 发布说明](releases/release-v2026.09.14.md) - 协议注册日志四个输出
+  缺陷收口（假成功信号、机器通道静默停写、失败分类失真、人读通道无法归因），
+  外加 HTTP 重试覆盖补齐、代理池支持 HTTP 上游、文档指针漂移的检测与修复两半。
+- [v2026.09.13 发布说明](releases/release-v2026.09.13.md) - 深度扫描延后项收口：
+  双 god file 拆解与失败词汇单一注册表、geo 表合一（US=New York）、
+  protocol_core 改读 policy、WPF 邮箱解析迁 Contracts、构建双胞胎合并。
+- [v2026.09.12 发布说明](releases/release-v2026.09.12.md) - 深度扫描第一批收口：
+  优惠状态跨语言机器契约、失败结果入约与终态判定唯一 owner、测活去双探与队列
+  浏览器槽修复、代理池静默默认值清零、BA-token 与 campaign 常量单源、Rule 6
+  关闭与 Rule 14 决策落档。
+- [v2026.09.11 发布说明](releases/release-v2026.09.11.md) - 注册代理出口切换至
+  越南（VN）、9http `geo-XX` 供应商模板与两侧地理档案补齐、PayPal 链接生成的
+  代理地区重写收敛到单一范式。
+- [v2026.09.10 发布说明](releases/release-v2026.09.10.md) - 协议注册依赖修复、
+  内部异常分类、持久化 journal 终态和 WPF 发布验证。
+- [v2026.09.08 发布说明](releases/release-v2026.09.08.md) - 桌面注册结果契约、
+  阶段计时与关联修复、浏览器 admission 前置、测活队列租约，以及日志脱敏和轮转。
+- [v2026.09.06.3 发布说明](releases/release-v2026.09.06.3.md) - 注册链路加固
+  （ADR-0009）、create_account 判定放宽、探针假阴性修复、register_method 落库
+  断链修复、失败诊断持久化。
+- [v2026.09.06.2 发布说明](releases/release-v2026.09.06.2.md) - 协作取消接通、
+  browser_flow patch 失效面根除、注册结果契约统一、可观测性修复与文档对账。
+- [v2026.09.06.1 发布说明](releases/release-v2026.09.06.1.md) - 修复 GitHub
+  Actions Windows 工作目录、路径和配置检测测试兼容性。
+- [v2026.09.06 发布说明](releases/release-v2026.09.06.md) - 测活异步并发、部分
+  结果快照、邮箱池恢复闸门和 WPF 超时恢复。
+- [v2026.09.01 发布说明](releases/release-v2026.09.01.md) - 安全重建版本、发布
+  闸门和凭据扫描。
+- [v2026.08.20 发布说明](releases/release-v2026.08.20.md) - PayPal 标准
+  Checkout 顺序、blocked 重建、能力预检、显式断点恢复、持久事件和代理诊断。
+- [v2026.08.19 发布说明](releases/release-v2026.08.19.md) - 注册认证状态修复、
+  429 冷却、代理格式兼容和桌面发布验证。
+- [v2026.08.18 发布说明](releases/release-v2026.08.18.md) - 常驻 desktop-serve
+  JSONL 后端、代理预检并行化、支付批次 checkpoint 节流与跨进程注册闸门。
+- [v2026.08.09 发布说明](releases/release-v2026.08.09.md) - 注册 P0/P1 一致性
+  与恢复、ReMail 本地化 OTP、配置/敏感数据边界、桌面任务生命周期和支付适配器整理。
+- [v2026.08.06 Release Notes](releases/release-v2026.08.06.md) - protocol
+  registration decoupling (session_builder / registration_outcome / account_2fa),
+  P0 TOTP 2FA auto-enrollment, P1 device_id persistence, P2 think_time jitter.
+- [v2026.08.04 Release Notes](releases/release-v2026.08.04.md) - payment command
+  modularization, shared Checkout and wallet contracts, result semantics, and
+  repository hygiene.
+- [v2026.08.02 Release Notes](releases/release-v2026.08.02.md) - GoPay removal,
+  focused account health modules, registration concurrency ownership, and
+  desktop payment-method catalog cleanup.
+- [v2026.08.01.2 Release Notes](releases/release-v2026.08.01.2.md) -
+  account-pool cleanup, retired module removal, and inbox plain-text rendering.
+- [v2026.07.29.1 发布说明](releases/release-v2026.07.29.1.md) - 桌面菜单对齐、
+  代理路由拆分与有序动态代理回退。
+- 其余历史发布说明（v2026.07.29 – v2026.08.31 未列出的标签）在
+  [docs/releases/](releases/) 目录内，按文件名即版本排序，恕不逐一索引。
+
+## Historical audits（docs/audits/，只读证据快照）
+
+- [Historical Audits](audits/README.md) - 审计/扫描/评估快照的存放规则与解读方式。
+- [Current Documentation](current/README.md) - canonical current-state entry
+  points.
+- [Test Layout](../tests/README.md) - 测试归属与离线测试策略。
+- 中文优先说明见根目录 [README](../README.md)。
+
+## Root-level references
+
+- [README](../README.md) - quick start, common commands, mailbox formats, and
+  operator workflow.
+- [Proxy Guide](../PROXY_GUIDE.md) - local proxy setup and safe verification.
+
+## Documentation rules
+
+- Document the owner module before adding a new feature surface.
+- Keep local paths, mailbox credentials, refresh tokens, cookies, and payment
+  artifacts out of docs.
+- Prefer repository-relative paths in examples.
+- If a module starts calling another module's private helper, update the
+  boundary document or add a public seam first.
+- Keep one immutable release-note file per published tag, placed in
+  `docs/releases/`. Update this index and the root READMEs to point at the
+  newest release; do not rewrite historical release notes to describe current
+  behavior. Older notes may be left unindexed in `docs/releases/`.
+- GitHub Release 标题和正文统一使用中文；代码符号、命令、文件名和协议错误码保留原文。
+  本索引条目亦统一使用中文。
+- Generated test output, IDE metadata, local agent memory, installer payloads,
+  and published binaries do not belong in documentation or source commits.
+- 落码位置（2026-09-06 起）：
+  - 浏览器注册流程改动落在 `sms_tool/registration_drivers/browser_flow/` 分层包
+    （dom_fields → page_state → form_steps → flow_steps → orchestrator + session），
+    驱动接入在 `sms_tool/registration_drivers/`（`base.py` 注册表 +
+    `external_sessions/` 子包）；`playwright.py` 只是公共 API 薄壳。
+  - 协议（HTTP 直连）注册流程改动落在 `sms_tool/registration/handlers.py`、
+    `sms_tool/registration/state.py`、`sms_tool/otp_strategy.py`、
+    `sms_tool/account_creation.py`、`sms_tool/auth_flow/`（自 2026-09 起
+    是包，不是 `auth_flow.py`）、`sms_tool/auth_headers.py` 等 focused modules；
+    `sms_tool/registration/orchestrator.py` 是入口模块（不是包）：负责运行配置解析、
+    驱动选择、`run_email` / `run_batch` 分派，以及按调用绑定
+    `RegistrationOperations`；阶段顺序与阶段实现分别在
+    `registration/handlers.py` 与同目录的 stage 模块。
+  - 注册批次、并发与取消落在 `batch_runner.py`、`registration/pulse.py`、
+    `registration/concurrency.py`、`registration/cancel.py`；结果装配统一走
+    `registration.result.build_registration_result`。
+  - 邮箱逻辑仍在 `mailbox/router.py`、`providers/`、`mailbox/service.py` 等模块；
+    `k12_*`、`agent_identity.py`、`sub2api_import.py` 保持原有归属。
+- 新增 Agent Identity、SUB2API、导入导出逻辑时，在 `agent_identity.py`、
+  `sub2api_import.py`、`session_converter.py` 中落实现，不侵入注册或支付模块。
+
+当前专题：[注册架构](current/registration-architecture.md)、
+[协议注册契约](current/protocol-registration.md)、
+[配置分片](current/configuration.md)、[日志与运行数据](current/telemetry-and-runtime.md)。

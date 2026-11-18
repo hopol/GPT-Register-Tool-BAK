@@ -1,0 +1,245 @@
+"""流程步骤：浏览器会话作用域（进程池）、OTP 轮询、邮箱 OTP 流程重启。依赖 dom_fields/page_state/form_steps。"""
+
+from __future__ import annotations
+
+import threading
+import time
+import atexit
+import hashlib
+import json
+
+from . import dom_fields, form_steps, page_state
+
+from ...mailbox.service import MailboxService
+from ...kernel.error_classification import is_terminal_registration_error
+from ..base import BrowserRegistrationError
+from collections.abc import Mapping
+from contextlib import contextmanager
+from typing import Any
+
+
+def _browser_pool_config_identity(config: Mapping[str, Any] | None) -> str:
+    """Return a credential-safe identity for process-shaping configuration."""
+    try:
+        payload = json.dumps(
+            dict(config or {}),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    except Exception:
+        payload = repr(type(config)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _poll_browser_otp(
+    mailbox_service: MailboxService,
+    mailbox: Any,
+    *,
+    browser: Any,
+    page: Any,
+    driver_name: str,
+    subject_keyword: str,
+    timeout: int,
+    issued_after_unix: int,
+    proxy: str | None,
+    excluded_otps: set[str],
+) -> str | None:
+    # Heartbeat-aware polling applies to every driver, not just the retired
+    # cloud ones: a crashed or recycled page is caught between OTP windows
+    # instead of silently burning the whole timeout.  ``driver_name`` stays in
+    # the signature so callers and tests keep a stable seam.
+    deadline = time.monotonic() + max(1, int(timeout or 1))
+    while time.monotonic() < deadline:
+        from ...registration.cancel import registration_cancel_requested
+
+        if registration_cancel_requested():
+            raise BrowserRegistrationError("registration_cancelled")
+        remaining = max(1, int(deadline - time.monotonic()))
+        page = dom_fields._browser_heartbeat(browser, page)
+        try:
+            otp = mailbox_service.poll_otp(
+                mailbox,
+                subject_keyword=subject_keyword,
+                timeout=min(20, remaining),
+                issued_after_unix=issued_after_unix,
+                proxy=proxy,
+                excluded_otps=excluded_otps,
+            )
+        except Exception as exc:
+            if is_terminal_registration_error(exc):
+                raise
+            otp = None
+        if otp:
+            return otp
+        page = dom_fields._browser_heartbeat(browser, page)
+    return None
+
+
+def _restart_email_otp_flow(
+    browser: Any,
+    page: Any,
+    *,
+    start_url: str,
+    email: str,
+    password: str,
+    timeout_seconds: int,
+    config: Mapping[str, Any] | None = None,
+) -> tuple[Any, str]:
+    """Rebuild the email step when a remote OTP target enters an error page."""
+    select_page = getattr(browser, "select_live_page", None)
+    if callable(select_page):
+        page = select_page() or page
+    try:
+        page.goto(start_url, wait_until="domcontentloaded", timeout=max(5_000, int(timeout_seconds) * 1_000))
+    except Exception:
+        if callable(select_page):
+            page = select_page() or page
+            page.goto(start_url, wait_until="domcontentloaded", timeout=max(5_000, int(timeout_seconds) * 1_000))
+        else:
+            raise
+    form_steps._maybe_accept_cookies(page)
+    if page_state._manual_challenge(page):
+        if not page_state._wait_for_challenge_clear(page, max_wait_seconds=30):
+            raise BrowserRegistrationError("manual_challenge_required")
+    form_steps._fill_email(page, email, config=config)
+    state = page_state._wait_for_registration_state(page, min(timeout_seconds, 30), browser=browser, config=config)
+    if state in {"challenge", "identity_provider"}:
+        if state == "challenge" and page_state._wait_for_challenge_clear(page, max_wait_seconds=30):
+            state = page_state._wait_for_registration_state(
+                page, min(timeout_seconds, 30), browser=browser, config=config
+            )
+        if state in {"challenge", "identity_provider"}:
+            raise BrowserRegistrationError(
+                "manual_challenge_required" if state == "challenge" else "browser_unexpected_identity_provider"
+            )
+    if state == "login_password":
+        raise BrowserRegistrationError("browser_existing_account")
+    if state == "password":
+        form_steps._fill_password_if_present(page, password, config=config)
+        state = page_state._wait_for_registration_state(page, min(timeout_seconds, 30), browser=browser, config=config)
+    if state == "challenge":
+        if not page_state._wait_for_challenge_clear(page, max_wait_seconds=30):
+            raise BrowserRegistrationError("manual_challenge_required")
+    if state == "identity_provider":
+        raise BrowserRegistrationError("browser_unexpected_identity_provider")
+    if state == "login_password":
+        raise BrowserRegistrationError("browser_existing_account")
+    if state not in {"otp", "authenticated"}:
+        raise BrowserRegistrationError("browser_otp_restart_state_unknown")
+    return page, state
+
+
+_BROWSER_POOL_LOCK = threading.Lock()
+
+
+_BROWSER_POOL: Any = None
+
+
+_BROWSER_POOL_KEY: tuple[Any, ...] | None = None
+
+
+def close_browser_process_pool() -> None:
+    """Close the process-wide browser pool and discard its cache."""
+    global _BROWSER_POOL, _BROWSER_POOL_KEY
+    with _BROWSER_POOL_LOCK:
+        pool = _BROWSER_POOL
+        _BROWSER_POOL = None
+        _BROWSER_POOL_KEY = None
+    if pool is not None:
+        try:
+            pool.close()
+        except Exception:
+            pass
+
+
+atexit.register(close_browser_process_pool)
+
+
+@contextmanager
+def _browser_session_scope(
+    *,
+    driver_name: str,
+    config: Mapping[str, Any],
+    proxy: str | None,
+    headless: bool,
+    timeout_ms: int,
+    locale: str,
+    timezone_id: str,
+    browser_identity: Mapping[str, Any] | None,
+    viewport: tuple[int, int] | None,
+    session_factory,
+):
+    """Yield a connected browser session, routed through the process pool when enabled.
+
+    Two paths:
+
+    * pool disabled (default) -- the session factory is called directly and
+      lives exactly as long as the ``with`` block, which is the historical
+      behaviour.
+    * pool enabled (``registration.browser_process_pool.enabled``) -- slots
+      come from a process-wide pool that bounds concurrency and recycles
+      degraded browsers.  Per-account values (proxy, locale, timezone,
+      identity, viewport) are still passed per session; only the expensive
+      browser process is shared.
+    """
+    from ...browser_pool import BrowserProcessPool, PoolConfig
+
+    pool_config = PoolConfig.from_config(config)
+    if not pool_config.enabled:
+        close_browser_process_pool()
+        session = session_factory(
+            driver_name,
+            config=config,
+            proxy=proxy,
+            headless=headless,
+            timeout_ms=timeout_ms,
+            locale=locale,
+            timezone_id=timezone_id,
+            browser_identity=browser_identity,
+            viewport=viewport,
+        )
+        with session as browser:
+            yield browser
+        return
+
+    global _BROWSER_POOL, _BROWSER_POOL_KEY
+    # The pool owns the browser processes, so it is keyed only by the knobs
+    # that shape a process.  Everything per-account is supplied per session.
+    key = (
+        driver_name,
+        headless,
+        timeout_ms,
+        _browser_pool_config_identity(config),
+        pool_config.max_concurrent,
+        pool_config.max_uses_per_process,
+        pool_config.recycle_on_error,
+        id(session_factory),
+    )
+    with _BROWSER_POOL_LOCK:
+        if _BROWSER_POOL is None or _BROWSER_POOL_KEY != key:
+            old_pool = _BROWSER_POOL
+            _BROWSER_POOL = BrowserProcessPool(
+                config,
+                driver=driver_name,
+                headless=headless,
+                timeout_ms=timeout_ms,
+                locale=locale,
+                timezone_id=timezone_id,
+                session_factory=session_factory,
+            )
+            _BROWSER_POOL_KEY = key
+            if old_pool is not None:
+                try:
+                    old_pool.close()
+                except Exception:
+                    pass
+        pool = _BROWSER_POOL
+    with pool.session(
+        proxy=proxy,
+        locale=locale,
+        timezone_id=timezone_id,
+        browser_identity=browser_identity,
+        viewport=viewport,
+    ) as (browser, _slot):
+        yield browser

@@ -1,0 +1,455 @@
+// Opted into nullable reference checking file-by-file - see the note in
+// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
+#nullable enable
+
+using System.Diagnostics.CodeAnalysis;
+using SmsWorkbench.Localization;
+
+namespace SmsWorkbench
+{
+    public partial class MainWindow
+    {
+        private void RunUiTask(Func<Task> operation)
+            => _ = RunUiTaskAsync(operation);
+
+        // No cancellation token by design: callers schedule fire-and-forget UI work
+        // whose lifetime is the window itself, and a half-finished operation left
+        // dangling is worse than one that runs to completion. The window's
+        // lifetime token (_lifetimeCts) already stops the long-running backends
+        // the operation delegates to.
+        private async Task RunUiTaskAsync(Func<Task> operation)
+        {
+            try
+            {
+                await operation();
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                Log("界面异步操作失败：" + SensitiveDataSanitizer.Redact(ex.Message));
+                NotifyWarning(Loc.T("操作未完成，请查看运行日志。"));
+            }
+        }
+
+        // Path/config helpers, status formatting, external open/copy/log helpers.
+        //
+        // CLI argument construction lives in BackendCommandPlanner (window-independent,
+        // unit-testable). Backend JSON business interpretation lives in
+        // BackendResultInterpreter (window-independent, unit-testable).
+        // Generic JSON plumbing lives in BackendJson.
+        //
+        // This file retains only the WPF-aware glue: settings resolution, proxy-pool
+        // assembly, and thin delegates. The partials in Register.cs, Tasks.cs,
+        // Payment.cs, and Export.cs have been migrated to call
+        // BackendCommandPlanner.CreateXxx(...) and BackendResultInterpreter.xxx(...)
+        // instead of building CLI arguments inline.
+        private void AddRegistrationProxy(List<string> args)
+        {
+            BackendCommandPlanner.AppendProxyPool(args, GetRegistrationProxyRoute());
+        }
+
+        /// <summary>
+        /// The registration route in planner shape: the configured pool when one
+        /// exists, otherwise the single configured proxy. This is the same list the
+        /// old inline <c>--proxy</c> + <c>--proxy-pool</c> pair produced, with the
+        /// flag literals now owned by the planner.
+        ///
+        /// <para>
+        /// Empty means "nothing configured here", and that is deliberately passed
+        /// through as an empty list: <c>--proxy</c> is then omitted entirely and the
+        /// backend resolves the route itself (<c>proxy.default</c>, the lane pools and
+        /// <c>registration_network_preflight</c>'s reason codes). Inventing a value on
+        /// the desktop side made this argument always explicit, which suppressed every
+        /// backend lane pool and pointed fresh installs at a localhost proxy that need
+        /// not exist.
+        /// </para>
+        /// </summary>
+        private List<string> GetRegistrationProxyRoute() => GetRegistrationProxyPool();
+
+        private void AddMailboxProxy(List<string> args)
+        {
+            BackendCommandPlanner.AppendProxy(args, GetMailboxProxy());
+        }
+
+        /// <summary>Configured registration proxy, or <c>""</c> when none is set.
+        /// Never substitutes a localhost default -- see <see cref="GetRegistrationProxyRoute"/>.</summary>
+        private string GetRegistrationProxy()
+        {
+            return FirstNonEmpty(
+                settingsService.GetString("proxy.registration"),
+                settingsService.GetString("registration_proxy"),
+                settingsService.GetString("proxy.default"));
+        }
+
+        private List<string> GetRegistrationProxyPool()
+        {
+            var values = new List<string>();
+            string primary = GetRegistrationProxy();
+            if (primary.Length > 0) values.Add(primary);
+            values.AddRange(settingsService.GetStringList("proxy.pool"));
+            return values
+                .Select(item => item.Trim())
+                .Where(item => item.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        /// <summary>Configured mailbox (inbox-read) proxy, or <c>""</c> when none is set.</summary>
+        private string GetMailboxProxy()
+        {
+            return FirstNonEmpty(
+                settingsService.GetString("mailbox_proxy"),
+                settingsService.GetString("email_registration.mailbox_proxy"),
+                settingsService.GetString("proxy.mailbox"));
+        }
+
+        /// <summary>
+        /// Access-token/session operations must preserve the registration proxy +
+        /// fingerprint identity. The backend rebinds each account's saved affinity;
+        /// this pool is only the legacy fallback for rows that predate
+        /// identity_context, so an empty result (no registration route configured)
+        /// stays empty and lets the backend choose.
+        /// </summary>
+        private List<string> GetLivenessProxyPool()
+        {
+            return GetRegistrationProxyPool();
+        }
+
+        private string GetConfiguredCfWorkerDomain()
+        {
+            string domain = settingsService.GetString("email_registration.cfworker_domain").Trim().TrimStart('@');
+            if (domain.Length > 0) return domain;
+            domain = settingsService.GetString("email_registration.cfworker.domain").Trim().TrimStart('@');
+            return domain.Length > 0 ? domain : "liziai.cloud";
+        }
+
+        private string GetConfiguredSmailrDomain()
+        {
+            string domain = settingsService.GetString("email_registration.smailr.default_domain").Trim().TrimStart('@');
+            if (domain.Length > 0) return domain;
+            domain = settingsService.GetString("email_registration.smailr.domain").Trim().TrimStart('@');
+            return domain.Length > 0 ? domain : "smailr.com";
+        }
+
+        private string NormalizePaymentMethod(string paymentMethod)
+            => PaymentMethods.Normalize(paymentMethod);
+
+        private void AddPaymentMethodItems(ComboBox box)
+        {
+            foreach (PaymentMethodOption method in PaymentMethods.RegistrationOptions)
+                box.Items.Add(new ComboBoxItem { Content = method.DisplayName, Tag = method.Id });
+        }
+
+        private string GetSessionsDir()
+        {
+            return Path.Combine(rootDir, "sessions");
+        }
+
+        private string GetDatabasePath()
+        {
+            string configured = settingsService.GetString("storage.sqlite_path");
+            if (configured.Length == 0) return Path.Combine(rootDir, "runtime", "accounts.sqlite3");
+            string expanded = Environment.ExpandEnvironmentVariables(configured);
+            return Path.IsPathRooted(expanded) ? expanded : Path.Combine(rootDir, expanded);
+        }
+
+        private string GetMailboxTokenFile()
+        {
+            string configured = settingsService.GetString("email_registration.token_file");
+            string expanded = configured.Length > 0 ? Environment.ExpandEnvironmentVariables(configured) : "mailbox_tokens.txt";
+            if (Path.IsPathRooted(expanded)) return expanded;
+            string inConfigDir = Path.Combine(configDir, expanded);
+            // A pool that predates the config directory stays usable until the
+            // startup migration has moved it.
+            string legacy = Path.Combine(rootDir, expanded);
+            return !File.Exists(inConfigDir) && File.Exists(legacy) ? legacy : inConfigDir;
+        }
+
+        // ── Thin delegates to the shared JSON plumbing (BackendJson) ─────
+        // Kept so the control-event partials stay readable without qualifying
+        // every lookup; all behavior is owned by BackendJson.
+
+        private string GetString(Dictionary<string, object> data, string key)
+            => BackendJson.GetString(data, key);
+
+        // Mirrors BackendJson.TryGetMap, including its [NotNullWhen(true)] out
+        // contract: declaring `map` non-nullable here would promise callers
+        // something the shared helper does not guarantee.
+        private bool TryGetMap(Dictionary<string, object>? data, string key, [NotNullWhen(true)] out Dictionary<string, object>? map)
+            => BackendJson.TryGetMap(data, key, out map);
+
+        private string NestedString(Dictionary<string, object> data, params string[] path)
+            => BackendJson.NestedString(data, path);
+
+        private Dictionary<string, object> JsonElementToDictionary(JsonElement element)
+            => BackendJson.ElementToDictionary(element);
+
+        private string FirstNonEmpty(params string[] values)
+            => BackendJson.FirstNonEmpty(values);
+
+        // Moved here from MainWindow.Register.cs when the registration partial lost
+        // its helpers: the inbox and pool partials are the only callers, so the
+        // "register" home was where it stopped being discoverable. Not deleted --
+        // an earlier cleanup pass mistook it for dead code because a grep was
+        // truncated by `head`.
+        private string JsonString(JsonElement obj, string property)
+        {
+            return obj.TryGetProperty(property, out JsonElement value) && value.ValueKind == JsonValueKind.String
+                ? value.GetString() ?? ""
+                : "";
+        }
+
+        private static bool ParseBoolean(string value)
+            => BackendJson.ParseBoolean(value);
+
+        private string OnlyDigits(string raw)
+        {
+            string digits = new string((raw ?? "").Where(char.IsDigit).ToArray());
+            return digits.Length == 0 ? "0" : digits;
+        }
+
+        private string Mask(string value)
+        {
+            value = (value ?? "").Trim();
+            return value.Length <= 12 ? value : value.Substring(0, 6) + "..." + value.Substring(value.Length - 4);
+        }
+
+        private string SafeTime(DateTime time) => time.ToString("yyyy-MM-dd HH:mm:ss");
+
+        private void OpenPath(string path)
+        {
+            try
+            {
+                if (File.Exists(path) || Directory.Exists(path))
+                {
+                    if (File.Exists(path) && ShouldOpenWithNotepad(path))
+                    {
+                        OpenWithNotepad(path);
+                        return;
+                    }
+                    // Through IFileLauncher so this stays testable and the
+                    // "does it exist yet" rule lives in exactly one place.
+                    fileLauncher.Open(path);
+                    return;
+                }
+                if (Path.GetExtension(path).Length > 0)
+                {
+                    string directory = Path.GetDirectoryName(Path.GetFullPath(path)) ?? rootDir;
+                    Directory.CreateDirectory(directory);
+                    string example = Path.Combine(rootDir, "config.example.json");
+                    if (Path.GetFileName(path).Equals("config.json", StringComparison.OrdinalIgnoreCase) && File.Exists(example))
+                    {
+                        File.Copy(example, path);
+                    }
+                    else if (!File.Exists(path))
+                    {
+                        File.WriteAllText(path, "", Encoding.UTF8);
+                    }
+                    OpenWithNotepad(path);
+                    return;
+                }
+                Directory.CreateDirectory(path);
+                fileLauncher.Open(path);
+            }
+            catch (Exception ex)
+            {
+                Log("打开失败：" + ex.Message);
+            }
+        }
+
+        private bool ShouldOpenWithNotepad(string path)
+        {
+            string extension = Path.GetExtension(path).ToLowerInvariant();
+            return extension == ".json" || extension == ".txt" || extension == ".log";
+        }
+
+        // Not IFileLauncher: this needs to name the executable (notepad.exe)
+        // and pass an argument, which IFileLauncher.Open(path) cannot express.
+        // Widening the interface just for this would drag MainWindow-specific
+        // choices into a general-purpose abstraction.
+        private void OpenWithNotepad(string path)
+        {
+            var psi = new ProcessStartInfo("notepad.exe")
+            {
+                UseShellExecute = false
+            };
+            psi.ArgumentList.Add(path);
+            _ = Process.Start(psi);
+        }
+
+        private void OpenUrl(string url)
+        {
+            try
+            {
+                if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) ||
+                    (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                {
+                    Log("无效链接：" + url);
+                    return;
+                }
+                _ = Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                Log("打开链接失败：" + ex.Message);
+            }
+        }
+
+        private void OpenPayPalUrl(string url, string accountEmail = "")
+            => RunUiTask(() => OpenPayPalUrlAsync(url, accountEmail, _lifetimeCts.Token));
+
+        private async Task OpenPayPalUrlAsync(string url, string accountEmail = "", CancellationToken ct = default)
+        {
+            url = await ResolveBackendPaymentUrlAsync(url, accountEmail, ct);
+            if (!IsHttpUrl(url))
+            {
+                Log("无效支付链接：" + url);
+                return;
+            }
+            string chrome = FindChromePath();
+            if (chrome.Length == 0)
+            {
+                Log("未找到 Chrome，使用系统默认浏览器打开支付链接。");
+                OpenUrl(url);
+                return;
+            }
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = chrome,
+                    UseShellExecute = false
+                };
+                psi.ArgumentList.Add("--new-window");
+                psi.ArgumentList.Add("--incognito");
+                psi.ArgumentList.Add(url);
+                _ = Process.Start(psi);
+                Log("已用 Chrome 无痕窗口打开支付链接。");
+            }
+            catch (Exception ex)
+            {
+                Log("Chrome 打开失败：" + ex.Message);
+                OpenUrl(url);
+            }
+        }
+
+        private void CopyPayPalUrl(string url, string accountEmail = "")
+            => RunUiTask(() => CopyPayPalUrlAsync(url, accountEmail, _lifetimeCts.Token));
+
+        private async Task CopyPayPalUrlAsync(string url, string accountEmail = "", CancellationToken ct = default)
+        {
+            url = await ResolveBackendPaymentUrlAsync(url, accountEmail, ct);
+            if (!IsHttpUrl(url))
+            {
+                Log("无效支付链接，无法复制。");
+                return;
+            }
+            try
+            {
+                Clipboard.SetText(url);
+                Log("支付链接已复制。");
+            }
+            catch (Exception ex)
+            {
+                Log("复制支付链接失败：" + ex.Message);
+            }
+        }
+
+        private async Task<string> ResolveBackendPaymentUrlAsync(string url, string accountEmail, CancellationToken ct = default)
+        {
+            if (!string.Equals(url, "backend://payment-url", StringComparison.OrdinalIgnoreCase)) return url;
+            try
+            {
+                return (await desktopRead.ReadPaymentUrlAsync("", accountEmail, ct)).Trim();
+            }
+            catch (Exception ex)
+            {
+                Log("读取支付链接 backend 失败：" + SensitiveDataSanitizer.Redact(ex.Message));
+                return "";
+            }
+        }
+
+        private string FindChromePath()
+        {
+            string[] candidates =
+            {
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Google", "Chrome", "Application", "chrome.exe"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Google", "Chrome", "Application", "chrome.exe"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Google", "Chrome", "Application", "chrome.exe")
+            };
+            return candidates.FirstOrDefault(File.Exists) ?? "";
+        }
+
+        private bool IsHttpUrl(string url)
+        {
+            return Uri.TryCreate(url, UriKind.Absolute, out Uri? uri)
+                && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
+        }
+
+        private void Log(string text)
+        {
+            LogPresanitized(SensitiveDataSanitizer.Redact(text));
+        }
+
+        /// <summary>
+        /// Appends an already-redacted line. Backend lines are redacted once in
+        /// the pump; re-redacting here (the old behaviour) doubled regex cost on
+        /// every output line.
+        /// </summary>
+        private void LogPresanitized(string safeText, bool debug = false)
+        {
+            string line = LogViewModel.FormatLine(DateTime.Now, safeText);
+            if (debug)
+                logger?.Debug("[backend] {Line}", safeText);
+            else
+                logger?.Information("{Message}", safeText);
+            // A4: the console control owns the TextBox append path. It returns
+            // false while the window is not realised, so the view-model-only
+            // fallback (used during startup and by the tests) stays intact.
+            if (consoleControl.TryAppendLogLine(line))
+                return;
+            LogPanel.Append(line);
+        }
+
+        private void UiLog(string text)
+        {
+            // Called from Progress<T> callbacks, which already post to the UI
+            // SyncContext; the extra Dispatcher.BeginInvoke was a second hop.
+            LogPresanitized(SensitiveDataSanitizer.Redact(text), debug: true);
+        }
+
+        private void NotifySuccess(string message)
+        {
+            snackbarService.Show("完成", message, Wpf.Ui.Controls.ControlAppearance.Success, null, TimeSpan.FromSeconds(4));
+        }
+
+        private void NotifyWarning(string message)
+        {
+            snackbarService.Show("注意", message, Wpf.Ui.Controls.ControlAppearance.Caution, null, TimeSpan.FromSeconds(5));
+        }
+
+        private void NotifyInfo(string message)
+        {
+            snackbarService.Show("提示", message, Wpf.Ui.Controls.ControlAppearance.Info, null, TimeSpan.FromSeconds(4));
+        }
+
+        private void ShowThemedInfoDialog(string title, string message)
+            => RunUiTask(() => DialogFactory.ShowInfoAsync(this, title, message));
+
+        // Settings dialog entry point.  Config reads go through ISettingsService
+        // (GetString/GetStringList) and writes through ISettingsService.UpdateConfig,
+        // which preserves unknown fields and replaces the file atomically.
+        private void ShowConfigDialog()
+        {
+            if (settingsDialogs.ShowDialog(this))
+                Log("配置已保存。");
+        }
+
+        private void OnPropertyChanged(string name)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+        }
+    }
+}

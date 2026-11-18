@@ -1,0 +1,926 @@
+namespace SmsWorkbench
+{
+    public enum BackendAccountResultKind
+    {
+        None,
+        Liveness,
+        Promotion,
+        PaymentQualification,
+        ProxyPool,
+    }
+
+    /// <summary>
+    /// A fully resolved backend invocation: task label, stable account-result kind, CLI arguments, optional
+    /// per-command environment values, any temporary files the planner created,
+    /// and an optional timeout override for the caller that executes the plan.
+    /// </summary>
+    public sealed record BackendCommandPlan(
+        string TaskName,
+        IReadOnlyList<string> Arguments,
+        IReadOnlyDictionary<string, string>? EnvironmentVariables = null,
+        IReadOnlyList<string>? TemporaryFiles = null,
+        int? TimeoutMilliseconds = null,
+        BackendAccountResultKind ResultKind = BackendAccountResultKind.None)
+    {
+        public IReadOnlyDictionary<string, string> Environment { get; } = EnvironmentVariables
+            ?? new Dictionary<string, string>();
+
+        public IReadOnlyList<string> TempFiles { get; } = TemporaryFiles ?? Array.Empty<string>();
+    }
+
+    /// <summary>
+    /// Window-independent planner for the desktop backend command families it
+    /// owns (registration, SMS, liveness, deletion, import, export, refresh,
+    /// inbox). Batch payment builds its own argument list in
+    /// `PaymentBatchService` because the request carries batch/checkpoint
+    /// state; this class deliberately does not duplicate it. Settings
+    /// resolution stays with the caller; this class only shapes already-resolved
+    /// values into command-line arguments.
+    /// <para>
+    /// Two surfaces live in this class and they are not the same thing: builders a
+    /// window actually calls, and builders that exist only to pin a CLI contract the
+    /// Python backend still honours (each marked "no production caller" below). The
+    /// second set is frozen by <c>BackendCommandPlannerSurfaceTests</c> so a builder
+    /// cannot quietly become dead code, and so deleting one is a reviewed change
+    /// rather than a silent loss of the only C#-side record of a CLI flag.
+    /// </para>
+    /// </summary>
+    public static class BackendCommandPlanner
+    {
+        private static readonly UTF8Encoding Utf8NoBom = new(false);
+
+        /// <summary>
+        /// CLI flag for the 4-part <c>email----password----client-id----refresh-token</c>
+        /// mailbox line. Owned here, not by the window partials: the flag
+        /// vocabulary belongs to the command-plan layer, and
+        /// <c>MailboxArgumentForLine</c> already derives the same value.
+        /// </summary>
+        public const string ChataiMailboxFileFlag = "--chatai-mailbox-file";
+
+        // ── Registration ────────────────────────────────────────────────
+
+        /// <summary>
+        /// CLI-contract surface: <b>no production caller</b>. Kept (and unit-tested)
+        /// because the backend still accepts <c>--count</c> / <c>--workers</c> /
+        /// <c>--no-phone-reuse</c> / <c>--proxy</c> without a mailbox file; the
+        /// pool-registration button that used it was removed. See
+        /// <c>BackendCommandPlannerSurfaceTests</c>.
+        /// </summary>
+        public static BackendCommandPlan CreatePoolRegistration(
+            int count,
+            IReadOnlyList<string> proxyPool,
+            int workers = 4)
+        {
+            var args = new List<string>
+            {
+                "--desktop-ipc",
+                "--count", Count(count),
+                "--workers", Count(workers),
+            };
+            AppendNoPhoneReuse(args);
+            AppendProxyPool(args, proxyPool);
+            return new BackendCommandPlan("邮箱池注册", args);
+        }
+
+        /// <summary>
+        /// Mailbox-file registration shared by the selected-mailbox,
+        /// unregistered-mailbox, one-click pool, and failed-rerun actions.
+        /// </summary>
+        /// <param name="temporaryFiles">
+        /// Files the *caller* created for this run and expects deleted afterwards
+        /// (a selected-mailbox batch file). Declare them here rather than dropping
+        /// them: the window deletes <see cref="BackendCommandPlan.TempFiles"/> in a
+        /// <c>finally</c>, and an undeclared batch file is mailbox credentials left
+        /// in <c>%TEMP%</c> forever. The persistent pool file passed by the one-click
+        /// path is NOT a temporary file and must never be listed here -- doing so
+        /// deletes the operator's mailbox pool after the first run.
+        /// </param>
+        public static BackendCommandPlan CreateMailboxFileRegistration(
+            string taskName,
+            string mailboxArgument,
+            string mailboxFile,
+            int count,
+            int workers,
+            bool registrationAtOnly,
+            IReadOnlyList<string> proxyPool,
+            bool disable2fa = false,
+            bool checkPromotion = false,
+            IReadOnlyList<string>? temporaryFiles = null)
+        {
+            RequireArgument(mailboxArgument, nameof(mailboxArgument));
+            RequireArgument(mailboxFile, nameof(mailboxFile));
+            var args = new List<string>
+            {
+                "--desktop-ipc",
+                mailboxArgument, mailboxFile,
+                "--count", Count(count),
+                "--workers", Count(workers),
+            };
+            if (registrationAtOnly) args.Add("--registration-at-only");
+            AppendNoPhoneReuse(args);
+            AppendNo2fa(args, disable2fa);
+            AppendCheckPromotion(args, checkPromotion);
+            AppendProxyPool(args, proxyPool);
+            return new BackendCommandPlan(taskName, args, TemporaryFiles: temporaryFiles);
+        }
+
+        /// <summary>
+        /// CLI-contract surface: <b>no production caller</b>. This is the
+        /// "re-run the failed rows" entry point; the window reruns through
+        /// <see cref="CreateMailboxFileRegistration"/> directly. Kept so the fixed
+        /// argument set (count 4, <c>registrationAtOnly: false</c>) stays pinned.
+        /// </summary>
+        public static BackendCommandPlan CreateRerunFailedRegistration(
+            string mailboxArgument,
+            string mailboxFile,
+            int count,
+            IReadOnlyList<string> proxyPool)
+        {
+            return CreateMailboxFileRegistration(
+                "重新注册失败账号 (" + Count(count) + ")",
+                mailboxArgument,
+                mailboxFile,
+                count,
+                4,
+                registrationAtOnly: false,
+                proxyPool);
+        }
+
+        public static BackendCommandPlan CreatePhoneRegistration(
+            int count,
+            IReadOnlyList<string> proxyPool,
+            bool disable2fa = false,
+            bool checkPromotion = false)
+        {
+            var args = new List<string> { "--desktop-ipc", "--phone-register", "--count", Count(count) };
+            AppendNo2fa(args, disable2fa);
+            AppendCheckPromotion(args, checkPromotion);
+            AppendProxyPool(args, proxyPool);
+            // No vendor in the label: the provider is whatever
+            // `phone_reuse.source` selects, and this plan does not override it.
+            return new BackendCommandPlan("手机号注册", args);
+        }
+
+        public static BackendCommandPlan CreateCfWorkerRegistration(
+            string domain,
+            int count,
+            int workers,
+            IReadOnlyList<string> proxyPool,
+            bool disable2fa = false,
+            bool checkPromotion = false)
+        {
+            var args = new List<string>
+            {
+                "--desktop-ipc",
+                "--buy-cfworker-mailbox",
+                "--cfworker-domain", RequireArgument(domain, nameof(domain)),
+                "--count", Count(count),
+                "--workers", Count(workers),
+            };
+            AppendRegistrationAtOnly(args);
+            AppendNo2fa(args, disable2fa);
+            AppendCheckPromotion(args, checkPromotion);
+            AppendProxyPool(args, proxyPool);
+            return new BackendCommandPlan("CFWorker邮箱注册", args);
+        }
+
+        public static BackendCommandPlan CreateRemailTargetRegistration(
+            int count,
+            int workers,
+            IReadOnlyList<string> proxyPool,
+            bool disable2fa = false,
+            bool checkPromotion = false)
+        {
+            var args = new List<string>
+            {
+                "--desktop-ipc",
+                "--target-at200", Count(count),
+                "--buy-remail-mailbox",
+                "--remail-service-mode", "purchase",
+                "--workers", Count(workers),
+            };
+            AppendNoPhoneReuse(args);
+            AppendNo2fa(args, disable2fa);
+            AppendCheckPromotion(args, checkPromotion);
+            AppendProxyPool(args, proxyPool);
+            return new BackendCommandPlan("ReMail 长效邮箱注册 (" + Count(count) + ")", args);
+        }
+
+        public static BackendCommandPlan CreateSmailrRegistration(
+            string domain,
+            int count,
+            int workers,
+            IReadOnlyList<string> proxyPool,
+            bool disable2fa = false,
+            bool checkPromotion = false)
+        {
+            var args = new List<string>
+            {
+                "--desktop-ipc",
+                "--buy-smailr-mailbox",
+                "--smailr-domain", RequireArgument(domain, nameof(domain)),
+                "--count", Count(count),
+                "--workers", Count(workers),
+            };
+            AppendRegistrationAtOnly(args);
+            AppendNo2fa(args, disable2fa);
+            AppendCheckPromotion(args, checkPromotion);
+            AppendProxyPool(args, proxyPool);
+            return new BackendCommandPlan("Smailr 邮箱注册", args);
+        }
+
+        // ── One-click SMS (接码) ────────────────────────────────────────
+
+        public static BackendCommandPlan CreateOneClickSms(
+            string mailboxArgument,
+            string mailboxFile,
+            IReadOnlyList<string> emails,
+            string sessionFile,
+            IReadOnlyList<string> proxyPool,
+            string? phoneSource = null,
+            string? tempDirectory = null,
+            IReadOnlyList<string>? callerTemporaryFiles = null)
+        {
+            RequireArgument(mailboxArgument, nameof(mailboxArgument));
+            RequireArgument(mailboxFile, nameof(mailboxFile));
+            List<string> targets = RequireEmails(emails);
+            var args = new List<string>
+            {
+                "--one-click-sms",
+                "--workers", "1",
+                "--refresh-timeout", "60",
+                mailboxArgument, mailboxFile,
+            };
+            // This used to be the literal "smsbower", which meant the dialog's
+            // provider selection never reached the backend: the run always
+            // rented an SMSBower number. The key is not validated here -- this
+            // project cannot see SmsProviderCatalog, and the backend's argparse
+            // `choices` already rejects an unknown provider loudly.
+            AppendPhoneSource(args, phoneSource);
+            var tempFiles = new List<string>();
+            if (targets.Count > 1)
+            {
+                string emailFile = WriteEmailFile(tempDirectory, "oneclick_sms_emails_", targets);
+                tempFiles.Add(emailFile);
+                args.AddRange(new[] { "--email-file", emailFile });
+            }
+            else
+            {
+                args.AddRange(new[] { "--email", targets[0] });
+                AppendSessionFile(args, sessionFile);
+            }
+            AppendProxyPool(args, proxyPool);
+            // The caller's selected-mailbox batch file is a temp file too; see
+            // CreateMailboxFileRegistration's parameter docs for why it has to be
+            // declared instead of inferred.
+            if (callerTemporaryFiles != null)
+                tempFiles.AddRange(callerTemporaryFiles.Where(path => !string.IsNullOrWhiteSpace(path)));
+            return new BackendCommandPlan(
+                "一键接码(" + Count(targets.Count) + ")",
+                args,
+                TemporaryFiles: tempFiles);
+        }
+
+        // ── Account liveness (测活) ─────────────────────────────────────
+
+        public static BackendCommandPlan CreateAccountScan(
+            IReadOnlyList<string> emails,
+            string sessionFile,
+            int workers,
+            bool autoRelogin,
+            IReadOnlyList<string> proxyPool,
+            string? tempDirectory = null)
+        {
+            List<string> targets = RequireEmails(emails);
+            var args = new List<string>
+            {
+                "--refresh-local-quota",
+                "--quota-workers", Count(workers),
+                "--refresh-timeout", "90",
+                "--desktop-ipc",
+            };
+            if (autoRelogin)
+            {
+                args.Add("--quota-auto-relogin");
+                args.Add("--quota-relogin-timeout");
+                args.Add("300");
+            }
+            // Keep liveness bounded; optional recovery is a separate, explicitly
+            // enabled phase and must not consume the entire desktop timeout.
+            //
+            // Recovery widens the batch ceiling. The OTP poll window alone is
+            // 180s (email.otp_timeout), and the flat 840s batch budget truncated
+            // recovery long before a queued account could use it -- every
+            // recovery died as `*_otp_poll_timeout`. The per-account figure
+            // stays at 120s on purpose: it bounds the *probe* phase only, and a
+            // slow probe must still disqualify an account from recovery.
+            // Emit each flag exactly once; argparse keeps the last occurrence,
+            // so duplicate pairs only obscured which budget was effective.
+            string batchTimeout = Count(autoRelogin ? 1680 : 840);
+            args.AddRange(new[] {
+                "--quota-batch-timeout", batchTimeout, "--quota-account-timeout", "120"
+            });
+            var tempFiles = new List<string>();
+            if (targets.Count > 1)
+            {
+                string emailFile = WriteEmailFile(tempDirectory, "oneclick_scan_emails_", targets);
+                tempFiles.Add(emailFile);
+                args.AddRange(new[] { "--email-file", emailFile });
+            }
+            else
+            {
+                args.AddRange(new[] { "--email", targets[0] });
+                AppendSessionFile(args, sessionFile);
+            }
+            AppendProxyPool(args, proxyPool);
+            return new BackendCommandPlan(
+                "账号测活(" + Count(targets.Count) + ")",
+                args,
+                TemporaryFiles: tempFiles,
+                // Leave drain time for the final IPC envelope and partial
+                // snapshot after the Python batch deadline. Recovery runs a
+                // wider batch deadline (1680s) and needs the host to outlive
+                // it; a probe-only scan keeps the original 15 minutes.
+                TimeoutMilliseconds: (autoRelogin ? 30 : 15) * 60 * 1000,
+                ResultKind: BackendAccountResultKind.Liveness);
+        }
+
+        public static BackendCommandPlan CreateChangeEmail(
+            IReadOnlyList<string> emails,
+            string provider,
+            string mailboxFile,
+            int workers,
+            string smailrDomain,
+            string cfworkerDomain,
+            IReadOnlyList<string> proxyPool,
+            string? tempDirectory = null)
+        {
+            List<string> targets = RequireEmails(emails);
+            RequireArgument(provider, nameof(provider));
+            var args = new List<string>
+            {
+                "--change-email",
+                "--change-email-provider", provider.Trim().ToLowerInvariant(),
+                "--change-email-workers", Count(workers),
+            };
+            var tempFiles = new List<string>();
+            string emailFile = WriteEmailFile(tempDirectory, "change_email_accounts_", targets);
+            tempFiles.Add(emailFile);
+            args.AddRange(new[] { "--email-file", emailFile });
+            if (!string.IsNullOrWhiteSpace(mailboxFile))
+                args.AddRange(new[] { "--change-email-mailbox-file", mailboxFile.Trim() });
+            if (!string.IsNullOrWhiteSpace(smailrDomain))
+                args.AddRange(new[] { "--change-email-smailr-domain", smailrDomain.Trim() });
+            if (!string.IsNullOrWhiteSpace(cfworkerDomain))
+                args.AddRange(new[] { "--cfworker-domain", cfworkerDomain.Trim() });
+            AppendProxyPool(args, proxyPool);
+            return new BackendCommandPlan("批量邮箱换绑(" + Count(targets.Count) + ")", args, TemporaryFiles: tempFiles, TimeoutMilliseconds: 900000);
+        }
+
+        public static BackendCommandPlan CreatePromotionCheck(
+            IReadOnlyList<string> emails,
+            int workers,
+            IReadOnlyList<string> proxyPool,
+            string? tempDirectory = null)
+        {
+            List<string> targets = RequireEmails(emails);
+            var args = new List<string>
+            {
+                "--check-promotion",
+                "--quota-workers", Count(workers),
+                "--refresh-timeout", "20",
+                "--desktop-ipc",
+            };
+            var tempFiles = new List<string>();
+            if (targets.Count > 1)
+            {
+                string emailFile = WriteEmailFile(tempDirectory, "promotion_check_emails_", targets);
+                tempFiles.Add(emailFile);
+                args.AddRange(new[] { "--email-file", emailFile });
+            }
+            else
+            {
+                args.AddRange(new[] { "--email", targets[0] });
+            }
+            AppendProxyPool(args, proxyPool);
+            return new BackendCommandPlan(
+                "账号优惠检测(" + Count(targets.Count) + ")",
+                args,
+                TemporaryFiles: tempFiles,
+                ResultKind: BackendAccountResultKind.Promotion);
+        }
+
+        public static BackendCommandPlan CreateQuotaUsageProbe(
+            string email,
+            int refreshTimeoutSeconds,
+            IReadOnlyList<string> proxyPool)
+        {
+            var args = new List<string>
+            {
+                "--quota-usage",
+                "--email", RequireEmail(email),
+                "--refresh-timeout", Count(refreshTimeoutSeconds),
+            };
+            AppendProxyPool(args, proxyPool);
+            return new BackendCommandPlan("账号测活", args);
+        }
+
+        public static BackendCommandPlan CreatePaymentQualificationCheck(
+            IReadOnlyList<string> emails,
+            int workers,
+            IReadOnlyList<string> proxyPool,
+            string paymentMethod = "",
+            string? tempDirectory = null)
+        {
+            List<string> targets = RequireEmails(emails);
+            var args = new List<string>
+            {
+                "--check-payment-qualification",
+                "--quota-workers", Count(workers),
+                "--refresh-timeout", "45",
+                "--desktop-ipc",
+            };
+            if (!string.IsNullOrWhiteSpace(paymentMethod))
+                args.AddRange(new[] { "--payment-qualification-method", paymentMethod.Trim() });
+            var tempFiles = new List<string>();
+            if (targets.Count > 1)
+            {
+                string emailFile = WriteEmailFile(tempDirectory, "payment_qualification_emails_", targets);
+                tempFiles.Add(emailFile);
+                args.AddRange(new[] { "--email-file", emailFile });
+            }
+            else
+            {
+                args.AddRange(new[] { "--email", targets[0] });
+            }
+            AppendProxyPool(args, proxyPool);
+            return new BackendCommandPlan(
+                "支付资格检测(" + Count(targets.Count) + ")",
+                args,
+                TemporaryFiles: tempFiles,
+                ResultKind: BackendAccountResultKind.PaymentQualification);
+        }
+
+        // ── Proxy pool administration ──────────────────────────────────
+
+        /// <summary>Read the configured pool (masked) for one lane.</summary>
+        public static BackendCommandPlan CreateProxyPoolList(string lane)
+        {
+            var args = new List<string>
+            {
+                "--desktop-ipc",
+                "--desktop-read", "proxy-pool",
+                "--proxy-read-lane", LaneOrDefault(lane),
+            };
+            return new BackendCommandPlan("代理池列表", args, ResultKind: BackendAccountResultKind.ProxyPool);
+        }
+
+        /// <summary>Edge + geo reachability probe for the whole pool.</summary>
+        public static BackendCommandPlan CreateProxyPoolTest(
+            string? poolText,
+            string lane,
+            string country,
+            int workers,
+            double timeoutSeconds)
+        {
+            var args = new List<string> { "--desktop-ipc", "--proxy-test" };
+            AppendProxyPoolAdminArgs(args, poolText, lane, country, workers, timeoutSeconds);
+            return new BackendCommandPlan("代理连通性测试", args, ResultKind: BackendAccountResultKind.ProxyPool);
+        }
+
+        /// <summary>Dual-pass residential screening plus the ASN ranking.</summary>
+        public static BackendCommandPlan CreateProxyPoolScreen(
+            string? poolText,
+            string lane,
+            string country,
+            int qualityMin,
+            int workers,
+            double timeoutSeconds)
+        {
+            var args = new List<string>
+            {
+                "--desktop-ipc",
+                "--proxy-screen",
+                "--proxy-quality-min", Count(qualityMin),
+            };
+            AppendProxyPoolAdminArgs(args, poolText, lane, country, workers, timeoutSeconds);
+            return new BackendCommandPlan("代理住宅筛选", args, ResultKind: BackendAccountResultKind.ProxyPool);
+        }
+
+        private static void AppendProxyPoolAdminArgs(
+            List<string> args,
+            string? poolText,
+            string lane,
+            string country,
+            int workers,
+            double timeoutSeconds)
+        {
+            args.AddRange(new[] { "--proxy-read-lane", LaneOrDefault(lane) });
+            args.AddRange(new[] { "--proxy-workers", Count(workers) });
+            // One decimal is enough and avoids locale-dependent formatting.
+            args.AddRange(new[] { "--proxy-timeout", timeoutSeconds.ToString("0.0", CultureInfo.InvariantCulture) });
+            string isoCountry = CountryOrEmpty(country);
+            if (isoCountry.Length > 0)
+                args.AddRange(new[] { "--proxy-country", isoCountry });
+            // The pasted pool is one argv element; the backend splits commas and
+            // newlines itself (proxy.routing.parse_lane_proxy_pool).
+            if (!string.IsNullOrWhiteSpace(poolText))
+                args.AddRange(new[] { "--proxy-pool", poolText!.Trim() });
+        }
+
+        // ── Deletion ────────────────────────────────────────────────────
+
+        /// <summary>
+        /// CLI-contract surface: <b>no production caller</b>. The window deletes
+        /// through <see cref="CreateBatchDeleteAccounts"/> (one backend call for the
+        /// whole selection); this single-account form keeps the <c>--delete-account
+        /// --email</c> pairing (and its 120 s budget) recorded on the C# side.
+        /// </summary>
+        public static BackendCommandPlan CreateDeleteAccount(string email)
+        {
+            var args = new List<string>
+            {
+                "--delete-account",
+                "--email", RequireEmail(email),
+                "--desktop-ipc",
+            };
+            return new BackendCommandPlan("删除账号", args, TimeoutMilliseconds: 120000);
+        }
+
+        /// <summary>
+        /// Batch delete with a list of email addresses.
+        /// </summary>
+        public static BackendCommandPlan CreateBatchDeleteAccounts(
+            IReadOnlyList<string> emails,
+            int workers = 4,
+            string? tempDirectory = null)
+        {
+            List<string> targets = RequireEmails(emails);
+            string emailFile = WriteEmailFile(tempDirectory, "delete_emails_", targets);
+            var args = new List<string>
+            {
+                "--delete-account",
+                "--email-file", emailFile,
+                "--workers", Count(workers),
+                "--desktop-ipc",
+            };
+            return new BackendCommandPlan(
+                "批量删除账号 (" + Count(targets.Count) + ")",
+                args,
+                TemporaryFiles: new[] { emailFile },
+                TimeoutMilliseconds: 120000);
+        }
+
+        // ── Import ──────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Batch import from a list of email addresses. Writes a temp email file.
+        /// </summary>
+        public static BackendCommandPlan CreateAccountImport(
+            string target,
+            IReadOnlyList<string> emails,
+            int workers = 4,
+            int refreshTimeoutSeconds = 60,
+            string? tempDirectory = null)
+        {
+            List<string> targets = RequireEmails(emails);
+            string normalized = NormalizeImportTarget(target);
+            string emailFile = WriteEmailFile(tempDirectory, "oneclick_import_emails_", targets);
+            var args = new List<string>
+            {
+                "--import-cpa",
+                "--email-file", emailFile,
+                "--workers", Count(workers),
+                "--refresh-timeout", Count(refreshTimeoutSeconds),
+                "--import-target", normalized,
+            };
+            return new BackendCommandPlan(
+                "一键导入" + ImportTargetLabel(normalized) + " (" + Count(targets.Count) + ")",
+                args,
+                TemporaryFiles: new[] { emailFile });
+        }
+
+        public static string NormalizeImportTarget(string target)
+        {
+            string value = (target ?? "").Trim().ToLowerInvariant();
+            return value is "sub2api" or "cliproxyapi" ? value : "cpa";
+        }
+
+        public static string ImportTargetLabel(string target)
+        {
+            string value = (target ?? "").Trim().ToLowerInvariant();
+            if (value == "sub2api") return "SUB2API";
+            if (value == "cliproxyapi") return "CLIProxyAPI";
+            return "CPA";
+        }
+
+        /// <summary>
+        /// Single-account import. For a single email, no temp file is needed;
+        /// the email is passed directly via --email-file (the backend expects a file).
+        /// </summary>
+        /// <remarks>
+        /// CLI-contract surface: <b>no production caller</b>. The window imports the
+        /// selection through <see cref="CreateAccountImport"/>, which writes one temp
+        /// file for all rows; this form pins the single-row file shape and the
+        /// <c>TemporaryFiles</c> contract the caller is expected to clean up.
+        /// </remarks>
+        public static BackendCommandPlan CreateSingleAccountImport(
+            string target,
+            string email,
+            int workers = 4,
+            int refreshTimeoutSeconds = 60,
+            string? tempDirectory = null)
+        {
+            string normalized = NormalizeImportTarget(target);
+            string emailFile = WriteEmailFile(tempDirectory, "single_import_email_", new[] { RequireEmail(email) });
+            var args = new List<string>
+            {
+                "--import-cpa",
+                "--email-file", emailFile,
+                "--workers", Count(workers),
+                "--refresh-timeout", Count(refreshTimeoutSeconds),
+                "--import-target", normalized,
+            };
+            return new BackendCommandPlan(
+                "一键导入" + ImportTargetLabel(normalized),
+                args,
+                TemporaryFiles: new[] { emailFile });
+        }
+
+        // ── Export conversion ───────────────────────────────────────────
+
+        public static BackendCommandPlan CreateSessionConversion(
+            string sourcePath,
+            string format,
+            string outputPath)
+        {
+            string normalized = (format ?? "cpa").Trim().ToLowerInvariant();
+            if (normalized.Length == 0) normalized = "cpa";
+            var args = new List<string>
+            {
+                "--convert-session-json", RequireArgument(sourcePath, nameof(sourcePath)),
+                "--convert-format", normalized,
+                "--convert-output", RequireArgument(outputPath, nameof(outputPath)),
+            };
+            return new BackendCommandPlan("导出账号转换(" + normalized + ")", args);
+        }
+
+        // ── Refresh / maintenance ───────────────────────────────────────
+
+        /// <summary>
+        /// CLI-contract surface: <b>no production caller</b>. Account recovery
+        /// (401 → AT refresh) happens inside the backend command that needed it, not
+        /// through a standalone <c>--refresh-session</c> invocation; this builder
+        /// keeps that flag and its <c>--session-file</c> pairing recorded here.
+        /// </summary>
+        public static BackendCommandPlan CreateRefreshSession(string email, string sessionFile)
+        {
+            var args = new List<string> { "--email", RequireEmail(email), "--refresh-session" };
+            AppendSessionFile(args, sessionFile);
+            return new BackendCommandPlan("刷新Session", args);
+        }
+
+        /// <summary>
+        /// CLI-contract surface: <b>no production caller</b>. Pins the bare
+        /// <c>--rebuild-sqlite</c> invocation; the desktop rebuild action was removed
+        /// with the other dead handlers (see <c>MainWindow.Tasks.cs</c>).
+        /// </summary>
+        public static BackendCommandPlan CreateRebuildSqlite()
+        {
+            return new BackendCommandPlan("重建SQLite索引", new List<string> { "--rebuild-sqlite" });
+        }
+
+        // ── Inbox ───────────────────────────────────────────────────────
+
+        public static BackendCommandPlan CreateViewInbox(
+            string email,
+            int limit,
+            string mailboxArgument,
+            string mailboxLine,
+            string sessionFile,
+            string mailboxProxy,
+            string remailToken,
+            string? tempDirectory = null)
+        {
+            var args = new List<string>
+            {
+                "--desktop-ipc",
+                "--view-inbox",
+                "--email", RequireEmail(email),
+                "--inbox-limit", Count(limit),
+            };
+            var tempFiles = new List<string>();
+            string argument = (mailboxArgument ?? "").Trim();
+            string line = (mailboxLine ?? "").Trim();
+            if (argument.Length > 0 && line.Length > 0)
+            {
+                string mailboxFile = Path.Combine(
+                    TempDirectory(tempDirectory),
+                    "view_inbox_mailbox_" + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture) + ".txt");
+                File.WriteAllText(mailboxFile, line + Environment.NewLine, Utf8NoBom);
+                tempFiles.Add(mailboxFile);
+                args.AddRange(new[] { argument, mailboxFile });
+            }
+            AppendSessionFile(args, sessionFile);
+            string proxy = (mailboxProxy ?? "").Trim();
+            if (proxy.Length > 0)
+            {
+                AppendProxy(args, proxy);
+            }
+            var environment = new Dictionary<string, string>();
+            string token = (remailToken ?? "").Trim();
+            if (token.Length > 0)
+                environment["REMAIL_SERVICE_TOKEN"] = token;
+            return new BackendCommandPlan(
+                "查看收件箱",
+                args,
+                EnvironmentVariables: environment,
+                TemporaryFiles: tempFiles,
+                TimeoutMilliseconds: 120000);
+        }
+
+        // ── Shared shape helpers ────────────────────────────────────────
+
+        /// <summary>
+        /// Classifies a mailbox pool line into the CLI flag that consumes it.
+        /// The legacy parser is the compatibility superset for mixed provider
+        /// selections; unknown or comment lines yield an empty flag.
+        /// </summary>
+        public static string MailboxArgumentForLine(string line)
+        {
+            string value = (line ?? "").Trim().TrimStart('﻿');
+            if (value.Length == 0 || value.StartsWith('#')) return "";
+            if (value.StartsWith("cfworker://", StringComparison.OrdinalIgnoreCase)
+                || value.EndsWith("@edu.liziai.cloud", StringComparison.OrdinalIgnoreCase)
+                || value.EndsWith("@liziai.cloud", StringComparison.OrdinalIgnoreCase)) return "--mailbox-file";
+            if (value.StartsWith("remail://", StringComparison.OrdinalIgnoreCase)) return "--mailbox-file";
+            if (value.StartsWith("smailr://", StringComparison.OrdinalIgnoreCase)) return "--mailbox-file";
+            if (value.StartsWith("gmail://", StringComparison.OrdinalIgnoreCase)) return "--mailbox-file";
+            if (MailboxCredentialLineParser.TryParseICloudUrlLine(value, out _, out _)) return "--mailbox-file";
+            if (value.Contains("----", StringComparison.Ordinal) && value.Split("----", StringSplitOptions.None).Length >= 4) return "--chatai-mailbox-file";
+            if (value.Contains("---", StringComparison.Ordinal) && value.Split("---", StringSplitOptions.None).Length >= 3) return "--mailbox-file";
+            return "";
+        }
+
+        /// <summary>
+        /// Appends the registration proxy route: the first pool entry becomes
+        /// the scalar --proxy and the full pool is forwarded via --proxy-pool
+        /// only when more than one route exists.
+        /// </summary>
+        public static void AppendProxyPool(List<string> args, IReadOnlyList<string> proxyPool)
+        {
+            var pool = (proxyPool ?? Array.Empty<string>())
+                .Select(item => (item ?? "").Trim())
+                .Where(item => item.Length > 0)
+                .ToList();
+            if (pool.Count == 0) return;
+            AppendProxy(args, pool[0]);
+            if (pool.Count > 1)
+            {
+                args.Add("--proxy-pool");
+                args.Add(string.Join(Environment.NewLine, pool));
+            }
+        }
+
+        /// <summary>
+        /// Appends the scalar <c>--proxy</c> route. The only owner of that flag
+        /// literal on the desktop side; callers with a pool use
+        /// <see cref="AppendProxyPool"/> instead.
+        /// </summary>
+        public static void AppendProxy(List<string> args, string proxy)
+        {
+            string value = (proxy ?? "").Trim();
+            if (value.Length == 0) return;
+            args.Add("--proxy");
+            args.Add(value);
+        }
+
+        public static void AppendSessionFile(List<string> args, string sessionFile)
+        {
+            string value = (sessionFile ?? "").Trim();
+            if (value.Length == 0) return;
+            args.Add("--session-file");
+            args.Add(value);
+        }
+
+        private static void AppendRegistrationAtOnly(List<string> args)
+        {
+            args.Add("--registration-at-only");
+            AppendNoPhoneReuse(args);
+        }
+
+        private static void AppendNoPhoneReuse(List<string> args)
+        {
+            args.Add("--no-phone-reuse");
+        }
+
+        /// <summary>
+        /// Emit the provider override when the caller resolved one.
+        ///
+        /// Omitted entirely when blank so the backend falls back to
+        /// `phone_reuse.source` -- the same key the settings page writes. That
+        /// fallback is the contract; a blank value must not become
+        /// `--phone-source ""`, which argparse would reject.
+        /// </summary>
+        private static void AppendPhoneSource(List<string> args, string? phoneSource)
+        {
+            string key = (phoneSource ?? "").Trim();
+            if (key.Length == 0) return;
+            args.AddRange(new[] { "--phone-source", key });
+        }
+
+        private static void AppendNo2fa(List<string> args, bool disable2fa)
+        {
+            if (disable2fa) args.Add("--no-2fa");
+        }
+
+        private static void AppendCheckPromotion(List<string> args, bool checkPromotion)
+        {
+            if (checkPromotion) args.Add("--check-promotion-after-registration");
+        }
+
+        /// <summary>
+        /// A temporary file name that cannot be reused by a second run.
+        ///
+        /// Second-granularity names (<c>yyyyMMdd_HHmmss</c>) collided when two
+        /// actions started in the same second: the new file overwrote the batch
+        /// file the in-flight backend was still reading. Milliseconds plus a
+        /// random suffix make the name unique per call.
+        ///
+        /// Private on purpose: this is the planner's own naming rule for the
+        /// files <em>it</em> writes. The window names its selected-mailbox batch
+        /// file through <c>TransientArtifactCleanup.UniqueCredentialFileName</c>
+        /// (same project as the caller), so the command-plan layer never grows a
+        /// public helper that exists only for one view to call.
+        /// </summary>
+        private static string UniqueTempFileName(string prefix)
+            => prefix
+                + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture)
+                + "_" + Guid.NewGuid().ToString("N")[..8]
+                + ".txt";
+
+        private static string WriteEmailFile(string? tempDirectory, string prefix, IReadOnlyList<string> emails)
+        {
+            string emailFile = Path.Combine(TempDirectory(tempDirectory), UniqueTempFileName(prefix));
+            File.WriteAllLines(emailFile, emails.Select(email => email.Trim()), Utf8NoBom);
+            return emailFile;
+        }
+
+        private static string TempDirectory(string? tempDirectory)
+        {
+            return string.IsNullOrWhiteSpace(tempDirectory) ? Path.GetTempPath() : tempDirectory;
+        }
+
+        private static string RequireArgument(string? value, string parameterName)
+        {
+            string trimmed = (value ?? "").Trim();
+            if (trimmed.Length == 0)
+                throw new ArgumentException("Backend command argument must not be empty.", parameterName);
+            // `value` is non-null on every path that reaches here: null trims to
+            // "" and throws above. Not `trimmed`, which would also strip
+            // surrounding whitespace the caller passed deliberately.
+            return value!;
+        }
+
+        private static string RequireEmail(string email)
+        {
+            string trimmed = (email ?? "").Trim();
+            if (trimmed.Length == 0)
+                throw new ArgumentException("Backend command requires an account email.", nameof(email));
+            return trimmed;
+        }
+
+        private static List<string> RequireEmails(IReadOnlyList<string> emails)
+        {
+            var targets = (emails ?? Array.Empty<string>())
+                .Select(email => (email ?? "").Trim())
+                .Where(email => email.Length > 0)
+                .ToList();
+            if (targets.Count == 0)
+                throw new ArgumentException("Backend command requires at least one account email.", nameof(emails));
+            return targets;
+        }
+
+        private static string Count(int value)
+        {
+            return value.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static string LaneOrDefault(string? lane)
+        {
+            return string.IsNullOrWhiteSpace(lane) ? "protocol_registration" : lane!.Trim();
+        }
+
+        /// <summary>ISO alpha-2 or empty; the backend rejects anything else.</summary>
+        private static string CountryOrEmpty(string? country)
+        {
+            string value = (country ?? "").Trim().ToUpperInvariant();
+            if (value.Length != 2) return "";
+            foreach (char character in value)
+            {
+                if (!char.IsLetter(character)) return "";
+            }
+            return value;
+        }
+    }
+}

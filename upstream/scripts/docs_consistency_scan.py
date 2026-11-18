@@ -1,0 +1,461 @@
+"""Check live documentation pointers and current module layout.
+
+Four tiers, because the docs mix very different kinds of pointer:
+
+* **Weak (all docs).** A `` `path.py:NNN` `` pointer must name a file that exists
+  and a line that is in range. This catches the catastrophic case -- a module
+  that was split or deleted, e.g. ``playwright.py:1518`` after the file became a
+  27-line re-export shell. It cannot tell that ``base.py:9`` stopped being
+  ``RegistrationDriver``, because the file merely grew.
+* **Strong (symbol tables only).** A table row shaped
+  ``| `Symbol` | `path.py:NNN` | ... |`` is resolved with ``ast`` and the symbol
+  must actually be defined on that line. Symbol names and table layout survive
+  refactors, so this catches the silent off-by-N drift the weak tier misses.
+* **Weak (C# names, all docs).** A backticked ``Foo.cs`` must exist under a
+  desktop project. Neither tier above looks at C# at all, so a renamed or deleted
+  desktop file left prose no gate could see; see
+  :func:`check_csharp_file_refs` for the measured instance that added this tier.
+* **Weak (repository paths, canonical docs).** A backticked, root-anchored path
+  (``sms_tool/...``, ``services/...``, ``scripts/...``, ``tests/...``,
+  ``docs/...``, ``SmsWorkbench/...``) must exist. The first two tiers only see
+  ``path.py:NNN`` pointers, so a pointer whose suffix is a *call*
+  (``sms_tool/paths.py:config_dir()``) or that carries no line number at all
+  slipped through every tier; see :func:`check_path_refs` for the measured
+  instances that added this one.
+
+Anything a tier cannot resolve (env-var names, prose-anchored pointers into a
+function body) is skipped rather than failed -- the gate must never fire on a
+pointer it does not understand.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "sms_tool"
+
+DOCS = (
+    "README.md",
+    "README_EN.md",
+    "docs/README.md",
+    "docs/CONTEXT.md",
+    "docs/architecture.md",
+    "docs/directory-map.md",
+    "docs/current/registration-and-proxy-architecture.md",
+    "docs/current/paypal-zero-due-link.md",
+    "docs/current/protocol-payment-enhancement.md",
+    # Current-state and ADR documents are canonical too; excluding them lets
+    # stale symbol/line references survive CI even though maintainers read
+    # these files as active contracts. Historical audits intentionally remain
+    # outside the line-number gate because they preserve old snapshots.
+    "docs/current/README.md",
+    "docs/current/account-health.md",
+    "docs/current/configuration.md",
+    "docs/current/mailbox.md",
+    "docs/current/registration-architecture.md",
+    "docs/current/protocol-registration.md",
+    "docs/current/registration-recovery.md",
+    "docs/current/telemetry-and-runtime.md",
+    "docs/current/typing.md",
+    "docs/current/randomness.md",
+    "docs/adr/README.md",
+    "docs/adr/0001-provider-layout.md",
+    "docs/adr/0002-storage-events.md",
+    "docs/adr/0003-driver-registry.md",
+    "docs/adr/0004-browser-flow-split.md",
+    "docs/adr/0005-cooperative-cancellation.md",
+    "docs/adr/0006-browser-pool-and-pulse.md",
+    "docs/adr/0007-email-verification-stuck.md",
+    "docs/adr/0008-registration-result-contract.md",
+    "docs/adr/0009-registration-hardening.md",
+    # The troubleshooting checklists quote concrete file:line anchors
+    # (``mailbox/pool_writer.py:209`` and friends) so operators can jump
+    # straight to the owner. Those anchors rot exactly like the contract
+    # docs' do, so this file is canonical too -- not an audit snapshot.
+    "docs/TROUBLESHOOTING.md",
+)
+
+# ```mod.py:12``` or the shorthand ```:12``` (repeats the previous file on the line).
+# ``.json`` is tracked too -- the architecture doc chains bare ```:227`` refs off a
+# ```config.json:216`` lead -- but only ``.py`` pointers are validated, because
+# config.json is gitignored and user-edited, so its line numbers are not ours to police.
+REF = re.compile(r"`((?:[A-Za-z0-9_./]+/)?[A-Za-z0-9_]+\.(?:py|json)):(\d+)`|`:(\d+)`")
+SYMBOL = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)`")
+# `| col1 | col2 | ...` -- only the first two cells matter for symbol pointers.
+TABLE_ROW = re.compile(r"^\|(.+?)\|(.+?)\|")
+
+# ```Foo.cs``` or ```SmsWorkbench/Foo.cs``` -- a canonical doc naming a desktop
+# source file. The third tier below; see check_csharp_file_refs for why it exists.
+CSHARP_REF = re.compile(r"`((?:[A-Za-z0-9_./]+/)?[A-Za-z0-9_]+\.cs)`")
+#: Projects that may own a `.cs` a doc is allowed to name. ``bin``/``obj`` are
+#: skipped when indexing: generated copies of a renamed file would otherwise keep
+#: a deleted name alive for one build.
+CSHARP_ROOTS = ("SmsWorkbench", "SmsWorkbench.Contracts", "tests/SmsWorkbench.Tests")
+
+# ```sms_tool/payment/catalog.py``` -- a canonical doc naming a repository path
+# that is not a ``.py:NNN`` anchor. The fourth tier below; see check_path_refs.
+# The optional ``:...`` group is what lets ``sms_tool/paths.py:config_dir()``
+# resolve to the path: a colon followed by an identifier is a call suffix, not
+# the line number ``check_line_refs`` requires.
+PATH_REF = re.compile(r"`([A-Za-z0-9_.\-/]+)(?::[^`\s]*)?`")
+#: Trees a backticked path may be anchored in. Anything else (``runtime/``,
+#: ``%LOCALAPPDATA%``, an upstream repository) is not a claim about this tree.
+PATH_ROOTS = (
+    "sms_tool/",
+    "services/",
+    "scripts/",
+    "tests/",
+    "docs/",
+    "SmsWorkbench/",
+    "SmsWorkbench.Contracts/",
+)
+#: Extensions that make a token a file claim. A bare directory is a claim only
+#: when it is written with a trailing slash -- ``tests/payment`` is prose.
+PATH_SUFFIXES = (
+    ".py",
+    ".md",
+    ".json",
+    ".cs",
+    ".ps1",
+    ".js",
+    ".csproj",
+    ".xaml",
+    ".slnx",
+    ".toml",
+    ".txt",
+    ".yml",
+    ".yaml",
+    ".css",
+    ".html",
+)
+#: Characters that turn a token into a pattern, a call, or a range rather than
+#: one path. ``PATH_REF``'s class already excludes most of them; the set is kept
+#: explicit so widening that class cannot silently start guessing.
+PATH_OPAQUE = frozenset("*?<>{}%$|()[]:,'\"")
+#: ``There is no separate `docs/current/promotion.md` `` is a statement about
+#: absence, not a dangling pointer. Both languages are matched because the docs
+#: are bilingual.
+PATH_NEGATION = re.compile(
+    r"(?:\bno\b|\bnot\b|\bnever\b|\bwithout\b|不存在|没有|不要|无需)[^`]{0,40}$",
+    re.IGNORECASE,
+)
+#: Paths that are deliberately absent from a checkout: the doc names a location
+#: the operator creates, and ``.gitignore`` keeps it out of the tree.
+UNTRACKED_BY_DESIGN = {
+    "sms_tool/config.json": "gitignored operator config (`.gitignore`); the docs name the location, not a source file",
+}
+#: Build output and caches. These are absent from a clean checkout by
+#: definition, so a doc that classifies them -- ``directory-map.md`` calls
+#: ``SmsWorkbench/bin/`` + ``obj/`` "build intermediates ... never commit" -- is
+#: making a statement about generated state, not pointing at a missing file.
+GENERATED_SEGMENTS = frozenset(
+    {
+        "bin",
+        "obj",
+        "dist",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        ".dotnet",
+        ".pytest_cache",
+        ".ruff_cache",
+    }
+)
+#: An ADR records the layout **at decision time**. A path it names may have been
+#: deleted since (ADR-0004's ``tests/browser_flow_patch.py`` went away with the
+#: patch mechanism), and rewriting a decision record is worse than tolerating
+#: the pointer. The line-number and symbol tiers still cover ADRs.
+PATH_EXEMPT_PREFIXES = ("docs/adr/",)
+
+
+def _resolve_source(name: str) -> Path | None:
+    for candidate in (ROOT / name, SRC / name):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _iter_ref_matches(text: str):
+    """Yield ``(match, path|None, line_number, extension)`` resolving ``:NN`` shorthands.
+
+    The match itself is handed to callers that need to rewrite the number in
+    place (see ``scripts/refresh_doc_symbol_lines.py``); everything else should
+    use :func:`_iter_refs` and never re-derive the shorthand rule.
+    """
+    last_file: str | None = None
+    for match in REF.finditer(text):
+        full, full_num, bare_num = match.group(1), match.group(2), match.group(3)
+        if full is not None:
+            last_file = full
+            yield match, _resolve_source(full), int(full_num), full.rsplit(".", 1)[-1]
+        elif last_file:
+            yield match, _resolve_source(last_file), int(bare_num), last_file.rsplit(".", 1)[-1]
+        else:
+            yield match, None, int(bare_num), ""
+
+
+def _iter_refs(text: str):
+    """Yield ``(ref_text, path|None, line_number, extension)`` resolving ``:NN`` shorthands.
+
+    A bare ```:NN`` repeats the file named by the last fully-qualified pointer on
+    the same line, which is how the architecture doc writes ``/ `:539` ``.
+    """
+    for match, source, num, ext in _iter_ref_matches(text):
+        yield match.group(0), source, num, ext
+
+
+def _symbol_lines(path: Path) -> dict[str, int]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found: dict[str, int] = {}
+
+    def record(name: str, lineno: int) -> None:
+        found.setdefault(name, lineno)
+
+    for node in tree.body:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            record(node.name, node.lineno)
+            if isinstance(node, ast.ClassDef):
+                for sub in node.body:
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        record(f"{node.name}.{sub.name}", sub.lineno)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    record(target.id, node.lineno)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            record(node.target.id, node.lineno)
+    return found
+
+
+def check_line_refs(failures: list[str]) -> None:
+    for rel in DOCS:
+        path = ROOT / rel
+        if not path.is_file():
+            continue
+        for lineno, text in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for ref_text, source, num, ext in _iter_refs(text):
+                if ext != "py":
+                    continue
+                if source is None:
+                    failures.append(f"{rel}:{lineno} unresolvable module in {ref_text}")
+                    continue
+                total = len(source.read_text(encoding="utf-8").splitlines())
+                if num < 1 or num > total:
+                    failures.append(
+                        f"{rel}:{lineno} {ref_text} past EOF ({source.relative_to(ROOT)} has {total} lines)"
+                    )
+
+
+def check_symbol_tables(failures: list[str]) -> None:
+    cache: dict[Path, dict[str, int]] = {}
+    for rel in DOCS:
+        path = ROOT / rel
+        if not path.is_file():
+            continue
+        for lineno, text in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            row = TABLE_ROW.match(text)
+            if not row:
+                continue
+            symbols = SYMBOL.findall(row.group(1))
+            refs = list(_iter_refs(row.group(2)))
+            if not symbols or len(symbols) != len(refs):
+                continue
+            for symbol, (ref_text, source, num, ext) in zip(symbols, refs):
+                if source is None or ext != "py":
+                    continue
+                if source not in cache:
+                    cache[source] = _symbol_lines(source)
+                actual = cache[source].get(symbol)
+                if actual is None:
+                    continue  # not a module-level definition -- gate stays silent
+                if actual != num:
+                    failures.append(
+                        f"{rel}:{lineno} {symbol} documented at {ref_text} "
+                        f"but defined at {source.relative_to(ROOT)}:{actual}"
+                    )
+
+
+def check_csharp_file_refs(failures: list[str]) -> None:
+    """A canonical doc that names a desktop source file must name one that exists.
+
+    **Weak tier, deliberately.** Only existence is checked, never content -- a
+    ``.cs`` file has no ``ast`` module to introspect, and parsing C# is not this
+    script's job.
+
+    Why it is needed at all: the two stronger tiers are blind to C#.
+    ``check_line_refs`` only resolves ``.py``/``.json`` pointers and
+    ``check_symbol_tables`` only reads Python symbol tables, so a renamed or
+    deleted desktop file left prose that **no gate could see**. Measured
+    2026-09-23: adding this check immediately found ``AccountScanResultInterpreter.cs``
+    still listed as a live row in ``directory-map.md`` three weeks after the file
+    was deleted as zero-reference dead code -- the same defect class as the
+    ``SmsBowerCatalogClient.cs`` -> ``SmsProviderCatalogClient.cs`` rename that
+    prompted it.
+
+    Three deliberate silences, so it never fires on something it cannot judge:
+
+    * a reference containing ``*`` or ``?`` is skipped -- glob expansion is
+      tool-dependent (git pathspec ``*`` crosses ``/``; shell and ``pathlib``
+      do not), and guessing would make the gate lie in either direction.
+      Measured 2026-09-23: ``CSHARP_REF``'s character classes already exclude
+      both characters, so a glob-shaped reference is never matched in the first
+      place and the guard below is **unreachable today**. It is kept because it
+      becomes load-bearing the moment the regex is widened --
+      ``tests/governance/test_docs_consistency.py`` pins the property with a mutation that
+      does exactly that;
+    * a bare name passes if **any** root has it, even when the doc's prose sits
+      next to a different project's table -- a filename is not a path claim;
+    * ``bin``/``obj`` are excluded from the index, so a generated copy cannot
+      keep a deleted name alive.
+
+    Consequence worth knowing: a backticked ``Foo.cs`` is a **claim that the file
+    exists**. To write about a file that was deleted, name the type without the
+    extension (``AccountScanResultInterpreter``) -- that keeps the history legible
+    without turning prose into a false pointer.
+    """
+    index = _csharp_index()
+    for rel in DOCS:
+        path = ROOT / rel
+        if not path.is_file():
+            continue
+        for lineno, text in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for ref in CSHARP_REF.findall(text):
+                if "*" in ref or "?" in ref:
+                    continue
+                if "/" in ref:
+                    resolved = (ROOT / ref).is_file()
+                else:
+                    resolved = ref in index
+                if not resolved:
+                    failures.append(f"{rel}:{lineno} documented C# file does not exist: {ref}")
+
+
+def check_path_refs(failures: list[str]) -> None:
+    """A canonical doc that names a repository path must name one that exists.
+
+    **Weak tier, deliberately.** Only existence is checked -- a path is not a
+    symbol, and a directory has no ``ast`` module to introspect.
+
+    Why it is needed at all: the three tiers above each have a blind spot that
+    is not the same blind spot. ``check_line_refs`` only matches
+    ``path.py:NNN``, so it skipped ``docs/current/configuration.md``'s
+    ``sms_tool/paths.py:config_dir()`` (the suffix is a call, not a number) and
+    every pointer written without a line number. ``check_csharp_file_refs``
+    accepts a bare name if **any** project owns it, so it skipped
+    ``docs/current/dotnet-gates.md``'s ``SmsWorkbench/StageMatrixStore.cs`` --
+    the file had moved to ``SmsWorkbench/Services/`` (it has since been deleted
+    with the retired single-account payment window). Measured 2026-10-22, seven
+    such pointers were live and every gate was green: five module paths that had
+    moved into subpackages (``kernel/``, ``proxy/``, ``registration/``), one
+    desktop path missing its subdirectory, and two mermaid nodes naming modules
+    that no longer exist (``registration_result``, ``payment_wire``).
+
+    Deliberate silences, so it never fires on something it cannot judge:
+
+    * a token outside :data:`PATH_ROOTS` is not a claim about this tree;
+    * a backticked token that is not *exactly one path* never matches
+      :data:`PATH_REF`'s full-token shape, so it is never judged -- that is how
+      a glob (``sms_tool/*.py``), a command (``scripts/format_guard.py --fix``),
+      a call (``...edge_challenge_verdict(response)``) and a multi-path cell
+      (``tests/payment tests/config``) stay silent;
+    * :data:`PATH_OPAQUE` restates the same property inside the regex. Like the
+      glob guard in :func:`check_csharp_file_refs`, it is **unreachable today**
+      and becomes load-bearing the moment the character class is widened;
+    * a token that is neither a known extension nor a trailing-slash directory
+      is prose, not a pointer (``sms_tool/cli._load_heavy_deps`` names a
+      function);
+    * a token naming a build-output or cache segment (:data:`GENERATED_SEGMENTS`)
+      is generated state, absent from a clean checkout;
+    * a path listed in :data:`UNTRACKED_BY_DESIGN` is absent by design;
+    * a reference the same line negates is a statement about absence;
+    * ADR bodies are exempt (:data:`PATH_EXEMPT_PREFIXES`) -- see that constant.
+
+    Consequence worth knowing: writing a path that was deleted requires dropping
+    the anchor (name the module without ``sms_tool/``) or saying it is gone. A
+    backticked repository path is a **claim that the path exists**.
+    """
+    for rel in DOCS:
+        if rel.startswith(PATH_EXEMPT_PREFIXES):
+            continue
+        path = ROOT / rel
+        if not path.is_file():
+            continue
+        for lineno, text in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for match in PATH_REF.finditer(text):
+                token = match.group(1)
+                if not token.startswith(PATH_ROOTS):
+                    continue
+                if any(char in token for char in PATH_OPAQUE):
+                    continue
+                if not (token.endswith("/") or token.endswith(PATH_SUFFIXES)):
+                    continue
+                if GENERATED_SEGMENTS.intersection(Path(token).parts):
+                    continue
+                if token in UNTRACKED_BY_DESIGN:
+                    continue
+                if PATH_NEGATION.search(text[: match.start()]):
+                    continue
+                if (ROOT / token.rstrip("/")).exists():
+                    continue
+                failures.append(f"{rel}:{lineno} documented path does not exist: {token}")
+
+
+def _csharp_index() -> set[str]:
+    """Every ``.cs`` basename under :data:`CSHARP_ROOTS`, build output excluded."""
+    names: set[str] = set()
+    for root in CSHARP_ROOTS:
+        base = ROOT / root
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*.cs"):
+            parts = path.relative_to(ROOT).parts
+            if "obj" in parts or "bin" in parts:
+                continue
+            names.add(path.name)
+    return names
+
+
+def main() -> int:
+    def release_key(path: Path) -> tuple[int, ...]:
+        match = re.search(r"release-v(\d+(?:\.\d+)+)\.md$", path.name)
+        return tuple(int(part) for part in match.group(1).split(".")) if match else ()
+
+    # Release notes live in docs/releases/ (archived 2026-09-06).
+    releases = sorted((ROOT / "docs" / "releases").glob("release-v*.md"), key=release_key)
+    if not releases:
+        print("No release notes found")
+        return 1
+    latest = releases[-1].name
+    failures: list[str] = []
+    for path in (ROOT / "README.md", ROOT / "README_EN.md", ROOT / "docs" / "README.md"):
+        text = path.read_text(encoding="utf-8")
+        if latest not in text:
+            failures.append(f"{path.relative_to(ROOT)} does not point to {latest}")
+    architecture = (ROOT / "docs" / "architecture.md").read_text(encoding="utf-8")
+    if "Half-migrated" in architecture or "半迁移" in architecture:
+        failures.append("architecture.md still describes providers as half-migrated")
+    for path in (ROOT / "docs" / "directory-map.md", ROOT / "docs" / "architecture.md"):
+        for ref in re.findall(r"`(sms_tool/providers/[^`]+\.py)`", path.read_text(encoding="utf-8")):
+            if not (ROOT / ref).is_file():
+                failures.append(f"missing documented path: {ref}")
+
+    check_line_refs(failures)
+    check_symbol_tables(failures)
+    check_csharp_file_refs(failures)
+    check_path_refs(failures)
+
+    if failures:
+        print("Documentation consistency check failed")
+        print("\n".join(failures))
+        print("hint: python scripts/refresh_doc_symbol_lines.py --apply")
+        return 1
+    print(f"Documentation consistency check passed ({latest})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

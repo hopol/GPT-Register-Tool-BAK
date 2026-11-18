@@ -1,0 +1,530 @@
+"""Environment self-check ("doctor") shared by CLI, installer and desktop.
+
+The dependency checks below previously lived only in ``scripts/preflight_env.py``
+(a manual README step), so a fresh install had no single command to answer
+"why does this machine fail".  ``python -m sms_tool --doctor`` aggregates them
+plus config completeness into one offline report; ``--doctor --json`` emits the
+same report machine-readably for the WPF first-launch probe and the installer's
+post-install verification.
+
+Statuses: ``ok`` / ``warn`` (optional dependency or non-blocking config gap) /
+``fail`` (hard requirement missing).  Exit code = number of failed checks.
+"""
+
+from __future__ import annotations
+
+import importlib.metadata
+import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+from .config import SHARD_FILES
+from .kernel.paths import resolve_config_file
+
+
+def _check(name: str, status: str, detail: str = "", hint: str = "") -> dict[str, str]:
+    return {"name": name, "status": status, "detail": detail, "hint": hint}
+
+
+def _probe_python() -> dict[str, str]:
+    version = sys.version_info
+    detail = f"{sys.version.split()[0]} ({sys.executable})"
+    if version < (3, 10):
+        return _check("python", "fail", detail, "Python 3.10+ is required")
+    return _check("python", "ok", detail)
+
+
+def _probe_node() -> dict[str, str]:
+    binary = os.environ.get("OPENAI_SENTINEL_NODE_PATH") or shutil.which("node")
+    if not binary:
+        return _check(
+            "node",
+            "fail",
+            "not found on PATH",
+            "install Node.js LTS (Sentinel token extraction shells out to node)",
+        )
+    try:
+        proc = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=15)
+        version = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+    except Exception as exc:  # noqa: BLE001 - any launch failure is the finding
+        return _check("node", "fail", binary, f"node exists but failed to run: {type(exc).__name__}")
+    if proc.returncode != 0:
+        return _check("node", "fail", binary, f"node --version exited {proc.returncode}")
+    return _check("node", "ok", f"{version} ({binary})")
+
+
+def _probe_sentinel_runtime() -> dict[str, str]:
+    """Node + vendored bundle + one offline mint (``sentinel.selfcheck``).
+
+    ``_probe_node`` answers "is there a node binary"; this answers "can it mint a
+    token".  The two failures that cost real accounts — a corrupted vendored
+    asset and a runner that loads but cannot produce ``p``/``t`` — are invisible
+    to a version string and only surface at ``create_account``, after the mailbox
+    and its OTP are spent.  The mint is offline (synthetic challenge), so this
+    stays a no-network probe.
+    """
+    from .sentinel.selfcheck import run_selfcheck
+
+    report = run_selfcheck()
+    detail = "bundle=%s node=%s mint=%s" % (report["bundle"], report["node"], report["mint"])
+    if report["ok"]:
+        return _check("sentinel_runtime", "ok", detail)
+    return _check(
+        "sentinel_runtime",
+        "fail",
+        detail,
+        "re-vendor sms_tool/sentinel/runtime (hash mismatch) or install Node.js >= 18; "
+        "run `python -m sms_tool.sentinel.selfcheck` for the full reason",
+    )
+
+
+def _probe_playwright() -> dict[str, str]:
+    """Presence + version, plus the browser cache, without importing the package.
+
+    Importing ``playwright.sync_api`` and starting it just to ask where chromium
+    lives cost ~200 ms on every ``--doctor`` (the desktop first-launch probe
+    included). The installed release is the evidence that matters, and the
+    browser directory is a filesystem fact; the engine still gets a real launch
+    on the first registration run.
+    """
+    try:
+        spec = importlib.util.find_spec("playwright")
+    except (ImportError, ValueError):
+        spec = None
+    if spec is None:
+        return _check(
+            "playwright",
+            "fail",
+            "package not installed",
+            "python -m pip install playwright",
+        )
+    version = _distribution_version("playwright") or "installed"
+    browsers = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or _default_browsers_dir())
+    try:
+        has_chromium = browsers.is_dir() and any(entry.name.startswith("chromium-") for entry in browsers.iterdir())
+    except OSError:
+        has_chromium = False
+    if has_chromium:
+        return _check("playwright", "ok", f"{version} ({browsers})")
+    return _check(
+        "playwright",
+        "fail",
+        f"{version}; chromium not found under {browsers}",
+        "python -m playwright install chromium",
+    )
+
+
+def _default_browsers_dir() -> Path:
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "ms-playwright"
+    return Path.home() / ".cache" / "ms-playwright"
+
+
+def _distribution_version(distribution: str) -> str:
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return ""
+
+
+def _probe_curl_cffi() -> dict[str, str]:
+    """Version gate only: 0.15/0.16 are the releases that carry the profile API.
+
+    The old probe additionally imported ``BrowserType``; that import (~180 ms)
+    proved only what the version already states, so the pin is the evidence.
+    """
+    try:
+        spec = importlib.util.find_spec("curl_cffi")
+    except (ImportError, ValueError):
+        spec = None
+    if spec is None:
+        return _check(
+            "curl_cffi",
+            "fail",
+            "package not installed",
+            "python -m pip install 'curl_cffi>=0.15.0,<0.17'",
+        )
+    version = _distribution_version("curl_cffi")
+    if not version.startswith(("0.15.", "0.16.")):
+        return _check(
+            "curl_cffi",
+            "fail",
+            f"version {version or 'unknown'}",
+            "registration requires curl_cffi 0.15.x or 0.16.x (chrome146 TLS profile)",
+        )
+    return _check("curl_cffi", "ok", f"{version} (impersonation profiles available)")
+
+
+def _probe_import(
+    name: str,
+    display: str,
+    purpose: str,
+    *,
+    required: bool,
+    distribution: str = "",
+) -> dict[str, str]:
+    """Presence probe that does not execute the package's import side effects."""
+    try:
+        spec = importlib.util.find_spec(name)
+    except (ImportError, ValueError):
+        spec = None
+    if spec is not None:
+        version = _distribution_version(distribution or name)
+        return _check(display, "ok", f"installed ({version})" if version else "installed")
+    status = "fail" if required else "warn"
+    hint = f"python -m pip install {name}" + ("" if required else f"  (only needed for {purpose})")
+    return _check(display, status, "not installed", hint)
+
+
+def _probe_requests() -> dict[str, str]:
+    return _probe_import("requests", "requests", "", required=True)
+
+
+def _phone_provider_rows(config: Mapping[str, Any]) -> list[dict[str, object]]:
+    """Per-provider SMS key readiness, or ``[]`` when it cannot be determined.
+
+    Imported lazily on purpose: ``doctor`` has to stay runnable on a machine
+    where the registration dependencies are not installed yet -- that is
+    precisely the machine it exists to diagnose.
+    """
+    try:
+        from .phone_reuse import provider_key_status
+    except Exception:  # pragma: no cover - advisory only
+        return []
+    section = config.get("phone_reuse")
+    try:
+        return provider_key_status(dict(section) if isinstance(section, Mapping) else {})
+    except Exception:  # pragma: no cover - advisory only
+        return []
+
+
+def _missing_key_hint(provider: str) -> str:
+    """The shared "set this key" instruction, with a fallback.
+
+    Guarded on purpose: ``doctor`` has to be able to *say* what is missing on a
+    machine where the package will not import -- that is exactly the machine the
+    hint is written for, so a failed import must not cost the message.
+    """
+    try:
+        from .phone_reuse import missing_key_hint
+
+        return missing_key_hint(provider)
+    except Exception:  # pragma: no cover - advisory only
+        return f"set phone_reuse.{provider}.api_key in proxy.json, or its provider env var"
+
+
+def _phone_key_collisions(config: Mapping[str, Any]) -> list[str]:
+    """Providers sharing one api_key, or ``[]``.
+
+    Lazy import for the same reason as :func:`_phone_provider_rows`: ``doctor``
+    has to stay runnable on a machine where the registration dependencies are
+    not installed yet.
+    """
+    try:
+        from .phone_reuse import provider_key_collisions
+    except Exception:  # pragma: no cover - advisory only
+        return []
+    section = config.get("phone_reuse")
+    try:
+        return provider_key_collisions(dict(section) if isinstance(section, Mapping) else {})
+    except Exception:  # pragma: no cover - advisory only
+        return []
+
+
+def _check_phone_providers(config: Mapping[str, Any]) -> dict[str, str]:
+    """Warn when the SMS provider keys cannot be right.
+
+    Two conditions, both warn rather than fail:
+
+    1. The provider ``phone_reuse.source`` selects has no usable key -- that is
+       the one that blocks a run.
+    2. Two or more providers share one *resolved* key. No single vendor account
+       serves two of these registries, so a shared key always means a save wrote
+       one vendor's credential into another vendor's section. Measured
+       2026-09-23: one pass through the desktop's 设置 → 接码供应商 dropdown did
+       exactly that for three providers, and every vendor then answered with a
+       credential error that the desktop rendered as "无法读取 OpenAI 号码地区和价格档位"
+       -- a message naming neither the key nor the section, so a stale
+       credential looked like a broken vendor. This check is offline, which is
+       what lets it run on a machine with no network.
+
+    Only the selected provider can block a run, so the other three being
+    unconfigured is normal and must not become three separate warnings -- that
+    is how a report trains people to ignore it. All four are still named in the
+    detail, because "which providers do I have keys for at all" is the question
+    asked immediately after this check fails.
+
+    No key value is ever printed. ``origin`` distinguishes a literal in the
+    config from a value that came out of the environment -- invisible in a
+    successful run, which is exactly why "it works on one machine and not the
+    other" has no answer without it.
+    """
+    rows = _phone_provider_rows(config)
+    if not rows:
+        return _check(
+            "phone_providers",
+            "warn",
+            "could not determine provider key status",
+            "run `python -m sms_tool --doctor --json` from the project root",
+        )
+    selected = next((row for row in rows if row.get("selected")), rows[0])
+    summary = ", ".join("%s=%s" % (row["provider"], row["origin"] if row["configured"] else "missing") for row in rows)
+    collisions = _phone_key_collisions(config)
+    if collisions:
+        detail = "providers sharing one api_key: %s; %s" % (", ".join(collisions), summary)
+        hint = (
+            "Give each provider its own key: %s. A shared key means one vendor's "
+            "credential was written into another vendor's section -- on the desktop "
+            "that is the 设置 → 接码供应商 dropdown, which decides which section the "
+            "API Key box writes to." % ", ".join("phone_reuse.%s.api_key" % provider for provider in collisions)
+        )
+        if not selected["configured"]:
+            # Both facts, in this order: a missing key for the selected provider
+            # is what blocks a run, and letting the collision branch return first
+            # would hide it -- the collision is the more surprising finding, not
+            # the more urgent one.
+            detail = "selected=%s has no key; %s" % (selected["provider"], detail)
+            hint = _missing_key_hint(str(selected["provider"] or "")) + " " + hint
+        return _check("phone_providers", "warn", detail, hint)
+    if selected["configured"]:
+        return _check(
+            "phone_providers",
+            "ok",
+            "selected=%s (origin=%s, endpoint=%s); %s"
+            % (selected["provider"], selected["origin"], selected["endpoint"], summary),
+        )
+    return _check(
+        "phone_providers",
+        "warn",
+        "selected=%s has no key; %s" % (selected["provider"], summary),
+        _missing_key_hint(str(selected["provider"] or "")),
+    )
+
+
+def _probe_config(config: Mapping[str, Any], config_source: str) -> list[dict[str, str]]:
+    checks: list[dict[str, str]] = []
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    bundled = os.path.normcase(os.path.join(package_dir, "config.json"))
+    using_fallback = config_source and os.path.normcase(str(config_source)) == bundled
+    checks.append(
+        _check(
+            "config_source",
+            "warn" if using_fallback else "ok",
+            str(config_source or "unknown"),
+            ""
+            if not using_fallback
+            else "project-root config.json is missing; run `python -m sms_tool --init-config` to create the shards",
+        )
+    )
+
+    # A directory source is the canonical sharded layout, so "does it exist" is
+    # a question about the three files, not about the directory. Before this
+    # check a fresh machine reported `config_source: ok` for an empty config
+    # directory and then failed on the first command with
+    # "chatgpt must be an object".
+    source_path = Path(config_source) if config_source else None
+    if source_path is not None and source_path.is_dir():
+        missing = [filename for filename in SHARD_FILES.values() if not (source_path / filename).is_file()]
+        if missing:
+            checks.append(
+                _check(
+                    "config_shards",
+                    "warn",
+                    "missing " + ", ".join(missing),
+                    "run `python -m sms_tool --init-config` to create them from config.example.json",
+                )
+            )
+        else:
+            checks.append(_check("config_shards", "ok", ", ".join(SHARD_FILES.values()) + " present"))
+
+    _raw_proxy_cfg: object = config.get("proxy")
+    proxy_cfg: Mapping = _raw_proxy_cfg if isinstance(_raw_proxy_cfg, Mapping) else {}
+    pool = proxy_cfg.get("pool") or []
+    if str(proxy_cfg.get("default") or "").strip() or pool:
+        checks.append(_check("config_proxy", "ok", "proxy.default or proxy.pool configured"))
+    else:
+        checks.append(
+            _check(
+                "config_proxy",
+                "warn",
+                "no proxy configured",
+                "registration/payment flows need proxy.default or proxy.pool",
+            )
+        )
+
+    _raw_email_cfg: object = config.get("email_registration")
+    email_cfg: Mapping = _raw_email_cfg if isinstance(_raw_email_cfg, Mapping) else {}
+    token_file = str(email_cfg.get("token_file") or "").strip()
+    mailbox_sources: list[str] = []
+    if token_file:
+        resolved_token_file = resolve_config_file(token_file)
+        if resolved_token_file.is_file():
+            mailbox_sources.append(f"token_file:{resolved_token_file}")
+    for provider in ("remail", "smailr"):
+        _raw_provider_cfg: object = email_cfg.get(provider)
+        provider_cfg: Mapping = _raw_provider_cfg if isinstance(_raw_provider_cfg, Mapping) else {}
+        if provider_cfg.get("enabled") and str(provider_cfg.get("api_key") or "").strip():
+            mailbox_sources.append(provider)
+    cfworker_url = str(email_cfg.get("cfworker_url") or "").strip()
+    if cfworker_url:
+        mailbox_sources.append("cfworker")
+    if mailbox_sources:
+        checks.append(_check("config_mailbox", "ok", ", ".join(mailbox_sources)))
+    else:
+        checks.append(
+            _check(
+                "config_mailbox",
+                "warn",
+                "no usable mailbox source",
+                "configure email_registration.token_file, remail, smailr or cfworker",
+            )
+        )
+    checks.append(_check_phone_providers(config))
+    return checks
+
+
+def _probe_unread_config_keys() -> dict[str, str]:
+    """Report config values that no Python code path reads.
+
+    These are the worst kind of configuration: they look like they are doing
+    something, they survive review because the key name is plausible, and they
+    quietly do nothing. Reported as a warning, never a failure -- an unread key
+    is untidy, not broken, and failing would train people to ignore --doctor.
+
+    Scope is Python on purpose. The detector scans ``sms_tool/`` + ``services/``;
+    keys with a cited C# reader are excluded via
+    ``config_usage.CSHARP_CONSUMED_KEYS``, so the wording must not claim more
+    than the scan covers -- telling an operator that ``runtime.python_path`` has
+    no effect, while the desktop resolves its interpreter from it, is worse than
+    saying nothing.
+    """
+    try:
+        from .config_usage import cached_unread_config_keys
+
+        unread = cached_unread_config_keys()
+    except Exception as exc:  # pragma: no cover - advisory only
+        return _check("config_unread_keys", "warn", f"could not inspect config usage: {exc}")
+    if not unread:
+        return _check(
+            "config_unread_keys",
+            "ok",
+            "every configured key is read by Python source or a cited C# consumer",
+        )
+    return _check(
+        "config_unread_keys",
+        "warn",
+        "%d key(s) set but never read by Python source: %s"
+        % (len(unread), ", ".join(item.path for item in unread[:6]) + ("..." if len(unread) > 6 else "")),
+        "remove them or wire them up; run with --json for the full list",
+    )
+
+
+def run_doctor(
+    config: Mapping[str, Any] | None = None,
+    config_source: str = "",
+    *,
+    probes: Mapping[str, Callable[[], dict[str, str]]] | None = None,
+) -> dict[str, Any]:
+    """Run all checks and return the report dict (offline; no network calls)."""
+    default_probes: list[tuple[str, Callable[[], dict[str, str]]]] = [
+        ("python", _probe_python),
+        ("node", _probe_node),
+        # Kept next to "node" because the two answer different questions, and the
+        # difference only shows up at create_account (see the probe's docstring).
+        ("sentinel_runtime", _probe_sentinel_runtime),
+        ("playwright", _probe_playwright),
+        ("curl_cffi", _probe_curl_cffi),
+        ("requests", _probe_requests),
+        ("pyotp", lambda: _probe_import("pyotp", "pyotp", "TOTP 2FA enrollment", required=False)),
+        ("qrcode", lambda: _probe_import("qrcode", "qrcode", "UPI QR rendering", required=False)),
+        (
+            "nacl",
+            lambda: _probe_import("nacl", "pynacl", "Agent Identity signing", required=False, distribution="pynacl"),
+        ),
+        # Advisory, and injectable like every other probe: it walks the whole
+        # source tree, so tests must be able to stub it out.
+        ("config_unread_keys", _probe_unread_config_keys),
+    ]
+    checks: list[dict[str, str]] = []
+
+    def run_probe(item: tuple[str, Callable[[], dict[str, str]]]) -> dict[str, str]:
+        name, probe = item
+        override = (probes or {}).get(name)
+        try:
+            return override() if override else probe()
+        except Exception as exc:  # noqa: BLE001 - one broken probe must not kill the report
+            return _check(name, "warn", f"probe failed: {type(exc).__name__}")
+
+    # An injected ``probes`` mapping is the *whole* set, not a patch on top of the
+    # defaults: callers use it to run the report hermetically (the offline tests),
+    # and a probe they did not name would otherwise reach the real filesystem or
+    # spawn node behind their back.
+    selected = [(name, probe) for name, probe in default_probes if probes is None or name in probes]
+
+    # Probes are independent and dominated by I/O (subprocess, filesystem,
+    # metadata), so run them concurrently. ``map`` preserves the declaration
+    # order, which the console report and the tests rely on.
+    with ThreadPoolExecutor(max_workers=max(1, min(8, len(selected)))) as pool:
+        checks.extend(pool.map(run_probe, selected))
+    checks.extend(_probe_config(config or {}, config_source))
+    failed = sum(1 for item in checks if item["status"] == "fail")
+    warned = sum(1 for item in checks if item["status"] == "warn")
+    # Full list for --json: the console line is truncated, and 60+ key names
+    # would bury every other check.
+    unread_detail = next((item for item in checks if item["name"] == "config_unread_keys"), None)
+    return {
+        "ok": failed == 0,
+        "failed": failed,
+        "warned": warned,
+        "checks": checks,
+        "unread_config_keys": (
+            [
+                {"path": item.path, "shards": list(item.shards), "in_example": item.in_example}
+                for item in unread_config_keys_safe()
+            ]
+            if unread_detail and unread_detail["status"] == "warn"
+            else []
+        ),
+        # Structured twin of the `phone_providers` check. The console line is a
+        # summary; the desktop first-launch probe wants the per-provider rows
+        # (endpoint included) rather than a string it would have to re-parse.
+        "phone_providers": _phone_provider_rows(config or {}),
+    }
+
+
+def unread_config_keys_safe() -> list:
+    try:
+        from .config_usage import cached_unread_config_keys
+
+        return list(cached_unread_config_keys())
+    except Exception:  # pragma: no cover - advisory only
+        return []
+
+
+def print_doctor_report(report: Mapping[str, Any]) -> None:
+    labels = {"ok": "[ OK ]", "warn": "[WARN]", "fail": "[FAIL]"}
+    failed = int(report.get("failed") or 0)
+    warned = int(report.get("warned") or 0)
+    print(f"doctor: {failed} failed, {warned} warning(s)")
+    for item in report["checks"]:
+        status = str(item.get("status") or "")
+        label = labels.get(status, "[ ?? ]")
+        name = str(item.get("name") or "")
+        detail = str(item.get("detail") or "")
+        line = f"{label} {name}"
+        if detail:
+            line += f": {detail}"
+        print(line)
+        if item.get("hint"):
+            print(f"         -> {item['hint']}")
+    if report.get("ok"):
+        print("doctor: environment ready")
+    else:
+        print("doctor: fix the [FAIL] items above before running registration/payment")

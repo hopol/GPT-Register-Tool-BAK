@@ -1,0 +1,272 @@
+# 注册链路线上受控对照 Runbook
+
+> **Scope.** 只负责「如何受控地做对照、看什么指标判定」。系统本身的行为见
+> [registration-architecture.md](registration-architecture.md) 与
+> [protocol-registration.md](protocol-registration.md)，本篇不复述。
+
+**机器可读台账。** 每个开关的决定（`kind` / `default` / `status` / 判读结论 / 到期日）记录在
+`scripts/experiment_ledger.json`；`scripts/experiment_ratchet.py` 在本表与本台账之间做交叉校验——
+每个 `ab` 条目的 id 与 `registration.<key>` 必须同时出现在两处，代码里读到的开关必须在台账里。
+新增开关而不登记，或台账引用了本表不存在的 id，pre-commit 与 CI 都会失败。
+
+本 runbook 描述**如何受控地执行**并**如何判读**三项"已落地但尚未线上对照"的改动：
+
+| # | 假设 | 开关 | 参考 |
+| --- | --- | --- | --- |
+| P0-1 | 预检打浏览器入口页比打 `auth.openai.com/log-in` 更少触发 Cloudflare | `registration.preflight_login_page`（`browser`/`legacy`） | `docs/audits/scans/scan-2026-10-01-protocol-registration-payment-link.md` §3 |
+| P0-2 | 预检失败路径确实把出口级拒绝识别为 Cloudflare 挑战 | 无（分类恒开，**仅观察**） | 同上 §3 P0-2 |
+| P1-3 | 密码页 Sentinel flow bundle 不降低注册成功率、不引入 Sentinel 类失败 | `registration.sentinel_password_bundle`（默认 `false`） | 同上 §3 P1-3 |
+| P1-4 | POST `user/register` 前先 GET `/create-account/password` 建立密码步事务状态，让服务端真正派发 OTP（修复「发码 200 但不派发」） | `registration.prime_create_account_password`（默认 `false`） | `steps._prime_create_account_password_page_enabled` docstring（2026-10-06 实测）；turb `navigate_create_account_password`、SunnyRegister `_submit_password` 均无条件执行 |
+| P1-5 | signup 泳道 `authorize/continue` body 声明 `screen_hint: "signup"` 不降低成功率，且可能修复同一不派发形状 | `registration.signup_continue_screen_hint`（默认 `false`） | SunnyRegister `_authorize_email` 每次都声明；本仓 login 泳道 09-14/09-16 实测已钉住同一字段差异（`_existing_login_continue_enabled`） |
+| P1-6 | POST `create_account` 前 GET `/about-you` 让页面状态与 Referer 声明一致，不降低成功率 | `registration.prime_about_you_page`（默认 `false`） | turb `navigate_about_you`（"先真实导航到 about-you"）；本仓密码页当年的同型缺口（`_prime_create_account_password_page`） |
+| P1-7 | `create_account` 对 `registration_disallowed` 按 `[8,20,45]s` 有界退避（每轮重铸 Sentinel）能挽救风险窗口期内的暂时拒绝 | `registration.create_account_disallowed_backoff`（默认 `false`） | SunnyRegister `_create_account` 实测（Remail 地址特别敏感）；本仓把该错误归入终态 `account` 类（`failure_registry`） |
+| P1-8 | 密码泳道 `authorize` 落 `/email-verification` 时，补发一次带 `screen_hint: "signup"` 的 `authorize/continue` 能把事务臂从 passwordless 扳回 signup（修复 P1-5 够不到的那个形状） | `registration.signup_email_verification_continue_hint`（默认 `false`） | `docs/audits/scans/scan-2026-10-07-protocol-registration.md` §4 P0-A；`steps._signup_email_verification_continue_hint_enabled` docstring |
+| P0-2b | 预检之后命中的出口级 Cloudflare 挑战，可由「同池换出口一次 + 重试同一请求」抳回（H1）；换出口仍不过时，交棒给浏览器能让账号完成注册（H2） | `registration.edge_challenge_rotate_exit`（默认 `false`）；`browser_handoff` **尚未落地**（见下） | `docs/audits/plans/plan-2026-10-05-inflow-challenge-handoff.md` §4；三臂 `observe` / `rotate` / `handoff` |
+| P1-9 | P1-4 的 prime 导航头不完整（缺 `sec-fetch-site` / `sec-fetch-user`），不是真实顶层导航 —— 补齐后 prime 才能建立服务端真正读取的密码页状态，让 `email-otp/send` 派发验证码 | `registration.prime_navigation_headers`（默认 `false`）；两臂都开 `prime_create_account_password` | `docs/audits/scans/scan-2026-10-07-protocol-registration.md` §4 P1-A；turb `navigate_create_account_password`（发齐两头且落点错即 `raise`） |
+| P1-10 | 密码泳道首个 signin 的 `screen_hint` 从 `signup` 改为 `login_or_signup`（turb 的形状）能把事务臂从 `passwordless_signup` 扳回 signup 臂，让 `email-otp/send` 真正派发 | `registration.signin_screen_hint_login_or_signup`（默认 `false`）；**只改首个尝试的 `screen_hint`**，`authorize/continue` 行为两臂恒定 | 2026-10-07/08 两轮线上（hint@lajiao / default@fireside，不同邮箱）形状完全相同 ⇒ 出口/邮箱/continue 声明均被排除；turb `signin_openai`（`screen_hint=login_or_signup` + `prompt=login`，不发 continue） |
+| P1-11 | 在 P1-10（`login_or_signup`）之上再声明 `prompt=login`（turb 的完整 signin 形状）能把事务臂从 `passwordless_signup` 扳回 signup 臂，让 `email-otp/send` 真正派发 | `registration.signin_prompt_login`（默认 `false`）；**只改首个尝试的 `prompt`**，两臂都开 `signin_screen_hint_login_or_signup` | 2026-10-07/08 线上：P1-10 治疗臂 n=2（烧过 + 全新邮箱）均为 `passwordless_signup` 且 `original_screen_hint` 跟着声明变 ⇒ 声明的 screen 被记录但不选臂；turb `signin_openai` |
+| P1-12 | 在 SunnyRegister 的 signin 形状（`prompt=login` + `screen_hint=signup`）上再声明 `locale=ja-JP` 能把事务臂从 `passwordless_*` 扳回 signup 臂，让 `email-otp/send` 真正派发 | `registration.signin_locale_ja_jp`（默认 `false`）；**只加 `locale` 查询参数**，两臂都开 `signin_prompt_login`、都关 `signin_screen_hint_login_or_signup` | SunnyRegister `_start_next_auth`（唯一声明 locale 的参考）；P1-11 实测 `prompt=login` 会把臂推到 `passwordless_login` + `invalid_auth_step` |
+| P1-13 | turb 的 signin/authorize 上下文（signin 不带 `device_id`/passkey capabilities/`ccaps`；authorize 去掉 `ext-passkey-client-capabilities`、`ccaps="login_methods chatgpt_login_finalizer_v1"`、加 `auth_return_target_category=chatgpt_home` 与 `ui_locales`）能选中 signup 臂，让 `email-otp/send` 真正派发 | `registration.turb_signin_authorize_context`（默认 `false`）；**一整束上下文**（turb 是同一份 HAR 上一起改的，故为一个开关） | `myfanhua/turb-gpt-free-register@ffcda12` `core/chatgpt_auth.py:17,33`（2026-09-14 成功样本注释）；`docs/audits/scans/scan-2026-10-10-protocol-registration.md` §D1 |
+| P1-14 | turb 把密码页落点做成**致命**（不在 `/create-account/password` 就 `raise`）能区分「状态没建立」与「状态已建立但服务端仍不派发」 | `registration.prime_password_page_fatal`（默认 `false`）；两臂都开 `prime_create_account_password` + `prime_navigation_headers` | turb `navigate_create_account_password`（落点错即 raise）；本仓 prime 刻意非致命（只报告） |
+| P1-15 | turb 在 `email-otp/send` 导航上带 `sec-fetch-site: same-origin` + `sec-fetch-user: ?1`，本仓只带 `Accept` + `Referer` | `registration.otp_navigation_headers`（默认 `false`）；只改 send 的两个头 | turb `navigate_email_otp_send`；本仓 P1-9 对密码页已测过同一课 |
+| P1-16 | turb 给 `email-otp/validate` 带新铸的 `authorize_continue` Sentinel + SO，本仓 `use_sentinel=False` | `registration.otp_validate_sentinel`（默认 `false`）；只决定 validate 是否带头 | turb `openai_auth.py` + `config/openai_protocol.py::SEND_SENTINEL_ON_EMAIL_OTP_VALIDATE=True`（注释：2026-09-14 成功样本同时带 Sentinel 与 SO）。**潜在差异，非当前失败成因**（现在根本收不到码） |
+| P1-17 | OTP 验证后若 `page.type=external_url` 或 `continue_url` 已是回调，跳过 `create_account` 能避开 `invalid_auth_step` | `registration.otp_external_url_branch`（默认 `false`）；只加这一条分支 | turb `main.py::run_registration`（`direct_oauth_after_otp`）；本仓原本无此分支 |
+| P2-1 | 把 `oai-did` + `auth_session_logging_id` 做成**邮箱的纯函数**（而不是每次尝试随机），能让服务端不再给事务挂 `passwordless_email_otp_send_pending`（设备层 H1） | `registration.device_identity_seeded_by_email`（默认 `false`）；只改这两个 id 的**来源**，Sentinel SID / datadog / 指纹档案不变；已注册地址仍用库里存的 id | `plan-2026-10-10-fingerprint-device-layer.md` §3 S1；turb `core/session.py:53-74`（盐为本仓私有，**不**用 turb 字面量） |
+| P3-1 | passwordless 泳道假设「authorize+`login_hint` 已派发首码、只轮询」；10-11 浏览器 HAR 显示验证页**自己** POST `passwordless/send-otp`（空体、新铸 `authorize_continue` Sentinel、`x-access-flow-invocation-id` + `x-openai-document-navigation-id`），响应 `pending=false`。显式发这一次能让码真正落进邮箱 | `registration.passwordless_explicit_send_otp`（仓库默认 `true`，自 10-11 起；A/B 基线臂必须显式写 `false`）；只决定是否多发这一个 POST（仅 passwordless 泳道） | `docs/audits/scans/scan-2026-10-11-har-passwordless-signup.md`；HAR `C:\Users\29514\Downloads\chatgpt.com-1.har`（不入库） |
+| P1-18 | 现行网页客户端把**`email_otp_validate`**（不是 `authorize_continue`）绑在 `POST /api/accounts/email-otp/validate` 上；若服务端校验这个字段，`authorize_continue` 臂会在 validate 上失败（`wrong_email_otp_code` / 409），换成端点点名的 flow 则不差 | `registration.otp_validate_email_otp_validate_flow`（默认 `false` = `authorize_continue`）；**两臂都开 `registration.otp_validate_sentinel`**（它决定是否带 pair，是本变量的载体而不是变量本身），机制行 `OTP validate sentinel flow=email_otp_validate` **仅治疗臂**发出 | 2026-10-28 HAR（Codex webview）：validate 的 `openai-sentinel-token.flow` 与 `openai-sentinel-so-token.flow` 同为 `email_otp_validate`，同事务 send-otp=`authorize_continue`、create_account=`oauth_create_account`；`docs/audits/scans/scan-2026-10-31-har-passwordless-codex-webview.md` §3；**已跑（2026-10-31，30/臂，powered）**：29/30 vs 30/30，Δ=0.0333 < 0.05 ⇒ `inconclusive`，两臂操纵检查均过，唯一失败是 `network`（非 `auth_state`）⇒ flow 名不被该端点校验，开关保持默认 `false`（§8）|
+
+工具：`scripts/registration_ab.py`（`plan` / `collect` / `compare`）。
+
+> **边界**：该工具**不发起任何网络或注册流量**，只做设计打印、日志/报告归一化与对比。
+> 它给出的 `verdict` 是**受控对照的判定辅助**，不是成功率结论；离线测试同样不能建立
+> 线上成功率（见 [`protocol-registration.md`](protocol-registration.md) 的 Validation limits）。
+> 真实运行必须由操作者在受控批次上执行。
+
+---
+
+## 1. 前置条件（必须全部满足）
+
+- 同一邮箱批次：同一 provider、同一数量档、同一有效期形态。
+- 同一出口池：同一 `proxy_seeds` / lane 配置；对照期间不轮换池子。
+- 同一注册 driver、并发数、阶段超时与预检预算。
+- 同一时间窗：Cloudflare 负载有时段性；两个 arm 尽量相邻或交叉进行。
+- 已捕获每个 arm 的：
+  - 运行日志 `runtime/logs/processes/<pid>/sms_tool.log`（预检行在这里）
+  - 批次报告 `runtime/registration_target_<batch_id>.json`（含 `funnel`）
+  - 该次运行使用的 `config.json` 快照（**操纵检查**，缺它则 `compare` 拒绝判定）
+
+> ⚠️ **批次报告的来源（2026-10-07 扫描 §1.2 的实际阻塞点）。** 目前只有
+> `--target-at200` 会写 `runtime/registration_target_<batch_id>.json`；**普通批次与桌面端
+> 只把 report 经 IPC 发出，不落盘**，所以上一轮两个 arm 的 `funnel` 都是 `null`、
+> `attempted` 不可算。跑 P1-8 / P1-9 时必须二选一：
+> 1. 用 `--target-at200`（需 `--buy-remail-mailbox` 或 `--remail-service-mode`）跑批次；
+> 2. 或从 `runtime/logs/processes/<pid>/backend_stdout.jsonl` 里取最后一条 `result` 帧的
+>    `payload` 存成 JSON 文件（`{"funnel": {...}}`）后传给 `--funnel`。
+
+### P1-8 / P1-9 / P1-10 / P1-11 / P1-12 的额外前置
+
+- **密码泳道**：`--registration-mode password`（生产 `runtime.json` 未声明 `registration_mode`，
+  默认是 `passwordless`，而这几个开关在 passwordless 泳道上是 no-op —— 机制门禁会直接判
+  `manipulation_failed`）。
+- **关掉 pulse**：`registration.pulse.enabled = false`。生产默认为 `true`。
+  2026-10-08 起，事务臂形状（密码泳道 + dump 里 `email_verification_mode=passwordless_*`）
+  已带 `arm_mismatch` 后缀，`registration_pulse._is_otp_ban_signal` 对它短路，不再换池；
+  但**裸** `email_otp_send_stuck`（dump 不可读 / 臂读不出来）仍算派发侧候选信号 ⇒ 对照期
+  仍应关 pulse，否则单账号 wave 会换池 + 60s 冷却，破坏「同一出口池」前提
+  （2026-10-07 扫描 §5.3）。
+- **主读数**：`client_auth_session_dump[after_otp_send]` 里 **`passwordless_email_otp_send_pending`
+  是否消失**。不是落点 URL，也**不是** `email_verification_mode` —— 10-06/07 的 run 已经落点正确、
+  事务臂也记录正确，而 10-08 的 signin 系列实测**唯一与成败完全相关**的读数就是这条挂起键
+  （见 `docs/releases/release-v2026.10.08.md` 与 `docs/audits/landings/landing-2026-10-08-signin-*.md`）。
+  `email_verification_mode` 降为**次要**读数（只回答「服务端选了哪条臂」）。
+- **样本**：每臂 **≥ 30** 个 attempted（`scripts/registration_ab.py` 的 `MIN_ARM_ATTEMPTED`；
+  `compare` 在不足时判 `underpowered`，不得拿小样本下结论）。
+- **P1-11 两臂都开 P1-10**：turb 把 `prompt=login` 与 `screen_hint=login_or_signup` 配对，
+  所以 `p1-11` 的对照是 `login_or_signup` vs `login_or_signup + prompt=login`；只开
+  `signin_prompt_login` 而 `signin_screen_hint_login_or_signup=false` 测的是另一个组合，不算本实验。
+
+---
+
+## 2. 读设计
+
+```powershell
+python scripts/registration_ab.py plan
+```
+
+输出为 JSON：每个实验的假设、开关、arms、held-constant 变量、主指标与判定规则。
+阈值与手数在脚本顶部预注册（`MIN_ARM_ATTEMPTED`、`RATE_DELTA`），**看到数据后不得改**。
+
+---
+
+## 3. 跑与采集
+
+以 P0-1 为例（P1-3/P1-4/P1-5 同法，仅换 `--experiment` 与 arms；P1-4 的 arm 名为 `default`/`prime`，P1-5 为 `default`/`hint`）：
+
+```powershell
+# arm A：browser（默认）
+#   1) 确认 config.json 的 registration.preflight_login_page == "browser"
+#   2) 跑常规注册批次，记下 batch_id 与进程日志路径
+python scripts/registration_ab.py collect `
+  --experiment p0-1-preflight-endpoint --arm browser `
+  --log runtime/logs/processes/<pid>/sms_tool.log `
+  --funnel runtime/registration_target_<batch_id>.json `
+  --config config.json
+
+# arm B：legacy
+#   1) 把 config.json 改为 registration.preflight_login_page == "legacy"
+#   2) 跑同规模批次
+python scripts/registration_ab.py collect `
+  --experiment p0-1-preflight-endpoint --arm legacy `
+  --log runtime/logs/processes/<pid2>/sms_tool.log `
+  --funnel runtime/registration_target_<batch_id2>.json `
+  --config config.json
+```
+
+记录落在 `runtime/ab/<experiment>__<arm>.json`。
+
+> `collect` 会校验 `config.json` 与该 arm 期望的开关值一致；不一致时打印 WARNING 且记录
+> `toggle_verified=false`，`compare` 将直接拒绝判定 —— 这是防止"以为改了、其实没改"的操纵检查。
+>
+> 🔴 **第二道操纵检查（机制行）**：`collect` 还会在 arm 的运行日志里找该实验的**独占机制行**
+> （见下表）。开了开关但日志里没有那行 ⇒ 记 `mechanism_ok=false`，`compare` 一律返回
+> `manipulation_failed`（**优先于** `underpowered`），**不进速率判定**。这正是 P1-5 那一轮的
+> 教训：`signup_continue_screen_hint` 开着但早返回让它根本没执行，5/5 的失败被误读成
+> "开关无效"。🔴 **机制行必须走 `sms_tool.operator_output.emit`**：它一次调用同时喂
+> `sms_tool.log`（logging）与 `backend_stdout.jsonl`（stdout 镜像）两条通道。裸 `print`
+> **只**进 `backend_stdout.jsonl`，而本节的 `collect` 示例传的是 `sms_tool.log` —— 那样
+> 登记机制行的实验在结构上不可判定（2026-10-10 扫描 P1-A′；P1-6 / P1-7 已改为 `emit`）。
+>
+> | 实验 | 机制行（日志里必须出现/必须不出现） |
+> | --- | --- |
+> | P1-4 | `Create account password page` |
+> | P1-5 | `Signup continue declares screen_hint=signup` |
+> | P1-6 | `About you page prime` |
+> | P1-7 | `Create account temporarily disallowed` |
+> | P1-8 | `Email verification continue hint` |
+> | P1-9 | `Password page navigation headers` |
+> | P1-10 | `Signin screen_hint=login_or_signup` |
+> | P1-11 | `Signin prompt=login` |
+> | P1-12 | `Signin locale=ja-JP` |
+> | P1-13 | `Turb signin/authorize context` |
+> | P1-14 | `Password page landing is fatal` |
+> | P1-15 | `OTP navigation headers` |
+> | P1-16 | `OTP validate sentinel` |
+> | P1-17 | `OTP external_url branch` |
+> | P2-1 | `Device identity seeded by email` |
+> | P3-1 | `Passwordless explicit send-otp` |
+>
+> 🔴 **机制行必须落在开关自己的分支内。** P1-5 原先登记的是 `Signup username continue`，
+> 那是 `_continue_signup_username` 的**基线** print：开关开或关都会打，P1-8 的强制路径也会打。
+> 结果这道门禁两头都不准 —— 对照臂只要走到该函数（落点不在密码页/邮箱验证页）就会被误判
+> `manipulation_failed`，而 P1-8 开着时 P1-5 的 hint 臂又会在 P1-8 的路径上「机制通过」
+> （2026-10-07 扫描 §5.2）。现改为 `if force or ...` 分支内、且 `not force` 才发的独占行；
+> P1-5 的 `hold_constant` 同时钉 `registration.signup_email_verification_continue_hint=false`。
+>
+> P0-1 / P0-2 / P1-3 **未注册机制行**：P0-1 的两个 arm 值是端点名（字符串），无法推出机制行应在哪一侧；
+> P1-3 的 bundle 行走 logger（`Sentinel password flow bundle primed`），不保证落在 stdout 日志里。
+> 它们的 `mechanism_ok` 是 `null`（"未检查"），不会被判 `manipulation_failed`。
+>
+> 🔴 **P0-2b 故意不注册机制行**：它的机制检查是**有条件的** —— 换出口那行
+> （`[Edge] Cloudflare challenge on this exit; rotated`）只有在**确实发生了挑战**时才会出现。
+> 用常开的机制门禁会把「这个时间窗没发生挑战」误判成 `manipulation_failed`。
+> 所以它的机制检查写在判定规则里，返回 `not_judgeable`（见下表），而不是交给机制门禁。
+>
+> 🔴 **P1-7 同样是有条件的机制行**，但它的机制行有用（是「重试真的发生了」的证据），所以
+> 保留登记，另加 `"conditional": true`：机制行缺失时 `build_record` 记 `mechanism_ok=null`
+> 而不是 `false`，`compare` 在两臂都没看到该行时返回 `not_judgeable`（「这个窗口没撞到
+> `registration_disallowed`，什么都没测到」），而不是 `manipulation_failed`。P0-2b 走的是
+> 另一条路（不登记机制行、把检查写进判定规则），两者语义一致。
+
+---
+
+## 4. 对比
+
+```powershell
+python scripts/registration_ab.py compare `
+  --arm browser=runtime/ab/p0-1-preflight-endpoint__browser.json `
+  --arm legacy=runtime/ab/p0-1-preflight-endpoint__legacy.json
+```
+
+输出含各 arm 的 `attempted` / `registered_per_attempted` / 预检探测数 / `cloudflare_rate` /
+`no_healthy_route` / 失败分类，以及 `verdict` 与 `reason`。
+
+---
+
+## 5. 判定规则（预注册）
+
+- 每个 arm 的 `attempted` 必须 ≥ `MIN_ARM_ATTEMPTED`（30），否则 `underpowered`。
+- 速率差阈值 `RATE_DELTA = 0.05`。
+
+| 实验 | 判定 |
+| --- | --- |
+| P0-1 | `cloudflare_rate` 更低且差距 > 0.05、且 `no_healthy_route` 不更高的一方胜；否则 `inconclusive` |
+| P0-2 | `observation_only`：只报每出口挑战计数；流程内换出口需**单独开关 + 单独 A/B**才能落地 |
+| P1-3 | bundle 成功率不低 0.05 以上且 Sentinel 类失败不增长 → `favor_bundle`；Sentinel 类失败增长或成功率低 0.05 以上 → `keep_default_off` |
+| P1-4 | prime 成功率高出 0.05 以上且 mailbox 类失败不增长 → `favor_prime`；成功率高出但 mailbox 类反增 → `favor_prime_with_red_flag`（机制与速率矛盾，须人工排查）；低 0.05 以上 → `keep_default_off`；否则 `inconclusive` |
+| P1-5 | hint 成功率高出 0.05 以上且 `auth_state` 类失败不增长 → `favor_hint`；`auth_state` 类增长（声明的 screen 与服务端事务解读冲突）→ 无论速率一律 `keep_default_off`；低 0.05 以上 → `keep_default_off`；否则 `inconclusive` |
+| P1-6 | prime 成功率高出 0.05 以上且 `account` 类失败不增长 → `favor_prime`；`account` 类增长（导航扰动事务）→ 一律 `keep_default_off`；低 0.05 以上 → `keep_default_off`；否则 `inconclusive` |
+| P1-7 | backoff 成功率高出 0.05 以上 → `favor_backoff`；低 0.05 以上（拒绝是永久性的，重试只添延迟）→ `keep_default_off`；否则 `inconclusive` |
+| P1-8 | hint 成功率高出 0.05 以上且 `auth_state` 类失败不增长 → `favor_hint`；`auth_state` 类增长（补发的 POST 与服务端事务解读冲突）→ 一律 `keep_default_off`；低 0.05 以上 → `keep_default_off`；否则 `inconclusive`。主机制读数看 `passwordless_email_otp_send_pending` 是否从 `after_otp_send` 消失（`email_verification_mode` 只作次要读数） |
+| P1-9 | `headers` 成功率高出 0.05 以上且 `auth_state` 类失败不增长 → `favor_headers`；`auth_state` 类增长 → 一律 `keep_default_off`；低 0.05 以上 → `keep_default_off`；否则 `inconclusive`。主机制读数同上 |
+| P1-10 | `login_or_signup` 成功率高出 0.05 以上且 `auth_state` 类失败不增长 → `favor_login_or_signup`；`auth_state` 类增长（声明的 signin screen 与服务端事务解读冲突）→ 一律 `keep_default_off`；低 0.05 以上 → `keep_default_off`；否则 `inconclusive`。主机制读数同上 |
+| P1-11 | `prompt_login` 成功率高出 0.05 以上且 `auth_state` 类失败不增长 → `favor_prompt_login`；`auth_state` 类增长 → 一律 `keep_default_off`；低 0.05 以上 → `keep_default_off`；否则 `inconclusive`。主机制读数同上 |
+| P1-12 | `locale` 成功率高出 0.05 以上且 `auth_state` 类失败不增长 → `favor_locale`；`auth_state` 类增长 → 一律 `keep_default_off`；低 0.05 以上 → `keep_default_off`；否则 `inconclusive`。主机制读数同上；两者都不动即关闭整个客户端 signin 形状家族 |
+| P1-13 | `turb` 成功率高出 0.05 以上且 `auth_state` 类失败不增长 → `favor_turb`；`auth_state` 类增长 → 一律 `keep_default_off`；低 0.05 以上 → `keep_default_off`；否则 `inconclusive`。主机制读数同上；不动即说明 signin/authorize 上下文也不是杠杆，下一候选是指纹/设备层 |
+| P1-14 | `fatal` 成功率高出 0.05 以上且 `auth_state` 类失败不增长 → `favor_fatal`；低 0.05 以上 → `keep_default_off`；否则 `inconclusive`。**有 `password_page_not_reached` 中止但速率不动不是假设失败**，而是「落点本来就没到达」的测量结果，下一个变量是 prime 本身（P1-9） |
+| P1-15 | `headers` 成功率高出 0.05 以上且 `mailbox` 类失败不增长 → `favor_headers`；低 0.05 以上 → `keep_default_off`；否则 `inconclusive`。主机制读数同上 |
+| P1-16 | `sentinel` 成功率高出 0.05 以上且 `sentinel` 类失败不增长 → `favor_sentinel`；低 0.05 以上或 `sentinel` 类失败增长 → `keep_default_off`；否则 `inconclusive`。**两臂都没收到码 ⇒ 不可判定**（validate 根本没被走到） |
+| P1-17 | `branch` 成功率高出 0.05 以上且 `auth_state` 类失败不增长 → `favor_branch`；低 0.05 以上 → `keep_default_off`；否则 `inconclusive`。**分支从未触发（没有一臂走到已验证的 OTP）⇒ `not_judgeable`**，不得读成「无效果」 |
+| P2-1 | `seeded` 成功率高出 0.05 以上且无新终态失败类别 → `favor_seeded`；低 0.05 以上 → `keep_default_off`；否则 `inconclusive`。`collect` 的机制行门禁（`Device identity seeded by email`）缺失 ⇒ `manipulation_failed`（harness 自动）。以下两条 **harness 不判，由操作者读 funnel**：两臂挂起键出现率都为 0% ⇒ 记作 `ceiling`；`seeded` 臂 `funnel.device_identity.seeded_by_email == 0`（标记在但 id 没换，例如全是已注册地址）⇒ 记作开关未生效；二者都**不是**对假设的证据。`seeded` 臂出现新终态类别（`sentinel_*` / `account_deactivated`）⇒ 停全部臂。不动即关闭 H1，剩 H2（全指纹 seed）与 H3（出口声誉） |
+| P3-1 | `explicit` 成功率高出 0.05 以上 → `favor_explicit`；低 0.05 以上 → `keep_default_off`；否则 `inconclusive`。`collect` 的机制行门禁（`Passwordless explicit send-otp`）缺失 ⇒ `manipulation_failed`（harness 自动）。**harness 不判、由操作者读 `Passwordless send-otp: status= pending= mode=` 行**：`explicit` 臂答 `pending=true` 或非 200，即使 0% 成功也是对假设的证据；`pending=false` 但 `email_otp_poll_timeout:mailbox_side_no_code` ⇒ 问题在邮箱供给而非协议。两臂都必须出口国家一致（10-06..10-11 失败样本全是 IN，HAR 是 US，那是另一个变量） |
+| P0-2b | 先跑 §4.1 的**无效结果判据**：任一 arm 的 `edge_challenge` 计数缺失 ⇒ `inconclusive`；三臂 `hits` 全为 0 ⇒ `not_judgeable`（窗口没测到东西，**不是**“无效果”）；`rotate` 臂命中了挑战但 `rotations == 0`（单槽池/开关未生效）⇒ `not_judgeable`（该臂是 `observe` 的副本）。有效时：`rotate` 臂出现控制臂从未有过的失败类别 ⇒ `stop_all_arms`（立即回到 `observe`）；`registered_per_attempted` 高出 0.05 以上且无新类别 ⇒ `favor_rotate`；低 0.05 以上 ⇒ `keep_default_off`；否则 `inconclusive`。**H2（handoff）单独判定，永不与 rotate 合并拍板** —— 且本轮 `handoff` 臂不可判定（`browser_handoff` 未落地，见 §6） |
+
+---
+
+## 6. 停止规则
+
+- 任一 arm 出现 `no_healthy_route`：先排查出口池，**暂停对照**，不以该轮结论。
+- 预检 Cloudflare 挑战率 > 50%：暂停，先修出口质量。
+- 不得"看中间结果调阈值/加样本重新跑"——阈值与手数预注册，改动即为新的实验。
+- 一次只改一个变量；P0-1、P1-3、P1-4、P1-5、P1-6 与 P1-7 不得同批复跑。
+- 🔴 P1-4 与 P1-5 **机制上耦合**（两者都针对「发码 200 但不派发」），因此顺序必须是：先跑 P1-4（密码页 prime，作用点在 `user_register` 之前）；若 P1-4 定案且开关落地，再跑 P1-5（作用点更早，在 `authorize/continue`）。两开关同时打开跑一轮**不是**对照，是混淆变量。
+- 🔴 P1-5 与 P1-8 是**同一个假设的两个作用点**：P1-5 改的是泳道本来就发的 continue，P1-8 补的是落 `/email-verification` 时的那一次（P1-5 在那个形状上不可达）。同一批只跑一个；P1-8 的两个 arm 都必须保持 `signup_continue_screen_hint=false`，因为 P1-8 的机制行自带 `screen_hint` 声明。
+- 🔴 P1-10 与 P1-11 都作用在 **signin 形状**上（`screen_hint` / `prompt`），是同一假设的连续两个字段：顺序必须是先 P1-10 定案，再在 P1-10 开着的前提下跑 P1-11（`hold_constant` 已钉两臂都开 P1-10）。同一批只跑一个；两臂都不得同时打开 continue 的两个开关。
+- 🔴 P1-12 接在 P1-11 之后，但按 **SunnyRegister 的形状**（`prompt=login` + `screen_hint=signup` + `locale=ja-JP`）：两臂都开 `signin_prompt_login`、都关 `signin_screen_hint_login_or_signup`，只变 `signin_locale_ja_jp`。P1-12 若也不动（速率与挂起键都不动），则客户端 signin 形状家族（screen_hint + prompt + locale）整体关闭，下一步应转向指纹/设备层或服务端路由。
+- 🔴 P1-13 是 P1-10/11/12 之后**同一假设的最后一束**：它换的是 signin/authorize 上下文的其余五个参数（`device_id` / passkey capabilities / `ccaps` / `auth_return_target_category` / `ui_locales`），turb 在同一份 HAR 上一起改的，所以是一个开关。两臂都保持 P1-10/11/12 为默认值。P1-13 若也不动，客户端 signin/authorize 上下文整体关闭，下一候选是**指纹/设备层**（`oai-did` / TLS / 出口 IP 声誉）。
+- 🔴 P1-14 与 P1-9 **机制上耦合**：P1-9 给 prime 补导航头，P1-14 决定落点错是否致命。顺序必须先 P1-9 定案再跑 P1-14（两臂都开 P1-9），否则分不清「头不齐导致落点错」还是「落点本来就对」。
+- 🔴 P1-15 / P1-16 / P1-17 都作用在 OTP 阶段，是三个独立单变量：send 的头、validate 的 Sentinel、validate 之后的分支。同一批只跑一个；两臂都必须保持另两个为默认值。
+- 🔴 P1-16 / P1-17 在**当前失败形状上不可判定**：现在三个地址全部停在 `email_otp_send_stuck`（码从未派发），validate 从未被走到，所以两臂的分支/带头差异不会显现。先跑 P1-13..P1-15；P1-16/P1-17 等有码到达之后再跑，判定时按 `not_judgeable` 处理。
+- 🔴 P2-1 的两臂必须用**不同地址**：开关开启后同一地址重跑会得到**同一个** `oai-did`（这正是被测内容），同一地址进两臂会串味。两臂都钉 `pulse.enabled=false`、密码泳道、P1-* 全默认；两臂相邻或交叉进行并记录时间。P2-2（全指纹 seed）必须等 P2-1 定案后再做，`hold_constant` 钉两臂都开 P2-1。`oai-did` 是凭据级标识：日志/报告只记前 8 位与 `reused` / `seeded`。
+- 🔴 P3-1 只作用在 **passwordless 泳道**（两臂 `email_registration.registration_mode=passwordless`），与此前全部在密码泳道上的 P1-*/P2-1 不是同一条线，**不得与它们同批**。两臂用不同地址、同一出口国家、`pulse.enabled=false`、`device_identity_seeded_by_email=false`。同批的 `otp_dispatch_verdict` 已改为**读 pending 的值**（`false` ⇒ `dispatched`）：此前「键存在即 stuck」会把 `pending=false` 的健康派发也判成 `email_otp_send_stuck` 并跳过轮询，所以 P3-1 之前的 stuck 样本里有多少是真的未派发，**未知**。
+  - 2026-10-11 实测注记：explicit 臂的 POST 必须把 `Content-Type` 设为 `None`（去掉 libcurl 默认的 form-urlencoded，否则 `400 unsupported_content_type`），首轮 3 个因此失败的样本作废。第二轮 n=10（各 5）全部没收到验证码，结论 `inconclusive`（邮箱源 Smailr 入站未被证明可用），详见 `docs/audits/scans/scan-2026-10-11-har-passwordless-signup.md` §7。
+- 🔴 P0-2b 的 `handoff` 臂**现在不要跑**：`registration.edge_challenge_browser_handoff` 未落地（`browser_flow` 缺“接入 cookie jar → 闯关 → 导出 → 停”的模式，见 `plan-2026-10-05` §3.4.2 的 S4b）。只跑 `observe` / `rotate` 两臂即可定 H1；`handoff` 臂会被判 `not_judgeable`。
+- 🔴 P0-2b 的停止规则比速率优先：任一臂出现**新的终态失败类别**、或 `handoff` 臂把可注册地址写进死路账本（`registration_retry_guard`）⇒ **立即停全部三臂**并回到 `observe`。
+- 🔴 P1-6 与 P1-7 都作用在 `create_account` 阶段：P1-6 改**请求前**（多发一次 GET），P1-7 改**失败后**（重试同一 POST）。同一批只跑其中一个；若都要定案，顺序不限，但两批的 arm 必须都保持另一开关为默认值。
+- P1-4 只在**密码泳道**生效（`email_registration.registration_mode != passwordless`）；两 arm 都必须用同一 mode，且批次里不得混入 passwordless 配置。P1-7 若要复现 SunnyRegister 测到的人群，批次应以 Remail 邮箱为主。
+
+---
+
+## 7. 证据与复现
+
+- 记录文件：`runtime/ab/<experiment>__<arm>.json`（含 `collected_at`、
+  `log_sha256`、配置快照值、原始计数）。
+- 结论回流：对照完成后，把结论写回 `docs/audits/` 的 `landing-*` 或更新
+  [`protocol-registration.md`](protocol-registration.md)，并说明 arm、手数、判定。
+
+---
+
+## 8. 明确不做
+
+- 不改任何默认值、端点或代码。
+- 不把 `verdict` 当作成功率证据。
+- 不用离线单测替代线上对照。
+- 不把 P0-2 的观察结果当成"流程内换出口已生效"。
+
+---
+
+## 9. 相关
+
+- [`protocol-registration.md`](protocol-registration.md) — 端点/Sentinel 契约与 Validation limits
+- [`registration-architecture.md`](registration-architecture.md) — 注册依赖与生命周期
+- [`telemetry-and-runtime.md`](telemetry-and-runtime.md) — 日志位置与关联字段
+- `docs/audits/scans/scan-2026-10-01-protocol-registration-payment-link.md` — P0-1/P0-2/P1-3 取证

@@ -1,0 +1,744 @@
+"""Tests for scripts/import_layer_ratchet.py.
+
+Layers, in increasing order of "does it actually protect anything":
+
+1. **The resolver, both directions** -- an import resolver that returns nothing
+   (or everything) manufactures false confidence. The synthetic fixture tree
+   pins absolute vs relative vs package-relative vs same-directory vs delayed
+   vs wildcard vs prose, and the exact edge count for each.
+2. **The package-relative regression** -- reading ``sms_tool/upi_link/__init__.py``
+   as belonging to ``sms_tool`` rather than ``sms_tool/upi_link`` invents 12
+   phantom ``sms_tool`` edges and inflates every ``sms_tool -> ...`` pair. This
+   was a real bug in the ad-hoc analysis that produced the 2026-10-04 numbers,
+   so it is pinned here rather than trusted.
+3. **The self-test harness can go red** -- gutting the resolver must fail.
+4. **The ratchet against the real tree** -- it holds at the frozen baseline, the
+   summarised facts are pinned, and ``_vendor`` stays out.
+
+The regression this gate exists for: ``docs/architecture.md`` fixes a layer
+model, but no gate measured it, so on 2026-10-04 the review graph reported one
+strongly connected component spanning all 14 directories with 470 import
+statements and nothing could tell a new back-edge from an old one.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+import import_layer_ratchet as ilr  # noqa: E402  # type: ignore
+
+
+@pytest.fixture()
+def fixture_tree(tmp_path: Path) -> Path:
+    """A throwaway repo root holding the pinned ``sms_tool`` fixture tree."""
+    return ilr._build_fixture_tree(tmp_path / "repo")
+
+
+# --------------------------------------------------------------------------
+# The resolver, both directions
+# --------------------------------------------------------------------------
+
+
+def test_absolute_cross_directory_import_becomes_two_edges(fixture_tree: Path):
+    counts = ilr.analyze(fixture_tree).pair_counts()
+    assert counts["sms_tool -> sms_tool/geo"] == 2
+
+
+def test_relative_level_two_import_crosses_the_boundary(fixture_tree: Path):
+    counts = ilr.analyze(fixture_tree).pair_counts()
+    assert counts["sms_tool/accounts -> sms_tool/geo"] == 1
+    assert counts["sms_tool/geo -> sms_tool/accounts"] == 1
+
+
+def test_wildcard_reexport_is_counted(fixture_tree: Path):
+    """``from .accounts import *`` in a facade is a real edge, not prose."""
+    counts = ilr.analyze(fixture_tree).pair_counts()
+    assert counts["sms_tool -> sms_tool/accounts"] == 1
+
+
+def test_package_relative_self_import_is_not_an_edge(fixture_tree: Path):
+    """The 12-phantom-edge regression.
+
+    ``sms_tool/accounts/__init__.py`` does ``from . import helper`` and
+    ``from .helper import thing``. Both stay inside ``sms_tool/accounts`` and
+    must never be scored as ``sms_tool -> sms_tool/accounts``.
+    """
+    counts = ilr.analyze(fixture_tree).pair_counts()
+    assert counts.get("sms_tool/accounts -> sms_tool/accounts", 0) == 0
+
+
+def test_same_directory_imports_are_never_edges(fixture_tree: Path):
+    counts = ilr.analyze(fixture_tree).pair_counts()
+    for source_dir in ("sms_tool", "sms_tool/accounts", "sms_tool/geo"):
+        assert counts.get(f"{source_dir} -> {source_dir}", 0) == 0
+
+
+def test_stdlib_and_prose_are_not_edges(fixture_tree: Path):
+    """``import os`` and a comment naming a module must not score."""
+    analysis = ilr.analyze(fixture_tree)
+    assert not any(e.source_module.endswith("accounts.notes") for e in analysis.edges)
+
+
+def test_exact_fixture_totals(fixture_tree: Path):
+    """The fixture's own totals, NOT the production ones.
+
+    ``scripts/module_move.py``'s ``sync_pinned_totals`` used to rewrite every
+    ``"total_module_edges": N`` in this file, which silently replaced this
+    fixture pin with the production numbers and left the test comparing a
+    seven-module fixture against the real tree.
+    """
+    analysis = ilr.analyze(fixture_tree)
+    assert analysis.totals() == {
+        "total_module_edges": 6,
+        "ordered_pairs": 5,
+        "mutual_pairs": 2,
+        "minority_edges": 2,
+        "delayed_cross_dir_edges": 1,
+        "type_only_edges": 0,
+    }
+
+
+def test_function_local_import_is_delayed_not_module_scope(fixture_tree: Path):
+    """A delayed import is the sanctioned cycle-break, so it is reported but
+    explicitly outside the frozen metric."""
+    analysis = ilr.analyze(fixture_tree)
+    module_pairs = {(e.source_module, e.target_dir) for e in analysis.module_edges}
+    assert ("sms_tool.gamma", "sms_tool/accounts") not in module_pairs
+
+    delayed = {(e.source_module, e.target_dir) for e in analysis.delayed_edges}
+    assert ("sms_tool.gamma", "sms_tool/accounts") in delayed
+
+
+def test_vendor_tree_is_excluded(fixture_tree: Path):
+    analysis = ilr.analyze(fixture_tree)
+    assert not any("_vendor" in e.source_module for e in analysis.edges)
+
+
+def test_minority_direction_picks_the_weaker_way(fixture_tree: Path):
+    """``sms_tool -> sms_tool/geo`` (2) is dominant; ``geo -> sms_tool`` is absent,
+    so the scored minority edges are only the genuinely mutual pairs."""
+    analysis = ilr.analyze(fixture_tree)
+    minority = {(e.source_dir, e.target_dir) for e in analysis.minority_edges()}
+    assert minority == {
+        ("sms_tool/accounts", "sms_tool"),
+        ("sms_tool/geo", "sms_tool/accounts"),
+    }
+
+
+# --------------------------------------------------------------------------
+# The self-test harness must be able to go red
+# --------------------------------------------------------------------------
+
+
+def test_self_test_passes_on_the_shipped_fixtures():
+    assert ilr.resolver_is_trustworthy() is None
+
+
+def test_self_test_detects_a_resolver_that_finds_nothing(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(ilr, "analyze", lambda root=None: ilr.Analysis())
+    assert ilr.resolver_is_trustworthy() is not None
+
+
+def test_self_test_detects_a_resolver_that_invents_edges(monkeypatch: pytest.MonkeyPatch):
+    """A resolver that scores every pair would pass a naive total-only check."""
+    real = ilr.analyze
+    monkeypatch.setattr(ilr, "analyze", lambda root=None: real(root) if root else real())
+    monkeypatch.setattr(
+        ilr,
+        "FIXTURE_EXPECTED",
+        ilr.FIXTURE_EXPECTED + (("sms_tool", "sms_tool/never", 5),),
+    )
+    assert ilr.resolver_is_trustworthy() is not None
+
+
+def test_cli_fails_loudly_when_the_resolver_is_gutted(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(ilr, "resolver_is_trustworthy", lambda: "gutted")
+    assert ilr.main([]) == 1
+
+
+# --------------------------------------------------------------------------
+# The ratchet against the real tree
+# --------------------------------------------------------------------------
+
+
+def test_baseline_is_present_and_well_formed():
+    baseline = ilr.load_baseline()
+    assert baseline, "import_layer_baseline.json is missing or unreadable"
+    # Bind first, narrow the binding: ``isinstance(baseline.get("pairs"), dict)``
+    # proves nothing about a *separate* ``baseline["pairs"]`` subscript, so
+    # pyright still saw ``object`` at ``.values()``.
+    pairs = baseline.get("pairs")
+    assert isinstance(pairs, dict)
+    assert baseline["total_module_edges"] == sum(pairs.values())
+
+
+def test_ratchet_holds_for_the_current_tree():
+    """The frozen per-pair counts must not have grown."""
+    analysis = ilr.analyze(ROOT)
+    counts = analysis.pair_counts()
+    allowed = ilr._baseline_pairs(ilr.load_baseline())
+    grown = [
+        f"{pair}: {counts[pair]} > {allowed.get(pair, 0)}"
+        for pair in sorted(counts)
+        if counts[pair] > allowed.get(pair, 0)
+    ]
+    assert not grown, "module-level cross-directory edges grew:\n  " + "\n  ".join(grown)
+
+
+def test_summary_facts_are_pinned():
+    """Pin the decomposition so a silent metric change is caught.
+
+    470 raw directory-level edges decompose into 264 module-scope edges (frozen
+    here) plus 190 delayed cross-directory imports (frozen by
+    ``delayed_import_ratchet.py``).
+
+    276 (was 277) / 54 minority (was 56) on 2026-10-17: the pure auth wire
+    helpers (``_is_existing_login_redirect``, ``_with_query_param``,
+    ``_invalid_state_auth_response``, ``_auth_request_headers`` and the OTP
+    subject constant) moved out of ``auth_flow/steps.py`` into the top-level
+    contract module ``sms_tool/auth_wire.py``. ``otp_strategy`` and
+    ``phone_registration`` now import them (and ``http_utils``'s
+    ``_absolute_url`` / ``_json_or_raw``) directly instead of through the
+    ``auth_flow`` package facade, which drops the
+    ``sms_tool -> sms_tool/auth_flow`` pair 4 -> 2. The pair
+    ``sms_tool/auth_flow -> sms_tool`` grows 10 -> 11 because ``steps`` now
+    imports ``auth_wire``; that is the sanctioned remedy for a
+    minority-direction edge (move the shared helper into a leaf both sides may
+    import), and the totals still fall.
+
+    277 (was 287) / 29 pairs (was 31) / 56 minority (was 60) / 188 delayed (was
+    187) on 2026-10-17: ``accounts/account_creation.py`` and
+    ``accounts/account_seed.py`` moved to the package root. Both had every
+    internal dependency at the top level already (``http_utils``,
+    ``auth_headers``, ``codex_sentinel``, ``config``, ``http_client``,
+    ``storage``) and ``accounts/`` consumed only two ``account_creation``
+    symbols through a delayed import, so the move turned four
+    ``sms_tool -> sms_tool/accounts`` edges into same-directory imports. The
+    two ordered pairs that disappeared (31 -> 29) are exactly the pairs those
+    edges left behind; the delayed count grew by one because
+    ``account_recovery`` keeps its function-local import of the moved module.
+
+    187 (was 186) on 2026-10-11: ``codex_oauth._password_login_and_exchange``
+    completes a saved TOTP challenge through ``auth_flow.totp`` (the single owner
+    of that exchange) via one function-local import. A module-level import grew
+    the frozen ``sms_tool -> sms_tool/auth_flow`` pair 4 -> 5, so it stays
+    delayed -- the remedy this ratchet's own failure text names.
+
+    186 (was 185) / 287 (was 288) on 2026-10-08: the PayPal browser lane stopped
+    importing the protocol lane. ``paypal/orchestrator.py`` held a module-level
+    ``from ..paypal_reverse import try_reverse_pay``; it now takes the adapter as
+    the injected ``reverse_pay`` parameter (Boundary Rule 21), and the command
+    adapter resolves it inside one named helper. A module-level import there
+    would have grown the frozen ``sms_tool/commands -> sms_tool`` pair, so the
+    helper is function-local -- the remedy this ratchet's own failure text names.
+    Net: one module-scope edge left the graph (288 -> 287) and one delayed
+    cross-directory edge joined it (185 -> 186). The ``sms_tool/paypal ->
+    sms_tool`` pair drops 9 -> 8.
+
+    185 (was 184) on 2026-10-07: ``proxy_edge_probe.edge_challenge_verdict``
+    gained one delayed ``from .accounts.account_terminal import
+    text_has_account_deactivated``.  ``account_terminal`` is the single owner of
+    the deactivation vocabulary (rule 3 of the P0-B S0 judgement: an
+    ``account_deactivated`` 403 is not an exit challenge), and a module-level
+    import would have grown the ``sms_tool -> sms_tool/accounts`` pair that the
+    ratchet freezes -- the same remedy its own failure text names, and the same
+    shape ``payment_auth``/``payment_batch`` already use for that package.
+
+    184 (was 183) on 2026-10-06: ``auth_flow/signup.py`` gained one delayed
+    ``from ..operator_output import emit`` for the password-page prime's
+    operator-facing warnings -- the import-layer ratchet names a function-local
+    import as the sanctioned seam for an ``auth_flow -> sms_tool`` edge, and it
+    stays delayed because only that one reporting path needs it. Earlier the
+    same day, ``pay_link/adapters.py`` added one for the Checkout-create
+    Sentinel pair (183 was 182). Two baselines plus this literal all have to
+    move together, which is the point of the pin.
+
+    264 (was 267) / 42 minority (was 45) / 190 delayed (was 188) on 2026-10-21:
+    provider adapters stopped importing the two application concerns they were
+    only *receiving*. ``providers/mailbox_gmail`` and ``providers/mailbox_graph``
+    imported ``mailbox_pool_writer.apply_rotation``, and
+    ``providers/mailbox_remail`` imported ``desktop_ipc.progress_dots_enabled``;
+    both now arrive through ``sms_tool/providers/ports.py``, which imports them
+    lazily -- the remedy this ratchet's failure text names for a documented DI
+    seam. Three module-scope edges leave (267 -> 264, minority 45 -> 42) and two
+    delayed cross-directory edges join (188 -> 190); ``delayed_import_ratchet``
+    records 415 -> 417, each with a written reason in
+    ``delayed_import_reasons.json``. Pairs and mutual pairs are unchanged: the
+    seam stays inside the same ``sms_tool/providers -> sms_tool`` pair.
+
+    190 (was 188) / 267 (was 276) / 28 pairs (was 29) / 10 mutual (was 11) / 45
+    minority (was 54) on 2026-10-18: the CLI entrypoint stopped importing every
+    command adapter at module scope. Seven adapters plus ``batch_runner``,
+    ``storage`` and the helper hooks are now resolved by ``_LazyModule`` proxies
+    and per-symbol resolvers, so nine ``sms_tool -> sms_tool/commands`` edges
+    leave the graph and that pair disappears (hence 28 pairs, 10 mutual, 45
+    minority). Two cross-directory dependencies become function-local seams
+    (``commands.email_change`` and ``commands.helpers``), which is the +2 here;
+    ``delayed_import_ratchet`` records the wider 414 -> 421 because seven eager
+    adapter imports are now local. That is the trade Rule 15 prescribes: a 30 ms
+    help screen must not pay for the payment/browser stack, and the import-surface
+    test pins the result.
+    """
+    totals = ilr.analyze(ROOT).totals()
+    # 2026-10-23: 437 -> 453. Wiring every caller to its host authority
+    # (`sms_tool/endpoints.py`) added 16 module-level edges, all into that one
+    # pure-constants leaf module. The alternative -- making each call site a
+    # function-local import -- moved 41 statements into
+    # `delayed_import_ratchet`, which hides the coupling instead of recording
+    # it. This is the reviewed increase: a leaf of string constants is the
+    # cheapest edge in the tree, and `endpoints_literal_ratchet` requires it.
+    #
+    # 2026-10-23 (later): 453 -> 448, pairs 66 -> 65, mutual 18 -> 17. The P1
+    # import-cost work turned `registration/__init__.py`, `pay_link/__init__.py`
+    # and `payment/link_manager.py` into PEP 562 facades. The shell's
+    # `from ..pay_link import *` was the only `payment -> pay_link` runtime
+    # edge, so that pair disappears (the mutual pair count drops by one), and
+    # the facades no longer import their submodules at module scope. The shell's
+    # remaining cross-directory import of `pay_link` is type-only, which is why
+    # `type_only_edges` becomes 1 rather than 0.
+    #
+    # 2026-10-23 (import cleanup + stage proxies): 448 -> 436, minority 47 -> 46.
+    # Two changes in one day, both reviewed:
+    #   -13: the 37 dead `except ImportError` fallbacks deleted that day included
+    #        13 that spelled the shadow copy out as a full `sms_tool.x.y` path.
+    #        Those were real module-level edges (unreachable at runtime, but the
+    #        graph counts statements), so removing the handler removed them: 12
+    #        were majority-direction for their pair and one was the only
+    #        minority-direction edge of its pair.
+    #   +1:  `paypal_link/__init__.py` now imports `_resolve_stage_proxy` /
+    #        `_stage_proxy_is_configured` from their owner `paypal.proxy` instead
+    #        of relaying them through `gen_link`. Same pair, same direction, one
+    #        more statement -- pairs and mutual pairs are unchanged.
+    #
+    # 2026-10-24: 436 -> 426, ordered pairs 65 -> 64, delayed 257 -> 256. The
+    # dead-code removal took out `accounts/account_payment_eligibility.py` (and
+    # its 1011-line test), the `run_phone` compatibility wrapper, the
+    # `RegistrationState.CODEX_OAUTH` member and the unused `store.markers`
+    # exports. The disappeared ordered pair is the module-level side of that
+    # module; the delayed edge was the matching function-local import. Nothing
+    # was replaced by a facade, so this is a real reduction, not a relocation.
+    #
+    # 2026-10-24 (later): 426 -> 431. **Reviewed increase, decomposition only.**
+    # `registration/handlers.py` lost its bootstrap and identity stage bodies to
+    # `bootstrap_stages.py` / `identity_stages.py`. Those two modules are new
+    # source modules, so the edges they declare are new (source, target) pairs
+    # even though the *target set* is unchanged: registration -> sms_tool +2
+    # (`bootstrap -> operator_output`, `identity -> operator_output`),
+    # -> mailbox +1 (`bootstrap -> mailbox.service`), -> providers +1
+    # (`bootstrap -> providers.mailbox_graph`), -> proxy +1
+    # (`identity -> proxy.entry`; bootstrap's duplicate was offset by deleting
+    # handlers' now-unused import). Handler-side imports that existed only for
+    # the moved bodies (endpoints, mailbox.service, proxy.entry, auth_headers,
+    # fingerprint_pool, checkpoint) were deleted in the same change. No new
+    # target module was introduced; splitting one module into three is simply
+    # counted three times.
+    #
+    # 2026-10-24 (auth/register, same reviewed class): 431 -> 432, no pair-count
+    # change beyond registration -> sms_tool +1. `auth_stages` and
+    # `register_stages` each declare their own `operator_output` edge; deleting
+    # handlers' now-unused `_emit` import offsets one of the two, netting +1.
+    # The target set is again unchanged — this is the decomposition cost, and it
+    # is the last stage body that will move.
+    #
+    # 2026-10-25: 432 -> 434, **reviewed increase, one shared leaf constant.**
+    # The "code defect, not network" exception tuple was copy-pasted in three
+    # places (registration/handlers.py, registration/bootstrap_stages.py,
+    # payment/batch.py), each with a comment asking the next reader to keep it in
+    # sync with the other two. It now lives once, as
+    # `INTERNAL_EXCEPTION_TYPES` in kernel/error_classification.py — this
+    # ratchet's own failure text names exactly that remedy ("move the shared
+    # helper into a leaf module both sides may import"). The two registration
+    # stage executors import it at module scope (+2 on registration -> sms_tool);
+    # `payment/batch.py` reuses its existing function-local
+    # `kernel.error_classification` import, so the payment pair does not move.
+    # The alternative — a function-local import in the two executors as well —
+    # was rejected for the reason recorded on 2026-10-23 below: it hides the
+    # coupling (and puts a `sys.modules` lookup on the exception path) instead of
+    # recording a dependency on a leaf of exception types.
+    #
+    # 2026-10-25 (second): 434 -> 435, same reviewed class as the entry above.
+    # `commands/registration.py` converted 18 unguarded `int()/float()` casts on
+    # journal/report/argparse values to the canonical tolerant helpers, and those
+    # helpers already have exactly one owner: `registration/protocol_helpers.py`
+    # (`_safe_int` / `_safe_float`, added there for the stage modules). The module
+    # already imports `registration/preflight.py` and `registration/funnel.py` at
+    # module scope, so this is +1 on the existing `sms_tool/commands ->
+    # sms_tool/registration` pair and no new pair. A function-local import was
+    # rejected for the same reason as above; the alternative -- a seventh private
+    # copy of a two-line cast -- is the duplication this batched fix removes.
+    # 2026-11-01 (P4): 437 -> 433. ``registration/orchestrator.py`` became a
+    # hybrid PEP 562 facade: the 45 compatibility re-exports nothing in the module
+    # reads are resolved on demand, so their 21 import statements became one
+    # ``importlib.import_module`` call plus a literal map. Four module-scope edges
+    # left the graph; the 74 names the entry points do read stay eager, which is
+    # why this is a reduction rather than a relocation (a pure facade would have
+    # moved them into ``TYPE_CHECKING`` and broken the patch seams).
+    #
+    # 2026-11-01: 435 -> 437, **reviewed increase, one deleted duplicate.**
+    # The `registration.*` boolean-flag parse existed twice -- `registration/flags.py`
+    # and, verbatim, `auth_flow/steps.py::_registration_flag` -- and both docstrings
+    # said the second was a deliberate copy because `auth_flow` could not import
+    # the first without growing a minority-direction edge. The parse now lives in
+    # `kernel/flags.py`, a leaf that imports nothing from `sms_tool`, so both sides
+    # import it: `auth_flow -> sms_tool` 8 -> 9 and `registration -> sms_tool`
+    # 91 -> 92. This is the remedy the 2026-10-17 entry above names, paid in two
+    # leaf edges for one deleted duplicate -- and unlike a function-local import it
+    # records the dependency instead of hiding a `sys.modules` lookup.
+    # 2026-11-01 (P6-PR-B, step 1): 433 -> 434. ``kernel/transport.py`` is a new
+    # leaf that owns ``TRANSPORT_ERRORS``, and ``registration/preflight.py`` imports
+    # it so ``_proxy_scheme_reachable`` can stop swallowing logic errors. This
+    # ratchet's own failure text names the remedy (a leaf both sides may import);
+    # the alternative -- a second copy of the curl exception tuple in the lane --
+    # is the duplication the narrowing exists to remove.
+    # 2026-11-01 (P6-PR-B, site 4): +1 auth_flow -> sms_tool. `login.py` imports
+    # `kernel/transport.py` for the narrowed prime GET -- the same leaf both the
+    # protocol lane and the auth lane may import, so the edge is the remedy, not a leak.
+    assert totals == {
+        # 2026-10-26 (支付资格 / 代理池管理): 438 -> 435 (-3). The payment
+        # qualification feature moved into the payment lane (payment/qualification*)
+        # and its cross-directory imports are function-local, so the accounts ->
+        # payment and commands -> payment pairs shrank; proxy/admin.py hoists its
+        # same-directory imports, leaving only the geo cache lookup deferred.
+        #
+        # 2026-10-26 (支付资格, earlier the same day): 435 -> 438 (+3, reviewed
+        # increase), superseded by the move above.
+        # The new batch module imports three shared leaves at module scope --
+        # ``config.CFG``, ``batch_circuit_breaker.BatchCircuitBreaker`` and the
+        # new ``payment_qualification_states`` vocabulary -- exactly like its
+        # sibling ``promotion_batch``. This ratchet's own failure text sanctions
+        # importing a shared leaf both sides may use; the alternative (three
+        # function-local imports repeated across five helpers) would hide the
+        # dependency and put a ``sys.modules`` lookup on every summary row.
+        #
+        # 2026-11-02 (ratchet modelling correction): 437 -> 473 (+36;
+        # ordered_pairs 64 -> 78). ``kernel`` joined ``SUBPACKAGES`` in
+        # ``scripts/import_layer_ratchet.py``. Until then every
+        # ``..kernel.<leaf>`` import collapsed into the ``sms_tool`` node -- correct
+        # for a *subpackage* source (``registration -> sms_tool`` already counted
+        # it) but wrong for a *root-module* source, where importer and target both
+        # mapped to ``sms_tool`` and the edge was invisible. 35 root -> kernel
+        # edges (``config``, ``storage``, ``http_client``, ``desktop_read`` ...
+        # importing the leaf layer) existed all along and were simply not counted.
+        #
+        # This is not new coupling: a root module importing the kernel leaf is the
+        # inward direction. It is a one-time visibility correction, so the number
+        # may only go down from here like every other pair. The side effect is that
+        # pairs previously inflated by kernel imports now read their real value
+        # (``registration -> sms_tool`` 91 -> 56, ``accounts -> sms_tool`` 44 -> 36)
+        # and 14 new ``X -> sms_tool/kernel`` pairs are frozen.
+        #
+        # Why it was forced: ``auth_flow``'s P6-PR-B narrowing imported
+        # ``kernel.transport.TRANSPORT_ERRORS`` -- the exact leaf this gate's
+        # failure text prescribes -- yet the edge landed on ``auth_flow ->
+        # sms_tool`` and tripped a cap the leaf never earned. Adding the node is
+        # the fix; making that import function-local to dodge the counter would
+        # have been the workaround.
+        # 2026-11-11 (protocol TLS fingerprint): 486 -> 493 (+7). One new leaf
+        # module (``sms_tool/tls_fingerprint.py``) imported by four registration
+        # modules and by ``sentinel/client.py``, plus the sentinel self-check
+        # imported by ``doctor.py``. Every edge points at a layer-5 leaf.
+        #
+        # 2026-11-03 (UPI lane state modules): 473 -> 486 (+13). The seven new
+        # state modules (identity / ledger / billing / fingerprint / exit health /
+        # exit lease / zero eligibility) live in ``sms_tool/payment`` because the
+        # file set of ``sms_tool/upi_link`` is frozen
+        # (scripts/payment_legacy_manifest.py), and the legacy lane imports them
+        # at module scope. This is the inward direction the gate wants -- a legacy
+        # lane consuming the shared kernel instead of growing its own copy -- and
+        # the alternative (13 function-local imports) would hide the dependency
+        # and put a ``sys.modules`` lookup on every identity/billing resolution.
+        "total_module_edges": 493,
+        "ordered_pairs": 78,
+        "mutual_pairs": 17,
+        "minority_edges": 46,
+        # 2026-10-21: 188 -> 190 when the provider ports seam (providers/ports.py)
+        # took over the mailbox_pool_writer and desktop_ipc imports as delayed
+        # ones. Before that, 190 -> 188 when store/connection.py stopped
+        # importing the sms_tool.storage shell inside _init_cache_key/_connect.
+        # 2026-10-23 (P1): 256 -> 257 for the deferred
+        # `payment/routing.py -> proxy.routing` import that cut ~300 ms from
+        # every `payment.routing` consumer (see its reason in
+        # `delayed_import_reasons.json`).
+        # 2026-10-26: 257 -> 260 (+4) for the failed-run mailbox ledger
+        # (`mailbox/reclaim.py`, `registration/result.py`). Three edges are the
+        # ledger's own dependencies — `cross_process_gate`, `kernel.paths`,
+        # `kernel.error_classification` — imported inside the functions because a
+        # module-level `mailbox -> root` import would raise the frozen
+        # `mailbox -> sms_tool` pair above its cap, which is exactly the trade
+        # `import_layer_ratchet`'s failure text prescribes. The fourth
+        # (`registration/result.py -> mailbox/reclaim.py`) is failure-only, so it
+        # has no business running on every successful registration. All four
+        # carry a reasoned entry in `delayed_import_reasons.json`.
+        #
+        # 2026-10-26 (proxy intelligence P0/P1): 260 -> 266 (+6 statements,
+        # +4 edges). `proxy/screening.py -> geo.resolver` (2 statements: the two
+        # probe helpers), `proxy/asn_registry.py -> geo` (1) and
+        # `proxy/asn_registry.py -> kernel.paths` (1) are function-local because
+        # the frozen `proxy -> geo` pair was empty and `proxy -> sms_tool` sat at
+        # its cap; the remaining 2 statements are `batch_runner ->
+        # proxy.asn_registry` imported at its two call sites to keep
+        # `sms_tool -> sms_tool/proxy` at 2. Same trade this ratchet prescribes,
+        # same reasoned entries.
+        #
+        # 2026-10-27 (支付资格 egress hardening): 294 -> 297 (+3). Reviewed
+        # increase: `batch_runner -> proxy.dynamic`, `payment/qualification_batch
+        # -> endpoints` (Stripe preflight host resolved at call time) and
+        # `payment/qualification -> payment.wire` (country -> currency map) are
+        # function-local, each with a reasoned entry in
+        # `delayed_import_reasons.json`.
+        #
+        # 2026-10-28 (account identity provenance): 297 -> 298 (+1).
+        # `desktop_read -> accounts.account_identity` is function-local inside
+        # `_identity_payload`: the desktop read is the hot start path and
+        # `account_identity` pulls the fingerprint pool plus `phone_proxy`
+        # (requests). The reader is used so the `fingerprint_key`/`proxy_affinity`
+        # field names keep one owner instead of a second copy in the payload
+        # builder. Reasoned entry added to `delayed_import_reasons.json`.
+        #
+        # 2026-10-31 (HAR 2026-10-28: `email_otp_validate` flow): 298 -> 300
+        # (+2). `registration/otp_stages.py -> sms_tool.sentinel` resolves the
+        # flow name for the `otp_validate_email_otp_validate_flow` A/B arm, and
+        # `sentinel_tokens -> sms_tool.sentinel` names it inside the legacy
+        # issuer. Both are `provider`-classified (self-evident: the Sentinel
+        # package is imported on the path that needs it). A module-level import
+        # would have raised the frozen `registration -> sentinel` module pair AND
+        # pulled the Node runner (`subprocess`, `tempfile`) into every
+        # `sms_tool` startup, which is the trade this ratchet prescribes.
+        # 2026-11-02: 300 -> 307 (+7). Two are this session's reviewed seams: the
+        # `providers/ports.py -> http_client` deferred edge that removed the last
+        # module-scope `providers -> sms_tool` request import (``sms_vendor_api``
+        # was the only provider reaching for the retry transport directly), and the
+        # delayed imports that replaced redundant function-local `os` / `CFG` /
+        # `sms_providers` lookups in `desktop_read`. The rest came with the
+        # in-flight desktop/registration refactor; every one carries an entry in
+        # `delayed_import_reasons.json` where its reason is not rule-derived.
+        # 2026-11-11: 310 -> 311. ``sentinel/selfcheck.py`` is imported inside
+        # ``doctor._probe_sentinel_runtime`` so the vendor integrity check cannot
+        # run at import time.
+        #
+        # 2026-11-03: 307 -> 310. Three reviewed seams came with the same work:
+        # ``payment/routing.py`` and ``payment/batch.py`` resolve the exit lease
+        # inside the function that needs it (so the payment kernel does not import
+        # the UPI state modules on the hot path), and
+        # ``payment/upi_identity_store.py`` defers ``kernel.paths`` /
+        # ``cross_process_gate`` so a module every identity lookup imports stays
+        # free of them at import time. All three carry an entry in
+        # ``delayed_import_reasons.json``.
+        "delayed_cross_dir_edges": 311,
+        # Imports under `if TYPE_CHECKING:` never run, so they are not runtime
+        # edges. 1 here since 2026-10-23: `payment/link_manager.py` declares its
+        # `pay_link` re-exports type-only (the module is not a package, so the
+        # lazy `__getattr__` resolves them at runtime instead).
+        #
+        # 2 since 2026-10-26: `proxy/screening.py` names `ProxyGeo` for
+        # annotations only — the screening module duck-types the geo object and
+        # deliberately never imports the geo stack at module scope (see the note
+        # at the top of that module).
+        # 2026-11-01 (P4): 3 -> 15. ``registration/orchestrator.py`` now declares
+        # its 45 lazy re-exports to pyright in 16 grouped ``TYPE_CHECKING`` imports.
+        # Declaring them is what keeps those names typed for consumers; the cost is
+        # recorded here rather than hidden by dropping the declaration.
+        "type_only_edges": 15,
+    }
+
+
+def test_a_type_checking_import_is_not_a_runtime_edge(tmp_path: Path):
+    """The registration stage cluster looked like a 9-module cycle until these
+    were classified: every stage names the workflow for annotations only."""
+
+    nl = chr(10)
+    for rel, text in {
+        "__init__.py": "",
+        "handlers.py": "from .stages import run" + nl,
+        "stages.py": (
+            "from typing import TYPE_CHECKING"
+            + nl
+            + "if TYPE_CHECKING:"
+            + nl
+            + "    from .handlers import Workflow"
+            + nl
+        ),
+    }.items():
+        path = tmp_path / "sms_tool" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8", newline=nl)
+
+    analysis = ilr.analyze(tmp_path)
+    assert [(e.source_module, e.target_module) for e in analysis.all_module_edges()] == [
+        ("sms_tool.handlers", "sms_tool.stages")
+    ]
+    # The annotation-only edge must not appear in any runtime bucket: only the
+    # real handlers -> stages edge is a same-directory runtime edge.
+    assert analysis.type_edges == []
+    assert [(e.source_module, e.target_module) for e in analysis.same_directory] == [
+        ("sms_tool.handlers", "sms_tool.stages")
+    ]
+
+
+def test_vendor_tree_stays_out_of_the_real_scan():
+    analysis = ilr.analyze(ROOT)
+    assert not any("_vendor" in e.source_module for e in analysis.edges), (
+        "vendored code is not ours to re-layer and must stay out of the ratchet"
+    )
+
+
+def test_updating_the_baseline_cannot_silently_raise_a_pair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """``--update-baseline`` is the reviewed lowering path; it must write what it
+    measured, so a later run against that file passes."""
+    target = tmp_path / "baseline.json"
+    monkeypatch.setattr(ilr, "BASELINE", target)
+    assert ilr.main(["--update-baseline", "--root", str(ROOT)]) == 0
+    written = json.loads(target.read_text(encoding="utf-8"))
+    assert written["pairs"] == ilr.analyze(ROOT).pair_counts()
+    monkeypatch.setattr(ilr, "load_baseline", lambda *a, **k: written)
+    counts = ilr.analyze(ROOT).pair_counts()
+    assert not [p for p in counts if counts[p] > written["pairs"].get(p, 0)]
+
+
+# --------------------------------------------------------------------------
+# Layer direction: the reviewed module map in scripts/layer_manifest.json.
+# --------------------------------------------------------------------------
+
+LAYER_MANIFEST = {
+    "packages": {"adapters": 5, "flows": 3},
+    "module_overrides": {},
+    "root_modules": {"leaf.py": 5, "workflow.py": 3, "cli.py": 2},
+    "allow": {},
+}
+
+
+def layers_from(**overrides) -> ilr.Layers:
+    payload = dict(LAYER_MANIFEST)
+    payload.update(overrides)
+    return ilr.load_layers_payload(payload)
+
+
+def analysis_of(tmp_path: Path, files: dict[str, str]) -> tuple[ilr.Analysis, list[str]]:
+    for rel, text in files.items():
+        path = tmp_path / "sms_tool" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8", newline="\n")
+    _files, modules, _is_package = ilr._index(tmp_path)
+    return ilr.analyze(tmp_path), list(modules)
+
+
+def test_an_inner_module_importing_an_outer_one_is_a_violation(tmp_path):
+    analysis, modules = analysis_of(
+        tmp_path,
+        {
+            "__init__.py": "",
+            "leaf.py": "from .workflow import thing\n",
+            "workflow.py": "thing = 1\n",
+        },
+    )
+    unclassified, allowed, unallowed = ilr.direction_violations(analysis, layers_from(), modules)
+    assert unclassified == []
+    assert allowed == []
+    assert [edge.key for edge in unallowed] == ["sms_tool.leaf -> sms_tool.workflow"]
+
+
+def test_an_outer_module_importing_an_inner_one_is_legal(tmp_path):
+    analysis, modules = analysis_of(
+        tmp_path,
+        {
+            "__init__.py": "",
+            "leaf.py": "thing = 1\n",
+            "cli.py": "from .leaf import thing\n",
+        },
+    )
+    _unclassified, _allowed, unallowed = ilr.direction_violations(analysis, layers_from(), modules)
+    assert unallowed == []
+
+
+def test_same_layer_edges_are_legal(tmp_path):
+    analysis, modules = analysis_of(
+        tmp_path,
+        {
+            "__init__.py": "",
+            "adapters/__init__.py": "",
+            "adapters/a.py": "from .b import thing\n",
+            "adapters/b.py": "thing = 1\n",
+        },
+    )
+    _unclassified, _allowed, unallowed = ilr.direction_violations(analysis, layers_from(), modules)
+    assert unallowed == []
+
+
+def test_an_allow_entry_absorbs_a_documented_inward_edge(tmp_path):
+    analysis, modules = analysis_of(
+        tmp_path,
+        {
+            "__init__.py": "",
+            "leaf.py": "from .workflow import thing\n",
+            "workflow.py": "thing = 1\n",
+        },
+    )
+    layers = layers_from(
+        allow={
+            "sms_tool.leaf -> sms_tool.workflow": {
+                "reason": "the leaf is the documented facade for this workflow",
+                "owner": "sms_tool/leaf.py",
+            }
+        }
+    )
+    _unclassified, allowed, unallowed = ilr.direction_violations(analysis, layers, modules)
+    assert unallowed == []
+    assert [edge.key for edge in allowed] == ["sms_tool.leaf -> sms_tool.workflow"]
+
+
+def test_a_module_no_rule_claims_is_reported(tmp_path):
+    analysis, modules = analysis_of(
+        tmp_path,
+        {
+            "__init__.py": "",
+            "unclaimed.py": "thing = 1\n",
+        },
+    )
+    unclassified, _allowed, _unallowed = ilr.direction_violations(analysis, layers_from(), modules)
+    assert unclassified == ["sms_tool.unclaimed"]
+
+
+def test_a_same_directory_inward_edge_is_still_checked(tmp_path):
+    """A package __init__ importing its own higher-layer submodule never crosses a
+    directory boundary, so the per-pair ratchet cannot see it -- the layer check must."""
+
+    analysis, modules = analysis_of(
+        tmp_path,
+        {
+            "__init__.py": "",
+            "adapters/__init__.py": "from .high import thing\n",
+            "adapters/high.py": "thing = 1\n",
+        },
+    )
+    layers = layers_from(module_overrides={"adapters/high": 3})
+    _unclassified, _allowed, unallowed = ilr.direction_violations(analysis, layers, modules)
+    assert [edge.key for edge in unallowed] == ["sms_tool.adapters -> sms_tool.adapters.high"]
+
+
+def test_a_layer_outside_one_to_five_is_rejected():
+    with pytest.raises(ValueError, match="layer 1..5"):
+        layers_from(root_modules={"leaf.py": 9})
+
+
+def test_an_allow_entry_needs_a_written_reason():
+    with pytest.raises(ValueError, match="at least 5 words"):
+        layers_from(allow={"sms_tool.a -> sms_tool.b": {"reason": "because"}})
+
+
+def test_the_committed_manifest_claims_every_module():
+    layers = ilr.load_layers()
+    _files, modules, _is_package = ilr._index(ROOT)
+    assert [m for m in modules if m != "sms_tool" and ilr.layer_of(m, layers) is None] == []
+
+
+def test_the_committed_tree_has_no_unallowed_inward_edge():
+    layers = ilr.load_layers()
+    _files, modules, _is_package = ilr._index(ROOT)
+    _unclassified, _allowed, unallowed = ilr.direction_violations(ilr.analyze(ROOT), layers, list(modules))
+    assert unallowed == []

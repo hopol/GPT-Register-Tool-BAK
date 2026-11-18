@@ -1,0 +1,246 @@
+import unittest
+from typing import Any, cast
+import time
+import ast
+from contextlib import nullcontext
+from pathlib import Path
+from unittest.mock import Mock
+
+from sms_tool.registration.state import (
+    RegistrationState,
+    RegistrationStage,
+    RegistrationStageOverrun,
+    RegistrationStateMachine,
+    prepare_registration_context,
+)
+from sms_tool.registration.handlers import (
+    RegistrationEmailWorkflow,
+    RegistrationStageRunner,
+)
+from sms_tool.registration.runtime import RegistrationRuntimeState
+
+
+class Mailbox:
+    email = "user@example.com"
+
+
+class RegistrationStateTests(unittest.TestCase):
+    def test_email_registration_defaults_to_at_only_and_omits_codex_oauth_stage(self):
+        operations = Mock()
+        operations._tl.return_value = []
+        operations.runtime_config_scope.return_value = nullcontext()
+        workflow = RegistrationEmailWorkflow(
+            RegistrationStateMachine(lambda *_: None),
+            config={"registration": {}},
+            operations=operations,
+        )
+        workflow._bootstrap = Mock()
+        workflow._resume_post_create = Mock(return_value=None)
+        workflow._run_stage = Mock(return_value={"success": True})
+        workflow._set_outcome = Mock()
+        workflow._close_sessions = Mock()
+
+        workflow.run()
+
+        self.assertFalse(workflow.codex_oauth)
+        states = [call.args[0] for call in workflow._run_stage.call_args_list]
+        # ``RegistrationState.CODEX_OAUTH`` was deleted 2026-10-24, so "the email
+        # lane never enters a codex stage" is now a property of the vocabulary
+        # rather than an assertion about this run.
+        self.assertIn(RegistrationState.ACCESS_TOKEN_PROBE, states)
+
+    def test_email_registration_ignores_legacy_codex_oauth_true_flag(self):
+        operations = Mock()
+        operations._tl.return_value = []
+        operations.runtime_config_scope.return_value = nullcontext()
+        operations.select_auth_fingerprint.return_value = None
+        machine = RegistrationStateMachine(lambda *_: None)
+        workflow = RegistrationEmailWorkflow(
+            machine,
+            codex_oauth=True,
+            operations=operations,
+        )
+        workflow._bootstrap = Mock()
+        workflow._resume_post_create = Mock(return_value=None)
+        workflow._run_stage = Mock(return_value={"ok": True})
+        workflow._set_outcome = Mock()
+
+        workflow.run()
+
+        # ``codex_oauth=True`` is deliberately normalised away: the email lane is
+        # AT-only and has no codex stage left in its vocabulary (the enum member
+        # was deleted 2026-10-24).
+        self.assertFalse(workflow.codex_oauth)
+
+    def test_stage_runner_uses_one_runtime_across_real_stage_seam(self):
+        machine = RegistrationStateMachine(lambda *_: None)
+        runtime = RegistrationRuntimeState()
+        runner = RegistrationStageRunner(runtime, machine)
+
+        runner.run_stage(
+            RegistrationState.AUTH_FLOW,
+            lambda: setattr(runtime, "username", "user@example.test"),
+        )
+        runner.run_stage(
+            RegistrationState.ACCESS_TOKEN_PROBE,
+            lambda: setattr(runtime, "access_token", f"token-for:{runtime.username}"),
+        )
+
+        self.assertEqual(runtime.username, "user@example.test")
+        self.assertEqual(runtime.access_token, "token-for:user@example.test")
+        self.assertEqual(machine.snapshot()["state"], "access_token_probe")
+
+    def test_stage_runner_single_stage_is_the_production_execution_seam(self):
+        machine = RegistrationStateMachine(lambda *_: None)
+        runner = RegistrationStageRunner(object(), machine)
+        self.assertEqual(
+            runner.run_stage(RegistrationState.AUTH_FLOW, lambda: "ok", timeout_seconds=1),
+            "ok",
+        )
+
+    def test_handlers_do_not_reverse_import_registration_facade(self):
+        path = Path(__file__).resolve().parents[2] / "sms_tool" / "registration/handlers.py"
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+        imported_modules = [node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module]
+        self.assertNotIn("registration", imported_modules)
+
+    def test_stage_handler_applies_common_timeout_and_failure_transition(self):
+        events = []
+        machine = RegistrationStateMachine(lambda state, status, detail: events.append((state, status, detail)))
+        stage = RegistrationStage(RegistrationState.AUTH_FLOW, lambda _context: time.sleep(0.05), timeout_seconds=0.001)
+        with self.assertRaises(RegistrationStageOverrun):
+            stage.run(object(), machine)
+        self.assertEqual(machine.snapshot()["state"], "failed")
+        # A budget overrun must be distinguishable from a transport timeout.
+        self.assertTrue(issubclass(RegistrationStageOverrun, TimeoutError))
+        failed = [event for event in events if event[1] == "failed"][-1]
+        self.assertIn("stage_budget_exceeded", failed[2])
+
+    def test_stage_budget_is_post_hoc_and_never_cancels_the_handler(self):
+        """The budget classifies an overrun *after* the stage returns.
+
+        ``RegistrationStage.run`` runs the handler to completion on the calling
+        thread and compares elapsed time afterwards, so cleanup happens where it
+        always did and no worker thread is orphaned. That makes
+        ``stage_timeouts`` a reporting/classification budget, not a preemptive
+        stop: callers must not read it as "the stage is cancelled at N seconds".
+        A future change to mid-stage cancellation has to move cleanup off the
+        calling thread and update this test deliberately.
+        """
+        events = []
+        completed = []
+        machine = RegistrationStateMachine(lambda state, status, detail: events.append((state, status, detail)))
+
+        def handler(_context):
+            time.sleep(0.03)
+            completed.append("ran")
+            return "ignored"
+
+        stage = RegistrationStage(RegistrationState.AUTH_FLOW, handler, timeout_seconds=0.001)
+        with self.assertRaises(RegistrationStageOverrun) as caught:
+            stage.run(object(), machine)
+
+        # The handler finished before the overrun was classified, and the
+        # exception carries both numbers so the operator sees how late it was.
+        self.assertEqual(completed, ["ran"])
+        self.assertEqual(machine.snapshot()["state"], "failed")
+        self.assertGreater(caught.exception.elapsed_seconds, caught.exception.budget_seconds)
+        self.assertEqual(caught.exception.state, RegistrationState.AUTH_FLOW)
+
+    def test_stage_under_budget_returns_the_value_without_failing(self):
+        events = []
+        machine = RegistrationStateMachine(lambda state, status, detail: events.append((state, status, detail)))
+        stage = RegistrationStage(RegistrationState.AUTH_FLOW, lambda _context: "value", timeout_seconds=5)
+
+        self.assertEqual(stage.run(object(), machine), "value")
+        self.assertEqual(machine.snapshot()["state"], "auth_flow")
+        self.assertEqual([event for event in events if event[1] == "failed"], [])
+
+    def test_otp_poll_timeout_is_clamped_to_stage_budget(self):
+        workflow = RegistrationEmailWorkflow(
+            RegistrationStateMachine(lambda *_: None),
+            config={"registration": {"stage_timeouts": {"email_otp_wait": 45}}},
+            # Only ``_otp_poll_timeout()`` is exercised here; the workflow never
+            # reaches an operation, so the placeholder is deliberately not one.
+            operations=cast("Any", object()),
+        )
+        workflow.runtime.email_cfg = {"otp_timeout": 300}
+        # The blocking poll receives the smaller of its own timeout and the
+        # stage budget so the configured limit is enforced while it runs.
+        self.assertEqual(workflow._otp_poll_timeout(), 45)
+
+    def test_otp_poll_timeout_falls_back_to_config_without_budget(self):
+        workflow = RegistrationEmailWorkflow(
+            RegistrationStateMachine(lambda *_: None),
+            config={"registration": {}},
+            # Only ``_otp_poll_timeout()`` is exercised here; the workflow never
+            # reaches an operation, so the placeholder is deliberately not one.
+            operations=cast("Any", object()),
+        )
+        workflow.runtime.email_cfg = {"otp_timeout": 210}
+        self.assertEqual(workflow._otp_poll_timeout(), 210)
+
+    def test_state_machine_allows_forward_skips_and_rejects_backtracking(self):
+        events = []
+        machine = RegistrationStateMachine(lambda state, status, detail: events.append((state, status, detail)))
+        machine.transition(RegistrationState.MAILBOX_READY)
+        machine.transition(RegistrationState.AUTH_FLOW)
+
+        with self.assertRaises(ValueError):
+            machine.transition(RegistrationState.SENTINEL)
+
+        self.assertEqual(machine.snapshot()["state"], "auth_flow")
+        self.assertEqual([event[0] for event in events], ["mailbox_ready", "auth_flow"])
+
+    def test_completed_transition_does_not_claim_the_run_succeeded(self):
+        """``completed`` names the last stage, not the run's verdict.
+
+        ``COMPLETED`` is announced as soon as the pipeline runs out of stages,
+        while the outcome is decided by the caller afterwards. Reporting
+        ``success`` here made the operator log read
+        ``阶段 · 完成 (completed) — 成功`` and then, in the same second,
+        ``阶段 · 失败 (failed) — 失败`` for one attempt (27 of 179 failures
+        between 09-08 and 09-13). The terminal event now belongs solely to
+        ``registration_progress.persist``, which knows the outcome.
+        """
+        events = []
+        machine = RegistrationStateMachine(lambda state, status, detail: events.append((state, status)))
+        machine.transition(RegistrationState.FINALIZE)
+        machine.transition(RegistrationState.COMPLETED)
+
+        # The machine still records the transition itself ...
+        self.assertEqual(machine.snapshot()["state"], "completed")
+        # ... but it announces no stage outcome, least of all a successful one.
+        self.assertEqual([state for state, _status in events], ["finalize"])
+        self.assertNotIn("success", [status for _state, status in events])
+
+    def test_context_reuses_device_and_stored_password_without_exposing_them_in_repr(self):
+        context = prepare_registration_context(
+            proxy="http://proxy.example:8080",
+            mailbox=Mailbox(),
+            sentinel_data={"sentinel_token": "secret-sentinel"},
+            password=None,
+            registration_mode="password",
+            auth_base="https://auth.example",
+            chat_base="https://chat.example",
+            stored_password=lambda _email: "StoredPassword!1",
+            generate_password=lambda: "GeneratedPassword!1",
+            random_name=lambda: ("Ada", "Lovelace"),
+            random_birthdate=lambda: "1990-01-01",
+            normalize_mode=lambda value: str(value),
+            get_device_context=lambda _email: {
+                "device_id": "existing-device",
+                "auth_session_logging_id": "existing-log",
+            },
+            sentinel_device_id=lambda _data: "sentinel-device",
+            new_uuid=lambda: "new-uuid",
+        )
+
+        self.assertEqual(context.password, "StoredPassword!1")
+        self.assertEqual(context.device_id, "existing-device")
+        self.assertNotIn("StoredPassword!1", repr(context))
+        self.assertNotIn("secret-sentinel", repr(context))
+
+
+if __name__ == "__main__":
+    unittest.main()

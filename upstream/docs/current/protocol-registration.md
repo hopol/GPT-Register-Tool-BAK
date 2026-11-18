@@ -1,0 +1,819 @@
+# Protocol Registration Contract
+
+> **Scope.** Owns the wire contract: endpoints, step order, Sentinel, landing-page
+> vocabulary. Stage order and retry policy belong to
+> [registration-architecture.md](registration-architecture.md); this file does not
+> restate them.
+
+The current contract for the **email / AT protocol lane** — the non-browser
+flow that registers or logs into a ChatGPT account and ends with an access
+token. The browser lane is documented in
+[registration architecture](registration-architecture.md).
+
+This document records the wire contract only. It does not claim a live success
+rate; see [Validation limits](#validation-limits).
+
+## Owners
+
+| Concern | Module |
+| --- | --- |
+| Protocol step functions (signin, authorize, continue, OTP, TOTP) | `sms_tool/auth_flow/` (`steps`, `signup`, `login`, `otp`, `totp`) |
+| Stage order, runtime state, persistence | `sms_tool/registration/handlers.py`; bootstrap, identity, auth and register stage bodies live in `registration/bootstrap_stages.py` / `identity_stages.py` / `auth_stages.py` / `register_stages.py` and are reached through thin delegates |
+| Persistence seam, stage executor, pure helpers, email-OTP stages, account/session/AT-probe stages, edge-challenge hook, resume stage, Sentinel stages | `sms_tool/registration/persistence.py`, `registration/stage_runner.py`, `registration/protocol_helpers.py`, `registration/otp_stages.py`, `registration/account_stages.py`, `registration/edge_challenge.py`, `registration/resume.py`, `registration/sentinel_stages.py` |
+| `registration.*` boolean toggle parsing (one `Mapping`-safe, two-sided owner) | `sms_tool/registration/flags.py` — `auth_flow.steps._registration_flag` keeps a deliberate copy, because importing the leaf module from `auth_flow` would grow the import-layer ratchet |
+| Account creation and OTP validate wire calls | `sms_tool/account_creation.py` |
+| Sentinel token issuance | `sms_tool/sentinel/` (facade `sms_tool/sentinel_tokens.py`) |
+| AT probe, result contract, funnel | `sms_tool/registration/outcome.py`, `registration/result.py`, `registration/funnel.py` |
+| Protocol entry points: `run_email` / `run_batch` dispatch, runtime-config and driver selection, and the per-invocation `RegistrationOperations` binding | `sms_tool/registration/orchestrator.py` (a module, not a package — stage order and stage bodies live in `registration/handlers.py` and the sibling stage modules) |
+
+`registration/handlers.py` owns stage order (the bootstrap/identity/auth/register
+bodies sit in their own modules behind delegates); the `auth_flow/` package owns only the step
+functions. A change to endpoint order belongs in the handler, not in a
+step.
+
+## Two lanes
+
+The **server** chooses the lane, not the client. Both lanes begin with the same
+signin → authorize handshake and diverge on the landing page.
+
+- **Signup lane** — `_prepare_signup_auth_state`. The mailbox is new to the
+  server. It walks `_signup_signin_attempts()` (or
+  `_passwordless_signin_attempts()` on the passwordless Web path), then
+  `_continue_signup_username`, and settles on `/email-verification` or
+  `/create-account/password`.
+- **Existing-login lane** — `_login_existing_account_with_email_otp`, four
+  phases: `_existing_login_signin` → `_existing_login_continue` →
+  `_existing_login_probe` → `_existing_login_otp`. It is entered when the
+  signup lane lands on `/log-in/password` (`_is_existing_login_redirect`) or
+  the server answers `user_already_exists`.
+
+### Phone verification and refresh tokens belong to the one-click SMS lane
+
+The email lane does **not** rent a number when the server lands on `add-phone`.
+One-click SMS (`phone_registration` / `phone_reuse`) is a separate, decoupled
+channel; the email lane only reports the landing and leaves the account to that
+lane. This is why `registration_runtime` no longer carries a `phone_result`
+field or a `require_registration_phone_verification` switch: they had no
+producer on this path.
+
+Refresh tokens follow the same rule. A **fresh email account obtains an RT only
+through the add-phone flow**; the optional Codex OAuth collection after the AT
+probe (`registration.obtain_refresh_token`, default off) collects access/id
+tokens and must not be treated as an RT source for email-only signups.
+
+## Endpoints
+
+`{auth_base}` is `auth.openai.com`; `{chat_base}` is `chatgpt.com`. All paths
+are relative to those hosts.
+
+| Step | Method | Path | Owner |
+| --- | --- | --- | --- |
+| Prime (signup) | GET | `{auth_base}/create-account` | `registration_handlers.auth_flow` |
+| Prime (passwordless) | GET | `{chat_base}/` | `registration_handlers.auth_flow` |
+| CSRF | GET | `{chat_base}/api/auth/csrf` | `registration_handlers.auth_flow` |
+| Signin | POST | `{chat_base}/api/auth/signin/openai` | `auth_flow` (`_prepare_signup_auth_state`, `_existing_login_signin`) |
+| Authorize | GET | `{auth_base}/api/accounts/authorize` | `auth_flow` |
+| Authorize continue | POST | `{auth_base}/api/accounts/authorize/continue` | `auth_flow` (`_continue_signup_username`, `_existing_login_continue`) |
+| User register | POST | `{auth_base}/api/accounts/user/register` | `registration_handlers.user_register` |
+| OTP send | **GET** | `{auth_base}/api/accounts/email-otp/send` | `auth_flow` (`_send_existing_login_otp`) |
+| OTP resend | POST | `{auth_base}/api/accounts/email-otp/resend` | `auth_flow` (fallback only) |
+| OTP validate | POST | `{auth_base}/api/accounts/email-otp/validate` | `account_creation._validate_email_otp` |
+| Create account | POST | `{auth_base}/api/accounts/create_account` | `registration_handlers.create_account` |
+| Callback | GET | `{chat_base}/api/auth/callback/openai` | server redirect (terminal success) |
+
+The `send` endpoint's **method is per endpoint and must stay `GET`**. A POST
+arms a `login_challenge` that every later `email-otp/validate` rejects with
+`409 invalid_state`; the GET arms `passwordless_login`, which validates. Do not
+"simplify" the pair back to one method.
+
+`resend` is a fallback for endpoint-level rejections (`400`/`404`/`405`) only.
+It has never carried a challenge payload, and calling it after a bare `2xx`
+`send` acknowledgement dispatches a second code for the same transaction — stop
+on the acknowledgement instead.
+
+## Existing-login lane phases
+
+1. `_existing_login_signin` mints a CSRF token on the session that will post
+   (`_fetch_session_csrf_token`), posts signin, follows authorize, and returns
+   `(terminal, state)`. A `chatgpt.com/auth/login` landing is terminal with
+   `existing_login_signin_not_established:invalid_state` — never fall through
+   to `authorize/continue` from there.
+2. `_existing_login_continue` mints a fresh `authorize_continue` Sentinel, posts
+   the continue body, follows `continue_url`, and carries the payload forward.
+   On `/email-verification` the POST is gated by
+   `registration.existing_login_continue_on_verified_page`; when skipped, the
+   Sentinel is still minted so later OTP steps use a fresher token.
+3. `_existing_login_probe` asks `/log-in/password` whether the account has a
+   password, **before** spending an email code (`_probe_login_password_step`).
+4. `_existing_login_otp` sends the code, polls the mailbox, validates, and may
+   complete TOTP (`_complete_existing_login_totp`).
+
+Each phase returns `(terminal, state)`: a final result dict when it settles the
+login, `None` to continue; `state` carries `current_url`, the continue payload,
+and fresh Sentinel tokens.
+
+## Sentinel contract
+
+`_authorize_continue_sentinel` issues a **same-flow** token through
+`issue_sentinel_flow(flow="authorize_continue", ...)`. The result carries:
+
+- `sentinel_authorize_continue_token`
+- `sentinel_authorize_continue_so_token`
+- `sentinel_source` — `node_sdk_runner` on the current path
+- `oai_did`
+
+`_auth_request_headers` attaches the token pair to the continue, OTP and TOTP
+requests. The signup lane uses `oauth_create_account` for account creation
+(`registration_handlers.create_account`). Token issuance is validated against
+the pinned runner bundle before a batch starts; see
+[registration architecture](registration-architecture.md).
+
+### Runner transport
+
+The default path spawns the pinned runner once per token. `SMS_SENTINEL_WORKER=1`
+switches to a persistent Node process
+(`sms_tool/sentinel/runtime/sentinel-worker.js`) that loads the runner module
+once and serves one JSON request per stdin line, so a batch no longer pays Node
+startup and module load per token.
+
+The worker changes transport only: it receives the same config/challenge files
+and its output goes through the same token validation. A runner verdict (bad
+challenge, incomplete token) is raised as-is; only a transport failure (dead,
+wedged or timed-out worker) closes the worker and retries once through the
+one-shot path. The switch is off by default because Sentinel is a risk-control
+path: enable it for a controlled live comparison before making it the default.
+
+### Checkout lanes share this vocabulary but do not share the create flow
+
+`FLOW_PAGE_URLS` in `sms_tool/sentinel/client.py` is the **single** flow-to-page
+map shared by the registration and payment lanes; `issue_sentinel_flow` resolves
+through it at call time. `issue_sentinel_token` refuses any flow missing from it
+(`sentinel_flow_unsupported`), so "a name exists in the codebase" and "a name
+can be minted" are different claims.
+
+Registration flows registered there are `username_password_create`
+(`AUTH_CREATE_ACCOUNT_PASSWORD`), `authorize_continue` and `email_otp_validate`
+(both `AUTH_EMAIL_VERIFICATION`) and `oauth_create_account` (`AUTH_ABOUT_YOU`).
+
+- **`email_otp_validate`** (`EMAIL_OTP_VALIDATE_FLOW`) is what the current web
+  client binds to `POST /api/accounts/email-otp/validate`: the 2026-10-28 HAR has
+  that request's `openai-sentinel-token` **and** `openai-sentinel-so-token`
+  carrying `flow=email_otp_validate`, while `passwordless/send-otp` in the same
+  transaction carries `authorize_continue` and `create_account` carries
+  `oauth_create_account`. It is therefore **not** a rename of the lane. This repo
+  still sends `authorize_continue` on validate by default
+  (`registration.otp_validate_email_otp_validate_flow`, default `false`); the
+  name previously appeared only as a *challenge probe* in
+  `PASSWORD_PAGE_BUNDLE_FLOWS`, which mints nothing and so never needed the map
+  entry. Evidence and the A/B that would settle it:
+  `docs/audits/scans/scan-2026-10-31-har-passwordless-codex-webview.md`.
+
+Registered there are both checkout flows, and they are
+**not** interchangeable:
+
+- **Checkout create** mints `chatgpt_checkout` — `CHECKOUT_SENTINEL_FLOW` at `sms_tool/sentinel/client.py:46`, issued by `issue_checkout_sentinel` at `sms_tool/sentinel/client.py:710`.
+- **Checkout approve** mints `checkout_session_approval` — its own constant `UPI_SENTINEL_APPROVAL_FLOW` at `sms_tool/upi_link/constants.py:43`. Two rails request it explicitly: the UPI approve stage passes `sentinel_flow=UPI_SENTINEL_APPROVAL_FLOW` at `sms_tool/upi_link/stages.py:712`, and `PPLinkExtractor._fresh_approval_sentinel` mints it at `sms_tool/paypal/extract.py:245`.
+
+  🔴 **How to write a guardable pointer here** — two rules, both learned the hard
+  way by watching this pair drift by 13 lines when an unrelated `paypal/extract.py`
+  edit landed in the same series, with neither gate reporting it:
+
+  1. **The symbol name and the line number must sit on the *same* line.**
+     `scripts/docs_consistency_scan.py` is the weak tier for prose (any in-range
+     number passes), and `scripts/refresh_doc_symbol_lines.py` is the fixer -- but
+     `_rewrite` runs `_prose_edits` **per line**, so a pointer whose symbol is on the
+     previous line is unattributable and silently unguarded. That is why the
+     bullets above are single long lines instead of wrapped.
+  2. **A class method must be spelled dotted** (`Class.method`).
+     `_symbol_lines` records module-level names plus direct methods keyed as
+     `Class.method`, so an undotted `_fresh_approval_sentinel` maps to nothing.
+
+`CHECKOUT_SENTINEL_FLOW` is the **create** gate only. Do not collapse the approve
+flow onto it: the create token and the approve token are minted under different
+flows and the server reads them differently.
+
+**Token and SO need not come from the same flow.** The approve gate reads a main
+token minted under `checkout_session_approval`, but the SO it accepts carries an
+internal `flow: chatgpt_checkout` — the checkout-phase SO is *reused*, not
+re-minted. `sms_tool/upi_link/sentinel.py:443` records this as HAR #228 and
+re-consults the checkout mint for the SO even when the approval mint returned
+one. A flat one-flow-per-endpoint table is therefore *less* accurate than this
+code, not more.
+
+### The subprocess extractors now receive the Sentinel pair
+
+Until 2026-10-06 the seven extractors under `services/protocol-payment/` sent
+**no** Sentinel pair anywhere. `sms_tool/pay_link/adapters.py` passed no
+`SENTINEL*` value into their environment, none of them set the header by hand,
+and their approve was authenticated only by the account's own cookie jar
+(`oai-did` + `__Secure-next-auth.session-token`) plus the
+`x-openai-target-path` / `x-openai-target-route` markers and a per-endpoint
+`Referer`. Four of them (blik / ideal / twint / pix) also POST
+`backend-api/sentinel/ping` before approve — with **no token either**; that is a
+connectivity warm-up, and the in-process counterpart `_upi_sentinel_ping` sends
+the identical token-less header set.
+
+That silence was a **real gap, not a different gate**. A controlled A/B on the
+create endpoint — same account, same country-verified exit, same body, varying
+only the headers — settled it:
+
+| Headers sent | Result |
+| --- | --- |
+| none | `400` "Our systems have detected unusual activity" |
+| `openai-sentinel-token` alone | `200` `custom_checkout_session` |
+
+The pair now travels by **environment**, because Rule 10 forbids `services/` from
+importing `sms_tool`: `services/protocol-payment/common/protocol_core.py` owns the
+contract (`OPENAI_SENTINEL_TOKEN` / `_SO_TOKEN` / `_DEVICE_ID`,
+`sentinel_device_id()`, `openai_sentinel_headers()`) and
+`sms_tool/pay_link/adapters.py` (`_sentinel_env`) mints and injects it. The
+adapter chooses the device id **first** and hands it down, because a token binds
+to the `oai-did` that requested the challenge.
+
+🔴 **How the earlier review was boxed in (kept for the method, not the
+verdict).** An earlier revision of this section claimed "that is a different
+gate, not a missing one". A 2026-10-05 re-review could not support *or* refute
+that from the retained data, and the reason is worth keeping:
+
+| Source | Result |
+| --- | --- |
+| Source code | Conclusive for the **fact**: 6 of 7 call approve with no Sentinel (`direct_card` never calls approve). UPI and PayPal do mint `checkout_session_approval` (`sms_tool/upi_link/stages.py`, `sms_tool/paypal/extract.py:537`) |
+| 391 retained `runtime/logs/processes/*/backend_stdout.jsonl` | The extractor approve **failure path never fired**: `approve 未通过`, `approve_http_`, `approve 失败`, `approve_result_blocked` = **0 occurrences**. Says nothing about whether a token would have been needed, because success is not logged |
+| Same logs, in-process side | The mint is exercised and healthy: **65** `checkout_session_approval Sentinel ready (bridge …)` lines and **0** `Sentinel unavailable` — but all 125 `Sentinel ready` lines are UPI's bridge form, so this is **UPI-only** evidence; PayPal's `_fresh_approval_sentinel` success line appears **0** times, so that rail did not reach approve in the window |
+| Extractor `dumps/` (`ideal/dumps`, `twint/dumps`) | **Empty** — the `approve` dump is written with `force=True`, so it existed, but it was purged |
+| `protocol_payment.v1` terminal lines in logs | Not retained: `_finish_extractor` keeps stdout for parsing and only surfaces `_tail(output)` on the **failure** path, by design |
+
+**Why the logs could not answer it**: extractor success was silent. A run whose
+approve quietly succeeded was byte-identical in the logs to one that never
+reached approve, so neither hypothesis was supported — and the compensating
+mechanism was suspicious in a way the A/B later vindicated: the extractors answer
+`blocked` by **rotating the proxy up to 10 times** (`IDEAL_APPROVE_RETRY_MAX`,
+default 10, with a comment about `approve 返回 blocked`). Rotating an exit is the
+wrong lever when the real cause is a missing gate token, exactly as the
+`blocked_count` retries had previously been measured as wasted time.
+
+⇒ **Observability, not a header — landed 2026-10-05.** `_log_extractor_terminal` in
+`sms_tool/pay_link/adapters.py` emits exactly one INFO line per subprocess-extractor
+run recording `payment_method` / `ok` / `error_code` plus `contract=` and
+`exit_code=`, and **never** the contract's `error` text, `url` or `artifacts`.
+It is called from the single funnel every extractor passes through
+(`_finish_extractor`), including the timeout branch, so a new extractor cannot
+skip it.
+
+The line distinguishes four states that used to look identical: `ok=ok`,
+`ok=failed`, `ok=timeout`, and `ok=no_terminal_contract` (with `contract=absent`
+covering both a non-contract dict — e.g. direct_card's cancellation print — and
+a genuinely silent extractor). A mismatch between the contract's own
+`payment_method` and the method that was dispatched stays visible rather than
+being masked.
+
+⇒ **What to do next — and why five extractors are deliberately left unwired.**
+Two extractors are wired: **pix** and **direct_card**. The other five
+(blik / ideal / twint / kakao / momo) are not, because injecting the pair there
+cannot help:
+
+🔴 **Six of the seven cannot work on this endpoint any more.** The create call no
+longer issues `cs_*` sessions at all. Measured 2026-10-06 across every
+`checkout_ui_mode` the server accepts:
+
+| `checkout_ui_mode` | Result |
+| --- | --- |
+| `hosted` / `custom` / omitted | `200`, always `tag=custom_checkout_session`, always an `oaics_*` id |
+| `deferred` / `stripe_hosted` / `elements` | `422` |
+
+and Stripe answers an `oaics_*` id with `404 resource_missing: No such
+payment_page`. blik / ideal / twint / pix / kakao / momo drive Stripe
+`payment_pages` + `payment_methods` throughout, so **no prefix or header change
+can revive them**: they need the custom Checkout flow
+(`custom_payment_method/start` → `payment_intents/{pi}/confirm` →
+`checkout/confirm` → `checkout/approve`), or retirement in favour of the
+in-process machinery that already implements it (UPI, direct_card, gopay,
+gcash). That fork is open and deliberately undecided here.
+
+**Until it is decided, the six are `release_tier: "offline"` in
+`payment_methods.json`** (with `batch_enabled` and `registration_enabled` false, so
+the desktop batch and registration pickers no longer offer them).
+`payment_catalog.offline_method_error` is the single refusal: `generate_payment_link`
+and `run_payment_batch` return `payment_method_offline` (stage `validation`, not
+retryable) **before** any Checkout create, because a create for these methods only
+spends the account's create budget and then dies on the `cs_` prefix check. The
+read-only capability probe (`probe_only`) is exempt, since it never runs the
+extractor. Reviving one means moving its extractor onto the custom Checkout flow and
+flipping its three catalog fields back; tests opt into the real refusal with
+`@pytest.mark.enforce_offline_methods` and otherwise see the methods as online.
+
+`direct_card` is the exception because it accepts `oaics_*` and never touches
+`payment_pages`. With a country-correct exit and the injected pair it produces a
+real link end to end:
+
+```text
+extractor terminal: payment_method=direct_card ok=ok error_code=- exit_code=0
+url: https://chatgpt.com/checkout/openai_llc/oaics_<id>
+```
+
+See [account-health.md](account-health.md) for the session-family split this
+rests on, and for the create-gate token question.
+
+**Closeout (2026-10-05).** A cross-project review of `pxygit/SunnyRegister`
+(its `payment_proof_contracts.py` `ENDPOINT_FLOW` table) proposed mapping
+`checkout/confirm` and `checkout/approve` to a distinct
+`checkout_session_approval` flow. This repository already does exactly that, and
+the UPI rail additionally models the token/SO split above. **No change
+required.** Recorded here so the proposal is not re-litigated, and so nobody
+"simplifies" `CHECKOUT_SENTINEL_FLOW` into the approve flow.
+
+## Landing-page vocabulary
+
+Each predicate has exactly one owner in `auth_flow/steps.py`; do not re-derive a
+path test inline.
+
+| Predicate | Meaning |
+| --- | --- |
+| `_is_existing_login_redirect` | `/log-in` or `/login` — the server treats the address as registered |
+| `_is_chatgpt_auth_login_landing` | `chatgpt.com/auth/login` — NextAuth did not establish a session; fatal for the login lane |
+| `_is_signup_password_step` | `/create-account/password` |
+| `_is_email_verification_step` | `/email-verification` |
+| `_is_about_you_step` | `/about-you` — the signup profile step |
+| `_is_login_password_step` | `/log-in/password` (via `_login_password_page_type`) |
+| `_invalid_state_auth_response` | `invalid_state` / "session is no longer valid" — retryable `auth_state` class |
+
+## In-flow edge-challenge judgement (P0-B, S0 + S1)
+
+Until 2026-10-07 the protocol lane had **no** exit-level challenge judgement after
+preflight: every in-flow `403`/`429` collapsed into `session_circuit_open`
+(`sms_tool/http_client.py`), with no way to tell "this exit was challenged" from
+"the request was refused". The gap is expensive because it opens *after* a
+mailbox and its OTP were already spent, so a missed challenge loses a mailbox
+slot permanently while a false positive costs one extra request.
+
+`sms_tool/proxy_edge_probe.edge_challenge_verdict(response)` is that judgement.
+It is **pure and total** and answers one of three values:
+
+| Value | Meaning |
+| --- | --- |
+| `challenge` | an exit-level Cloudflare challenge — the reply classifies `BLOCKED` in the probe's own vocabulary, i.e. reachable but useless for registration |
+| `not_challenge` | the `403`/`429` is not about the exit: an already-deactivated account (excluded first, per `accounts/account_terminal.py`), or a plain `429` the origin answered |
+| `unknown` | any status other than `403`/`429` — never guess, because a successful OTP reply legitimately contains the word "challenge" (`auth_flow/otp.py`'s `login_challenge` transaction arm) |
+
+Three rules are load-bearing: only `403`/`429` get a yes/no answer; the
+judgement **reuses** `classify_edge_response` instead of a second set of
+host/header matchers; and a deactivated account is excluded before the challenge
+read, because rotating the egress cannot change that answer.
+
+**What it does today — nothing but a name.**
+`registration.edge_challenge_discrimination` (default **true**) appends a
+trailing `:edge_challenge` to `SessionCircuitOpen`'s message:
+
+```text
+session_circuit_open:http_403:retry_after=900s:edge_challenge
+```
+
+The leading `session_circuit_open` token never moves, so `failure_registry`
+classifies it exactly as before. Rotation and browser handoff are separate
+switches that stay **off**; the judgement is observation only, which is why the
+suffix can ship on by default (the A/B in
+`plan-2026-10-05-inflow-challenge-handoff.md` §4 has no other data source for
+"did a challenge happen at all").
+
+🔴 **Where it lives, and why not in `auth_state.py`.**
+`plan-2026-10-05` suggested `auth_state.py`; that is a cycle, because
+`auth_state` already imports `http_client`, and `http_client` is the owner of the
+`session_circuit_open` name the suffix rides on. The judgement therefore sits
+next to `classify_edge_response`, and `auth_state` will re-export it when the
+first consumer needs it (S2) rather than carrying an unused import.
+
+### The three invariants (§3.5)
+
+| # | Invariant | Pinned by |
+| --- | --- | --- |
+| 1 | the circuit is written only *after* the challenge path has failed, never before it — a challenge-labelled `403` still opens the breaker | `tests/registration/test_edge_challenge_verdict.py::CircuitInvariantTests::test_a_challenge_labelled_403_still_opens_the_circuit` |
+| 2 | after rotating the exit the circuit must be cleared, **including the challenge label** (`clear_session_circuit`), or the next exit inherits a challenge that never happened there | `...::test_clear_session_circuit_resets_the_challenge_label` |
+| 3 | the challenge path adds no new failure **class** — the suffix must not re-classify or change terminality | `...::test_the_suffix_does_not_change_the_failure_class` |
+
+One deliberate deviation from the plan's stage table: S0's judgement reaches the
+error string through `http_client`'s circuit rather than through the `auth_flow`
+steps, because that is where the `session_circuit_open` name is produced. The
+`auth_flow`-side consumer arrives with S2's `rotate_exit`, through `deps`'s
+existing `from ..auth_state import (...)` statement (which costs no new
+cross-directory edge).
+
+### Rotating the exit once (S2)
+
+`registration.edge_challenge_rotate_exit` (default **false**) turns the
+judgement into one action: on a challenge, move the run to a new exit **in the
+same pool** and retry the one request, exactly once.
+
+| Piece | Owner | Why there |
+| --- | --- | --- |
+| the retry, and the once-per-request cap | `http_client.request_with_retry` | it owns the response and the attempt budget |
+| the decision + the exit move | the registration handler, through the session's `_openai_edge_challenge_hook` | it owns `s.proxy`, the pool cursor, the audit counters and `clear_session_circuit` |
+| the counters | `proxy_audit` (`edge_challenge_hits` / `edge_challenge_unknown` / `edge_challenge_rotations` / `edge_challenge_rotate_failed`) → the batch funnel's `edge_challenge` block | they are **counts, not identities**: the before/after exit is a sticky-session credential and is never audited |
+
+Two consequences worth stating plainly:
+
+* **A single-slot exit short-circuits and says so.** A provider with no sticky
+  session id leaves the URL unchanged; that is counted as a *failed* rotation,
+  not as a successful one, or the A/B's `rotate` arm would be an `observe` arm
+  wearing a label.
+* **`unknown` rotates too, under its own key** (§7-5). The asymmetry says spend
+  the uncertainty on the cheap side, but merging it into `edge_challenge_hits`
+  would dilute the number the manipulation check reads. From
+  `request_with_retry` the `unknown` branch is currently unreachable (the policy
+  only runs on `403`/`429`, and the verdict answers `unknown` only off those
+  statuses); it is written and tested so the contract is complete for the next
+  caller.
+
+**Not landed: the browser handoff (S4).** The sign-off chose "reuse
+`browser_flow`, default to returning to the protocol lane", and that needs a
+browser-driver mode which does not exist yet — `run_browser_registration` runs a
+*complete* registration and accepts no cookie jar. Landing
+`registration.edge_challenge_browser_handoff` before that mode exists would be a
+switch that nothing executes, which is the fake-comparison failure the mechanism
+gate above exists to prevent. See `plan-2026-10-05` §3.4.2.
+
+## Device identity observation (S0)
+
+Every protocol registration attempt records where its `oai-did` came from, with
+no behaviour change (`plan-2026-10-10-fingerprint-device-layer.md` §3 S0). After
+`prepare_identity` the handler emits, through `operator_output.emit`:
+
+```text
+  Device identity: oai-did=<first 8 chars> reused=<true|false> seeded=<none|email>
+```
+
+`reused` is true only when `get_device_context` returned a stored id, which today
+means the address already has a row in `accounts`. An address that never
+registered therefore reads `reused=false` on **every** run: the current baseline
+is a fresh random `oai-did` per attempt. `seeded` is `none` unless the S1 toggle
+below is on. The same facts ride on every result and progress row as
+`device_identity` (`registration_result.safe_device_identity`), and
+`registration_funnel` aggregates them over **all** attempts, not only successes:
+
+```text
+device_identity: {reused, fresh, unknown, seeded_by_email}
+```
+
+`unknown` means "not recorded" (for example a browser-driver row), never "fresh".
+`oai-did` is a credential-level identifier: only its first 8 characters are ever
+written, in the log line, the result and the progress row.
+
+### Seeding by email (S1, default off)
+
+`registration.device_identity_seeded_by_email` (default `false`) changes only the
+**source** of `oai-did` and `auth_session_logging_id`: when on, and the address has
+no stored id, both become a pure function of the casefolded email
+(`registration_state.seeded_device_identity`, a uuid5 under this repo's private
+salt, deliberately not turb's literal). A stored id in `accounts` always wins, so
+already-registered addresses behave as before. Sentinel SID, datadog ids and the
+fingerprint profile are untouched. When on, the handler emits
+`Device identity seeded by email` and the S0 line reads `seeded=email reused=false`.
+
+Because the same address yields the same ids on every run, an A/B must use
+**different addresses per arm** (`p2-1-device-identity-seeded` in
+`registration-ab-runbook.md`). The harness only gates on the mechanism line; the
+operator reads the funnel's `seeded_by_email` count and the ceiling check.
+
+## Dispatch verdict reads the value (2026-10-11)
+
+`auth_state.otp_dispatch_verdict` used to treat the *presence* of
+`passwordless_email_otp_send_pending` as "stuck". A browser HAR shows the key
+present with `false` after a healthy dispatch, so presence cannot separate the
+two. The dump summary now carries the boolean (`signals`), and the verdict reads
+it: `false` is `dispatched`, `true` is `stuck`, and an unreadable value keeps the
+old presence reading. Samples recorded as `email_otp_send_stuck` before this
+change may include healthy dispatches whose mailbox poll was skipped.
+
+## Passwordless explicit send-otp (P3-1, default on since 2026-10-11)
+
+The default flipped to on after a live comparison (same exit IN, fresh
+addresses): 5/5 explicit registrations versus 1/5 legacy, all four legacy
+failures stuck on `pending=true`. That is below the pre-registered 30 per arm, so
+the harness still reads `underpowered`; the flip is an operating decision, not a
+finished A/B. `false` restores the legacy assumed pre-send and is the baseline arm.
+
+`registration.passwordless_explicit_send_otp` (default `true`) makes the
+passwordless lane POST `/api/accounts/passwordless/send-otp` the way the
+verification page does in the browser HAR: empty body, no `Content-Type`, a fresh
+`authorize_continue` Sentinel (token only), `x-access-flow-invocation-id`,
+`x-openai-document-navigation-id` and `Sec-Fetch-*` of an XHR. It emits
+`Passwordless explicit send-otp` and then
+`Passwordless send-otp: status=<n> pending=<true|false|unknown> mode=<enum>`.
+A Sentinel failure fails the arm rather than degrading to the assumed pre-send.
+The password lane ignores the toggle. Evidence and unknowns:
+`docs/audits/scans/scan-2026-10-11-har-passwordless-signup.md`; design:
+`registration-ab-runbook.md` (P3-1).
+
+## OTP validate Sentinel flow (default off, 2026-10-31)
+
+`registration.otp_validate_email_otp_validate_flow` (default `false`) decides which
+Sentinel flow the `email-otp/validate` request carries. `false` keeps
+`authorize_continue` (turb's 2026-09-14 observation, unchanged behaviour); `true`
+mints `email_otp_validate`, the flow the current web client binds to that request
+(2026-10-28 HAR: `token.flow` and `so.flow` both `email_otp_validate`). The switch is
+only reachable through `registration.otp_validate_sentinel`, which decides *whether*
+a pair is sent at all, and it is scoped to validate: `passwordless/send-otp` keeps
+`authorize_continue` and `create_account` keeps `oauth_create_account`. Both arms
+pass today, which is why this is a pre-registered single-variable A/B rather than a
+swap; the token and SO are stored under their own bundle keys
+(`sentinel_email_otp_validate_token` / `…_so_token`) so neither arm can silently
+reuse the other's pair. Evidence:
+`docs/audits/scans/scan-2026-10-31-har-passwordless-codex-webview.md`.
+
+**A/B result (2026-10-31, 30 attempted per arm, powered).** 29/30 with
+`authorize_continue` versus 30/30 with `email_otp_validate` on the same mailbox
+source (remail iCloud), the same ten IN exits, an adjacent window and
+`otp_validate_sentinel=true` in both arms; the only failure in either arm was one
+`network` (stage `unknown`), and neither arm had an `auth_state` failure. The
+delta 0.0333 is inside the pre-registered 0.05, so `compare` returns
+`inconclusive` with the reason "the flow name is not enforced on this endpoint":
+the switch buys nothing and stays off. Note what this did **not** test -- the
+`otp_validate_sentinel` default (`false`, no pair at all) is unchanged.
+
+## Reference lane (default off)
+
+`registration.reference_lane` (default `false`, `sms_tool/registration/reference_lane.py`)
+runs the reference project's `main.py` password stage order as one lane:
+preflight → anonymous ChatGPT bootstrap (`accounts/check`, CES settings, `me`,
+regional pricing) → `providers` → `csrf` → signin from `/auth/login`
+(`login_or_signup` + `prompt=login`, relative `callbackUrl`, turb
+signin/authorize context) → authorize → `GET /create-account/password` (fatal
+landing, navigation headers) → password-page Sentinel bundle (`frame.html`, then
+`email_otp_validate` / `username_password_create` / `authorize_continue` sharing
+one `p`) → `user/register` → `GET email-otp/send` → code → validate with a fresh
+`authorize_continue` Sentinel (+SO) → `external_url` branch or about-you →
+`oauth_create_account` Sentinel (+SO) → `create_account` → callback + session →
+authenticated warm-up. The switch forces `email_registration.registration_mode=password`
+and turns on the existing toggles it needs (`registration_reference_lane.LANE_FLAGS`,
+`chatgpt_bootstrap`, `humanize`) **over** explicit `false` values, because shipped
+configs list every toggle explicitly. Markers: `Reference lane: pre-signin bootstrap`,
+`Anonymous bootstrap: statuses=...`, `Auth providers: status=...`.
+
+On this lane a `passwordless_email_otp_send_pending` flag left in the post-send
+`client_auth_session` dump does **not** abort the run (`email_otp_send_stuck` is kept
+for the other lanes): the reference never reads it, and in the 2026-10-12 lane5 run
+all three runs stopped by it had a verification mail in the mailbox. Marker:
+`Email OTP send still shows pending; reference lane polls the mailbox anyway`.
+
+Sentinel is on SDK `20260810913b`. That SDK no longer folds the session-observer
+output into `token()`; the runner calls `sessionObserverToken(flow)` and emits it as
+`_so`, which `issue_sentinel_token` strips from the main token and wraps for
+`OpenAI-Sentinel-SO-Token`. The previous stack never sent an SO header although the
+challenge reported `so.required=true` for `authorize_continue` / `oauth_create_account`.
+`chatgpt`-family requests now claim the live web build (`CHATGPT_CLIENT_*` in
+`auth_headers.py`).
+
+`registration.chatgpt_bootstrap.enabled` (default `false`) now also drives a
+protocol-lane warm-up (`sms_tool/registration/warmup.py`): right after the
+access token is confirmed, 14 read-only bearer GETs (consent, `me`,
+`accounts/check`, models, conversations, ...) plus a dwell taken from
+`registration.post_registration_dwell_seconds_range`, logged as
+`Post-signup warm-up: ok=<n>/<m> dwell=<s>s`. It never raises. Measured
+2026-10-11 (n<=7 per arm): it does **not** stop the access token from being
+revoked within 5-15 minutes, nor does 2FA; see
+`docs/audits/scans/scan-2026-10-11-at-revocation-survival.md`.
+`scripts/at_survival_watch.py` records the liveness curve for any account ids.
+
+Update 2026-10-12 (audit §12): that measurement was on the SDK that sent no SO
+header. On `20260810913b` with the SO header, 9/9 accounts (4 lane/password, 4
+passwordless without warm-up, 1 earlier lane) stayed alive through 60 minutes, so
+neither the password arm nor the warm-up is what matters. The SDK cannot be used
+without SO (`create_account` -> `registration_disallowed`, 0/5). n is small and the
+exit/mailbox supplier are single; treat it as a strong lead, not a proven fix.
+
+Update 2026-10-23 (scan `scan-2026-10-23-live-protocol-registration-at-survival.md`):
+re-measured on the shipped default stack (passwordless + explicit send-otp, SDK
+`20260810913b` with SO, reference lane off, warm-up off, 2FA on) with **3 fresh
+accounts on US residential exits** (Proxylane, Charter/Comcast) and a different
+mailbox supplier (ReMail iCloud): registration 3/3, and every account answered
+HTTP 200 at 1/5/10/15 min, at 60 min, and again at 135-142 min. Nothing dropped
+inside the 10-minute window the 2026-10-11 audit made the failure signature. n=3,
+one exit supplier and one mailbox source, so the attribution to "old SDK / missing
+SO" is still an inference, not a proven cause.
+
+The shipped default is that measured stack: passwordless `login_or_signup`, SDK
+`20260810913b` with the SO header, `reference_lane` off, warm-up off
+(`tests/registration/test_default_registration_stack.py` pins it). No switch is needed to get it.
+
+Retry rule: when the password lane already got `user/register` 200, any later failure
+is tagged `|password_claimed_unfinished` (`failure_registry.PASSWORD_CLAIMED_MARKER`).
+The batch does not retry that account with a fresh proxy session and the retry guard
+records a permanent dead end, because every new session for that address answers
+`invalid_auth_step`. Failures before the POST, passwordless runs (no POST),
+`email_otp_send_stuck`, and runs that already hold a token keep the old rules.
+
+`--check-promotion-after-registration` probes each account's promotion **right
+after that account is saved** (inside `persist_registration_result`, before the
+next registration), because the access token only lives minutes. The batch end
+merges the per-account reports (`merge_promotion_reports`) and probes only the
+leftovers (deferred AT probe, replayed persistence); it no longer re-probes an
+account that already has a result, which used to overwrite it with `AT失效`.
+Not ported from the reference repo (`turb-gpt-free-register`,
+`AUTO_PLAN_CHECK_AFTER_REGISTER`): its 2 s re-check for a Free account without
+trial eligibility, because here each probe persists, so a failed re-check could
+replace a good first result; no measurement shows eligibility lags signup.
+
+Relogin has two matching switches under `codex_oauth`:
+`browser_style_send_otp` (default `true` since 2026-10-11; same send shape, fresh
+Sentinel bound to this device; `false` restores the cached-Sentinel `json={}`
+send; not yet measured on relogin itself) and `password_first_relogin` (default
+`false`; a forced email-OTP relogin first tries the saved
+password and spends a code only if that fails). The password path now also
+completes a saved TOTP challenge. The relogin send always logs
+`pending=… mode=…` when it answers 200.
+
+Relogin of a passwordless-registered account (audit §13, 2026-10-12): such an
+account holds no password, and the password-step probe answers
+`password_form_present` for every address, so the probe's "password step but no
+password" refusal (`existing_login_password_required`) is now applied only when the
+caller passes `allow_passwordless=False` (the two registration-lane callers do).
+The recovery path continues to the email code, which on a live account completes
+(`email-otp/validate` 200, `mfa/verify` 200, session 200). `mfa/verify` is also the
+only step that reveals a deactivated account (403 `account_deactivated`, after
+`validate` and `issue_challenge` both answered 200); that verdict is kept in the
+error (`existing_login_totp_verify_failed:403:account_deactivated`), so the recovery
+chain records the account as terminal. A 401 access token on such an account is
+therefore usually a deactivated account, not a refreshable session: 0 of 43 recent
+401 iCloud accounts could be relogged in, 28 were confirmed deactivated.
+
+## Client fingerprint baseline (2026-10-23 HAR)
+
+The 2026-10-23 `chatgpt.com` HAR (Chrome 155 / Windows 11 24H2) is the current
+reference for the protocol lane's client hints. Values the code must keep in
+sync (`sms_tool/auth_headers.py`, `sms_tool/fingerprint_pool.py`):
+
+| Field | Current value | Note |
+| --- | --- | --- |
+| `sec-ch-ua` | measured per impression: `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"` | **not hand-written**: every chrome profile's literal is what the installed curl_cffi sends for that same impression (Chrome rotates the GREASE brand and the brand order every few majors) |
+| `sec-ch-ua-full-version-list` | derived: same brands / order / grease, versions widened to `x.0.0.0` | built from the profile's own `sec_ch_ua`, so the header and the SDK's `navigator.userAgentData` cannot disagree |
+| `sec-ch-ua-arch` / `-bitness` / `-model` / `-platform-version` | **not sent by default** | a real Chrome emits these only after the origin asks with `Accept-CH`; the 2026-10-28 HAR has zero of them on chatgpt.com/auth.openai.com. `email_registration.auth_fingerprint.restore_high_entropy_hints` restores all five for the control arm |
+| `sec-ch-ua-platform-version` | `19.0.0` | Windows 11 24H2+; the UA still says `Windows NT 10.0` (sent only in the control arm) |
+| `oai-client-version` | `26.1022.91109` | chatgpt.com backend requests; the web client no longer sends `oai-client-build-number` |
+| `oai-language` | the profile's short locale tag (`hi-IN`) | chatgpt.com backend requests; the 2026-10-28 HAR sends it on `me`, `accounts/check` and both sentinel chat-requirements calls |
+| `x-openai-document-navigation-id` | one page-level value | sent on `passwordless/send-otp`, `email-otp/validate` and `create_account` |
+| `x-access-flow-invocation-id` | one value **per request** | the three auth POSTs differ; the run-level value in `base_headers` is overridden |
+
+The profile matrix keeps `chrome146` as a persisted-account key and stops there:
+`chrome146` is the newest impersonation `curl_cffi` 0.16.0 exposes (the 2026-10-28
+HAR is Chrome 156, which `curl_cffi` cannot mimic). The `chrome150` entry that
+shipped on 2026-10-23 was removed on 2026-10-31 — it could never be selected as an
+impersonation, so it could only fail closed in the preflight
+(`auth_fingerprint_unavailable:chrome150`) or fall back silently and send
+Chrome/150 hints over a 146 TLS fingerprint.
+
+Sentinel SDK: the HAR was served `20260219f9f6`; the repo pins the newer
+`20260810913b` (both are still served). No endpoint or request-body change was
+observed: `passwordless/send-otp` is body-less, `email-otp/validate` sends
+`{"code"}`, and `create_account` sends `{"name","birthdate"}`.
+
+## Device fingerprint consistency (2026-11-11)
+
+Three cross-layer contradictions were closed in one pass; each one is a value the
+server receives in the Sentinel proof, so none of them needed a live A/B to
+establish that it *could* be checked.
+
+### 1. Platform-aware device measurements
+
+`auth_headers._device_profile()` used one Windows-desktop table for every
+profile, so `safari18_0_ios` reported `screen=2560x1080, dpr=1.25` next to
+`navigator.platform="iPhone"` and `maxTouchPoints=5`, and macOS Safari reported a
+Windows ultrawide panel. Measured over 3000 pool draws: **9.4 % iOS + 9.7 %
+macOS** of protocol registrations carried that contradiction.
+
+The tables are now keyed by platform class (`_SCREEN_CHOICES_BY_PLATFORM` and the
+DPR / CPU / memory / heap siblings), and the cache key includes the class so a
+profile swap cannot reuse the previous platform's measurements.
+`auth_headers.validate_protocol_fingerprint()` asserts the invariants (platform ↔
+UA, touch points ↔ platform, screen ↔ platform bounds, DPR ↔ platform, locale ↔
+Accept-Language, zone ↔ offset) and `identity_stages` logs any violation —
+diagnostic only, never fatal.
+
+The reference implementation (`sentinel-rs/src/fingerprint.rs`) uses the same
+shape (`WINDOWS_SCREENS` / `MAC_SCREENS` / `_IPHONE_SCREENS` plus a
+`validate_fingerprint` that rejects `is_mobile`/`max_touch_points` mismatches).
+
+### 2. `timezoneName` is an OS label, not an IANA id
+
+`Intl.DateTimeFormat().resolvedOptions().timeZoneName` reports
+`Japan Standard Time`, never `Asia/Tokyo`. The protocol profile never set it, so
+`sentinel/runner.py` fell back to the IANA string while
+`client._requirements_token` formatted `%Z` (`JST`) — the two halves of one
+registration disagreed with each other *and* with a real browser. The profile now
+carries `timezone_name` from `geo.profiles.WINDOWS_TIMEZONE_BY_IANA` (the same
+table the browser lane uses) and both producers format that label.
+
+### 3. Per-account TLS ClientHello order
+
+`curl_cffi` impersonation presets are shared by every client; measured against
+`tls.peet.ws`, all four Firefox profiles (`firefox144/147/135/133`) produced the
+**same** `ja3_hash` (`6f7889b9fb1a62a9577e685c1fcfa919`), i.e. 50 % of the pool's
+weight sat behind one value a WAF can blacklist in a single line. Chrome presets
+already permute their extension order per handshake; Safari's order is fixed too.
+
+`sms_tool/tls_fingerprint.py` permutes the **order** of the profile's own
+extension list (never the set) deterministically from the account's device seed
+and installs it as a `CurlOpt.TLS_EXTENSION_ORDER` session option. Verified
+2026-11-11 through the configured residential exit: three seeds → three distinct
+`ja3_hash` values, all answering HTTP 200 at `auth.openai.com` with this project's
+own header set.
+
+| Family | JA3 before | After | Notes |
+| --- | --- | --- | --- |
+| Firefox (50 % weight) | one shared value | per account | extension order permuted |
+| Chrome (25 %) | already permuted | unchanged | preset permutes per handshake; explicit order would *remove* that |
+| Safari (18 %) | one per version | unchanged | permuting its list is rejected by BoringSSL (`curl: (35) Invalid TLS extensions`) |
+
+HTTP/2 (Akamai) is deliberately untouched: the presets are `curl-impersonate`
+native targets, `extra_fp` cannot rewrite their SETTINGS, and
+`Session(akamai=...)` needs the exact base string, which curl_cffi 0.16.0 does not
+expose — a guessed base produced a hash matching no real Chrome.
+
+Config: `registration.tls_fingerprint` (`enabled`, `rotate_extensions`,
+`seed_salt`). Evidence: `scripts/tls_fingerprint_probe.py` (`--seeds` offline,
+`--capture` / `--live` need network).
+
+### 4. `performance.memory` is Chromium-only
+
+The vendored runner exposed `performance.memory` on every profile. It is now
+built only for Chromium, matching Gecko/WebKit. This is the one local patch to
+`runtime/sentinel-runner.js`; `bundle.py:RUNNER_SHA256` pins the patched bytes and
+`THIRD_PARTY_NOTICES.md` records the patch.
+
+## Requirements-token parity (2026-11-12)
+
+The requirements token (`p`) is the one proof this repo builds in Python instead
+of letting the SDK build it — it is what the challenge is *fetched with*, so the
+SDK cannot produce it. `client._requirements_token` therefore has to be a
+byte-faithful copy of `sdk.js getConfig()`, and five divergences were closed:
+
+| Slot | Real SDK (`getConfig()`) | Was | Now |
+| --- | --- | --- | --- |
+| `p[2]` | `performance.memory.jsHeapSizeLimit` — **`null`** on Gecko/WebKit | always an integer | family-gated (`_CHROMIUM_FAMILIES`) |
+| `p[10]` | random `Object.keys(Object.getPrototypeOf(navigator))` key + `"−"` + `String(value)` | constant `userAgent−function userAgent() { [native code] }` | `sentinel/surface.py`, per-account sample |
+| `p[11]` | random `Object.keys(document)` key | constant `body` | `sentinel/surface.py` |
+| `p[12]` | random `Object.keys(window)` key | constant `crypto` | `sentinel/surface.py` |
+| `p[24]` | `Number("InstallTrigger" in window)` — 1 on Gecko only | constant `1` (wrong for Chrome/Safari = 46.4 % of the pool) | family-gated + `window.InstallTrigger` added to the shim for Firefox |
+
+`p[13]`/`p[17]` (`performance.now()` / `performance.timeOrigin`) used to be two
+independent randoms, so `Date.now() ≈ timeOrigin + now()` failed on **98.8 %** of
+500 measured device seeds (largest gap 887 s). Both are now derived from one
+`performance.timeOrigin` (page age 25 s – 15 min, floor chosen against the
+reference HAR's `p[13]=27894.9`), and the runner receives that same origin as
+`pageTimeOrigin`, so the VM's own proof describes the same page instead of a
+node process that started 30 ms ago.
+
+`Accept-Encoding` is family-gated too (`accept_encoding_for`): `zstd` is
+Chrome 123+/Firefox 126+, but WebKit only from **Safari 26.3**, so the six Safari
+profiles (19.2 % of the pool) no longer advertise a coding their engine cannot
+decode.
+
+The gate is `tests/registration/test_sentinel_proof_parity.py`: it runs the real
+runner against a synthetic PoW challenge (`difficulty="f"` always passes, no
+network), decodes both proofs and compares them slot by slot — exact equality on
+every deterministic slot, candidate-membership checks on the three random ones,
+and the clock identity on both halves. `sentinel/surface.py`'s candidate sets are
+asserted against the live VM (key exists, rendering byte-equal), which is what
+keeps the tables from drifting away from the shim.
+
+## Validation limits
+
+Offline tests cover step ordering, redirect classification and Sentinel header
+plumbing. They do not establish a live registration or login success rate.
+Changing the lane choice, the `send` method, the continue-on-verified-page
+toggle, the password-page prime (including whether a wrong landing is fatal),
+the signup continue's declared screen (on the lane's own continue or on the
+extra one issued from `/email-verification`), the signin/authorize context,
+Sentinel flow selection, or anything in the OTP stage (the send navigation's
+headers, whether `validate` carries a Sentinel pair, and whether a finished
+transaction skips `create_account`) requires a controlled live comparison, not
+an offline transaction test. The pre-registered A/B design, collection and
+comparison for **every** outstanding comparison is
+[`registration-ab-runbook.md`](registration-ab-runbook.md) — its table is the
+single list, so this paragraph does not enumerate them and cannot drift from it
+— driven by `scripts/registration_ab.py`.
+
+🔴 **A comparison needs two manipulation checks, not one.** Verifying that the
+config carried the toggle is not enough: on 2026-10-07 the
+`signup_continue_screen_hint` arm ran with the toggle on while the code path was
+unreachable, so the arm measured nothing and its 5/5 failure was almost read as
+"the hypothesis is false". `collect` therefore also records whether the arm's
+**log** shows the toggle's own line (`mechanism_ok`), and `compare` returns
+`manipulation_failed` -- ahead of `underpowered` -- when it does not. New
+toggles must register a mechanism line emitted through
+`sms_tool.operator_output.emit` in `scripts/registration_ab.py` (a bare `print`
+reaches only the stdout mirror, so a `collect --log .../sms_tool.log` run cannot
+see it, and a marker whose trigger is conditional must declare
+`"conditional": true` so its absence is `not_judgeable`, not
+`manipulation_failed`); see the runbook's mechanism table.
+
+## Read-only registration probe
+
+`sms_tool/registration/probe.py` answers "is this mailbox new to OpenAI?" with
+the same `signin -> authorize` handshake the signup lane uses, and stops at the
+authorize landing. It never posts `authorize/continue`, registers a password,
+sends an OTP or creates an account. `classify_registration_landing` maps an
+auth `/create-account[/password]` landing to `unregistered`, `/log-in*` and the
+`login_password` / `mfa_challenge` page types to `registered`, and an
+`/email-verification` landing without a verification mode to `unknown` — the
+follow-up `authorize/continue` needed to disambiguate may dispatch an OTP, so it
+is deliberately not taken. A transport failure is `unknown` with an `error`
+field; "not probed" is never reported as "registered".
