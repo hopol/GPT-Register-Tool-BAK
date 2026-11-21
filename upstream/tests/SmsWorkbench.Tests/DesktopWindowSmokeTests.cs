@@ -499,6 +499,216 @@ public sealed class DesktopWindowSmokeTests
         }
     }
 
+    /// <summary>
+    /// The account-detail panel is XAML since 2026-11-20 and its window actions
+    /// arrive through <see cref="IAccountDetailActions"/>. Both halves are asserted
+    /// here: the bindings render what the view carries, and each button reaches
+    /// exactly one command.
+    /// </summary>
+    private static void VerifyAccountDetailDialog(Action<string> stage)
+    {
+        var row = new PoolRow
+        {
+            Identifier = "detail@example.com",
+            Status = "已注册",
+            PayPalUrl = "https://pay.openai.com/x",
+            AccountType = "Session",
+        };
+        var actions = new RecordingAccountDetailActions();
+        var view = new AccountDetailView
+        {
+            Identifier = row.Identifier,
+            Status = row.Status,
+            SummaryItems = new[]
+            {
+                new AccountDetailSummaryItem("邮箱", row.Identifier),
+                new AccountDetailSummaryItem("类型", "—"),
+            },
+            PayPalUrl = row.PayPalUrl,
+            DetailText = "line-1" + Environment.NewLine + "line-2",
+            AccessToken = "token-value",
+        };
+
+        stage("account detail dialog: bindings");
+        var dialog = new AccountDetailDialog(null!, row, view, actions);
+        dialog.Show();
+        dialog.UpdateLayout();
+
+        // Expected through the translation point, never as the Chinese literal: the
+        // active language follows the operator's preference (first launch follows the
+        // OS UI language), so a literal pin asserts what the *machine* says. It did --
+        // CI's en-US runner rendered "Account details - detail@example.com" and this
+        // line was the only failure of the run, while the button assertions below
+        // stayed green because they already go through `Loc.T`.
+        Assert.Equal(Localization.Loc.F("账号详情 - {0}", row.Identifier), dialog.Title);
+
+        stage("account detail dialog: the title follows the language");
+        // Both shipped languages, so neither this machine's culture nor a switch
+        // earlier in the run can decide the result.
+        try
+        {
+            foreach (Localization.AppLanguage language in new[] { Localization.AppLanguage.En, Localization.AppLanguage.Zh })
+            {
+                Localization.Loc.Instance.SetLanguage(language);
+                var localized = new AccountDetailDialog(null!, row, view, actions);
+                Assert.Equal(Localization.Loc.F("账号详情 - {0}", row.Identifier), localized.Title);
+                localized.Close();
+            }
+        }
+        finally
+        {
+            Localization.Loc.Instance.SetLanguage(Localization.AppLanguage.Zh);
+        }
+
+        Assert.Same(view, dialog.DataContext);
+        var summary = FindVisualChildren<ItemsControl>(dialog).First();
+        Assert.Equal(2, summary.Items.Count);
+        var detailBox = FindVisualChildren<TextBox>(dialog)
+            .Single(box => box.AcceptsReturn);
+        Assert.Equal("line-1" + Environment.NewLine + "line-2", detailBox.Text);
+        Assert.False(detailBox.IsReadOnly == false, "the detail blob must stay read-only");
+
+        Button ButtonWith(string key) => FindVisualChildren<Button>(dialog)
+            .Single(button => Equals(button.Content, Localization.Loc.T(key)));
+
+        Assert.True(ButtonWith("一键复制AT").IsEnabled);
+        Assert.True(ButtonWith("打开支付链接").IsEnabled);
+        Assert.True(ButtonWith("复制支付链接").IsEnabled);
+        ButtonWith("关闭").RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        Assert.False(dialog.IsVisible);
+
+        stage("account detail dialog: buttons reach their command");
+        var targets = new AccountDetailDialog(null!, row, view, actions);
+        targets.Show();
+        targets.UpdateLayout();
+        FindVisualChildren<Button>(targets).Single(b => Equals(b.Content, Localization.Loc.T("打开源文件")))
+            .RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        FindVisualChildren<Button>(targets).Single(b => Equals(b.Content, Localization.Loc.T("复制支付链接")))
+            .RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        FindVisualChildren<Button>(targets).Single(b => Equals(b.Content, Localization.Loc.T("打开支付链接")))
+            .RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        Assert.Equal(new[] { "open-source", "copy-paypal", "open-paypal" }, actions.Calls);
+
+        stage("account detail dialog: check-alive closes first");
+        actions.Calls.Clear();
+        FindVisualChildren<Button>(targets).Single(b => Equals(b.Content, Localization.Loc.T("账号测活")))
+            .RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        Assert.Equal(new[] { "check-alive" }, actions.Calls);
+        Assert.False(targets.IsVisible, "the probe opens its own UI; the panel must be gone");
+
+        stage("account detail dialog: no AT disables the copy button");
+        var withoutToken = new AccountDetailDialog(
+            null!,
+            row,
+            new AccountDetailView { Identifier = row.Identifier, DetailText = "" },
+            new RecordingAccountDetailActions());
+        withoutToken.Show();
+        withoutToken.UpdateLayout();
+        Assert.False(FindVisualChildren<Button>(withoutToken).Single(b => Equals(b.Content, Localization.Loc.T("一键复制AT"))).IsEnabled);
+        Assert.False(FindVisualChildren<Button>(withoutToken).Single(b => Equals(b.Content, Localization.Loc.T("打开支付链接"))).IsEnabled);
+        withoutToken.Close();
+    }
+
+    /// <summary>Records which detail-panel command ran, in order.</summary>
+    private sealed class RecordingAccountDetailActions : IAccountDetailActions
+    {
+        public List<string> Calls { get; } = new();
+
+        public void OpenSourceFile(PoolRow row) => Calls.Add("open-source");
+
+        public void OpenPayPal(PoolRow row) => Calls.Add("open-paypal");
+
+        public void CopyPayPal(PoolRow row) => Calls.Add("copy-paypal");
+
+        public void CheckAlive(PoolRow row) => Calls.Add("check-alive");
+    }
+
+    /// <summary>
+    /// Batch progress is now a XAML window; cancellation still fires once and a
+    /// programmatic close does not masquerade as an operator cancellation.
+    /// </summary>
+    private static void VerifyBatchProgressDialog(Action<string> stage)
+    {
+        int cancellations = 0;
+        var owner = new Window { AllowsTransparency = true, WindowStyle = WindowStyle.None };
+        owner.Show();
+        var dialog = new AccountBatchProgressWindow(owner, "Batch", 3, () => cancellations++);
+        dialog.Show();
+        dialog.UpdateLayout();
+
+        Assert.Equal("0 / 3", Assert.IsType<TextBlock>(dialog.FindName("CountText")).Text);
+        dialog.UpdateProgress(2, 3, "account@example.com", "step 2");
+        Assert.Equal("2 / 3", Assert.IsType<TextBlock>(dialog.FindName("CountText")).Text);
+        Assert.Equal(2, Assert.IsType<ProgressBar>(dialog.FindName("ProgressIndicator")).Value);
+        Assert.Equal("account@example.com  step 2", Assert.IsType<TextBlock>(dialog.FindName("DetailText")).Text);
+
+        stage("batch progress: cancel callback is once-only and window remains open");
+        Assert.True(dialog.IsVisible);
+        Assert.True(dialog.CancellationRequested is false);
+        Button cancel = Assert.IsType<Button>(dialog.FindName("CancelButton"));
+        cancel.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        Assert.Equal(1, cancellations);
+        Assert.False(cancel.IsEnabled);
+        Assert.True(dialog.IsVisible, "cancel requests work but must not close the progress window");
+        Assert.True(dialog.CancellationRequested);
+
+        stage("batch progress: programmatic close does not request cancellation again");
+        dialog.ForceClose();
+        Assert.False(dialog.IsVisible);
+        Assert.Equal(1, cancellations);
+        owner.Close();
+    }
+
+    /// <summary>
+    /// The export-format picker is XAML since 2026-11-20. This is the test the
+    /// conversion bought: the structure (9 formats, CPA preselected) and the
+    /// click -> tag wiring are asserted on the real template, which the
+    /// 90-line `new Grid/ComboBox` version could not offer.
+    /// </summary>
+    private static void VerifyExportFormatDialog(Action<string> stage)
+    {
+        stage("export format dialog: structure");
+        var dialog = new ExportFormatDialog();
+        dialog.Show();
+        dialog.UpdateLayout();
+
+        Assert.Equal(Localization.Loc.T("一键导出"), dialog.Title);
+        var box = Assert.IsType<ComboBox>(dialog.FindName("FormatBox"));
+        Assert.Equal(2, box.SelectedIndex);
+        string?[] tags = box.Items.Cast<ComboBoxItem>().Select(item => item.Tag as string).ToArray();
+        Assert.Equal(
+            new[] { "txt", "json", "cpa", "sub2api", "cockpit", "9router", "codex", "axonhub", "codexmanager" },
+            tags);
+        Assert.Equal("CPA JSON", ((ComboBoxItem)box.Items[2]!).Content);
+        TextBlock description = FindVisualChildren<TextBlock>(dialog)
+            .Single(block => block.TextWrapping == TextWrapping.Wrap);
+        Assert.True(description.Text.Length > 0, "the multi-format caveat must still be rendered");
+        Assert.Equal(2, FindVisualChildren<Button>(dialog).Count());
+        dialog.Close();
+
+        stage("export format dialog: export returns the selected tag");
+        var modal = new ExportFormatDialog();
+        modal.Loaded += (_, _) => modal.Dispatcher.BeginInvoke(new Action(() =>
+        {
+            Button export = FindVisualChildren<Button>(modal)
+                .First(button => Equals(button.Content, Localization.Loc.T("导出")));
+            export.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        }));
+        Assert.True(modal.ShowDialog());
+        Assert.Equal("cpa", modal.SelectedFormat);
+
+        stage("export format dialog: cancel returns empty");
+        var cancelled = new ExportFormatDialog();
+        cancelled.Loaded += (_, _) => cancelled.Dispatcher.BeginInvoke(new Action(() =>
+        {
+            Button cancel = FindVisualChildren<Button>(cancelled)
+                .First(button => Equals(button.Content, Localization.Loc.T("取消")));
+            cancel.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+        }));
+        Assert.False(cancelled.ShowDialog());
+        Assert.Equal("", cancelled.SelectedFormat);
+    }
+
     private static void VerifyAccountScanSummary()
     {
         var results = new List<Dictionary<string, object>>
@@ -616,6 +826,12 @@ public sealed class DesktopWindowSmokeTests
             VerifyComboBoxPopup();
             stage("verify scrollable controls");
             VerifyScrollableEditorsAndTables();
+            stage("verify export format dialog");
+            VerifyExportFormatDialog(stage);
+            stage("verify account detail dialog");
+            VerifyAccountDetailDialog(stage);
+            stage("verify batch progress dialog");
+            VerifyBatchProgressDialog(stage);
 
             stage("show settings window");
             var settingsViewModel = new SettingsViewModel(

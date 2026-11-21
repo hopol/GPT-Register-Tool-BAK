@@ -17,7 +17,7 @@
 
 GPT-Register-Tool 采用 **WPF 桌面端 + Python 业务核心**，提供邮箱 OTP 注册、账号与 Session 管理、代理配置、协议支付链接提取和账号导出能力。运行数据默认保存在本机，不写入 Git。
 
-当前发布说明：[release-v2026.11.12.md](docs/releases/release-v2026.11.12.md)。
+当前发布说明：[release-v2026.11.20.md](docs/releases/release-v2026.11.20.md)。
 
 
 ## 赞助商
@@ -113,8 +113,8 @@ flowchart TB
 | ③ 应用工作流 | `registration/orchestrator.py`、`registration/handlers.py` | 注册入口（入口分派 + `RegistrationOperations` 绑定）与协议泳道：阶段顺序、Sentinel 签发、OTP、AT 探活 |
 | ③ 应用工作流 | `batch_runner.py`、`registration/pulse.py` | 并发与脉冲调度、JIT AT 门禁、原子断点与断点续跑 |
 | ③ 应用工作流 | `registration_drivers/` | 浏览器驱动（playwright · camoufox · roxy · cloak）与 `browser_flow/`、`external_sessions/` |
-| ③ 应用工作流 | `accounts/`、`codex_oauth.py` | 存量账号恢复与 Codex OAuth；不负责新注册 |
-| ④ 领域契约 | `registration/result.py`、`registration/flags.py`、`checkout_contract.py`、`payment/wire.py`、`desktop_ipc.py` | 每次调用绑定一次的不可变接缝；`RegistrationOperations` 为固定接口，不作为活模块传入工作流 |
+| ③ 应用工作流 | `accounts/`、`codex/oauth.py` | 存量账号恢复与 Codex OAuth；不负责新注册 |
+| ④ 领域契约 | `registration/result.py`、`registration/flags.py`、`checkout_contract.py`、`payment/wire.py`、`desktop/ipc.py` | 每次调用绑定一次的不可变接缝；`RegistrationOperations` 为固定接口，不作为活模块传入工作流 |
 | ⑤ Provider / 持久化适配&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | `auth_flow/` | 步骤函数：signin / authorize / continue / OTP / TOTP |
 | ⑤ Provider / 持久化适配&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | `sentinel/` | Sentinel Token 签发（Node `sdk.js` runner） |
 | ⑤ Provider / 持久化适配&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | `mailbox/service.py`、`mailbox/strategies.py`、`providers/` | 邮箱路由、能力解析、轮询策略与 provider 传输 |
@@ -127,13 +127,23 @@ flowchart TB
 更详细的边界说明见 [架构说明](docs/architecture.md)，目录职责见 [目录职责](docs/directory-map.md)。
 
 
+## 常见问题
+
+先在 [docs/current/faq.md](docs/current/faq.md) 找一遍，那里每条都有实测数据或上游契约作为依据：
+
+- **新号没有 Plus 试用 / 优惠** —— 上游按来源放量，实测 10 个 iCloud 账号 `trial_eligible=0`，不是指纹可修项。
+- **iCloud 收不到验证码** —— ReMail 旧域名 2026-11-16 作废（必须用 `remail.best`），且 iCloud 订单的 `serviceToken` 只在订单详情返回。
+- **没有密码 / 找不到 2FA** —— 只有 password 模式设密码；2FA 默认登记，secret 在 `accounts.totp_secret`。
+- **提链报 `unusual activity`** —— checkout 侧风控，换出口或冷却后重试。
+
 ## 部署方式
 
 ### 环境要求
 
 - Windows 10/11 x64。
 - Python 3.12 或更高版本（与 `scripts/runtime_manifest.json` 里打包的解释器一致；3.10/3.11 从未被任何门禁验证过）。
-- `curl_cffi==0.16.0`。注册预检会校验安装版本和 `chrome146` profile；旧版本不会进入邮箱采购或注册阶段。
+- `curl_cffi==0.17.0`。注册预检会校验安装版本（0.15–0.17）和 `chrome152` profile；旧版本不会进入邮箱采购或注册阶段。
+- 可选第二传输后端 `wreq>=0.13.0,<0.14`（`PROTOCOL_HTTP_CLIENT=wreq` / `email_registration.protocol_http_backend`，默认 `curl_cffi`）；未安装或无法运行所选指纹时**直接失败**，不静默回退。
 - .NET 10 Desktop Runtime；从源码编译时需要 .NET 10 SDK。
 - **Node.js 18+**（`node` 需在 PATH）：Sentinel Token 的 quickjs 提取器用 `node` 运行 OpenAI 真实 `sdk.js`，缺失会导致注册阶段 OTP 静默丢失。
 - **Playwright Chromium**：MoMo/直卡等协议支付的 Stripe init 走 Chromium 网络栈完成 TLS，需执行 `python -m playwright install chromium`。

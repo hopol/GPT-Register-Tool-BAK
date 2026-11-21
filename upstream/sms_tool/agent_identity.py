@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from curl_cffi import requests as curl_requests
 
-from .codex_export import build_codex_json
+from .codex.export import build_codex_json
 from .config import CFG
 from .kernel.paths import output_dir
 from .phone_proxy import normalize_proxy_url
@@ -170,7 +170,7 @@ def rebuild_agent_identity(email="", source_data=None, export_dir="", proxy="", 
     json_path = str(data.get("json_path") or "").strip()
     target_email = str(email or data.get("email") or "").strip().lower()
     if not data and target_email:
-        from .session_refresh import _load_seed_session
+        from .session.refresh import _load_seed_session
 
         data, json_path = _load_seed_session(email=target_email)
     if not target_email:
@@ -258,7 +258,7 @@ def _refresh_agent_identity_codex_rt(data, json_path="", proxy=""):
     _raw_auth_session: object = source.get("auth_session")
     auth_session: dict = _raw_auth_session if isinstance(_raw_auth_session, dict) else {}
     try:
-        from .codex_export import _openai_refresh_token, _refresh_with_openai_oauth
+        from .codex.export import _openai_refresh_token, _refresh_with_openai_oauth
 
         refresh_token = _openai_refresh_token(source, auth_session)
         if not refresh_token:
@@ -279,7 +279,7 @@ def _refresh_agent_identity_chatgpt_session(data, email, json_path="", proxy="",
     if not _has_chatgpt_session(source):
         return None, json_path, ""
     try:
-        from .session_refresh import _load_seed_session, refresh_session
+        from .session.refresh import _load_seed_session, refresh_session
 
         refreshed = refresh_session(
             email=email,
@@ -299,7 +299,7 @@ def _refresh_agent_identity_chatgpt_session(data, email, json_path="", proxy="",
 
 
 def _persist_agent_identity_source(data, json_path=""):
-    from .session_refresh import _save_refreshed
+    from .session.refresh import _save_refreshed
 
     return _save_refreshed(dict(data or {}), json_path)
 

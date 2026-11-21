@@ -1,13 +1,19 @@
 # Core dependencies
-curl_cffi==0.16.0
+curl_cffi==0.17.0
+# Optional second protocol transport (``PROTOCOL_HTTP_CLIENT=wreq`` /
+# ``email_registration.protocol_http_backend``). Rust stack, so its ClientHello
+# family is independent of curl-impersonate; declared (not optional) because
+# ``sms_tool.http_backend`` must be able to answer "installed?" honestly instead
+# of relying on an ad-hoc import. Requires CPython >= 3.11 by wheel tag.
+wreq>=0.13.0,<0.14
 # IANA timezone database.  Windows ships none, so ``zoneinfo.TZPATH`` is empty
 # and every ``ZoneInfo("America/New_York")`` raises.  That silently broke:
 #   - browser_fingerprint_pool: offset fell back to the hardcoded DST value
 #   - sentinel/client.py: the requirements token fell back to the *local
 #     machine's* clock while claiming the profile's timezone
 #   - sentinel/runner.py: ``timezoneOffsetMinutes`` was 0 for every registration
-tzdata>=2024.1
-cryptography>=41.0.0
+tzdata>=2026.6
+cryptography>=50.0.2
 PyNaCl>=1.5.0
 httpx[http2,socks]>=0.28.0
 requests>=2.31.0
@@ -17,10 +23,21 @@ pyotp>=2.9.0
 psutil>=7.0,<8
 
 # Anti-detect browser (preferred)
-camoufox[geoip]>=0.4.0
+camoufox[geoip]>=0.5.9
 browserforge>=0.1.0
 
-# Browser automation fallback
+# Browser automation fallback.
+# 🔴 `<0.6` is a ceiling on a *behaviour* change, not on style: from 0.7 on,
+# `ensure_binary()` calls `_claim_free_key()` and raises
+# `CloakBrowserLicenseError` when no key is configured, so the free binary these
+# docs promise (`CLOAK_LICENSE_KEY=""` -> free build, no account) would need a
+# claimed license key (env `CLOAKBROWSER_LICENSE_KEY` or `cloakbrowser login`).
+# Measured 2026-11-19 on 0.7.2 with the free binary already cached on disk:
+# launch dies with "No CloakBrowser license key" before a page opens. 0.5.9 only
+# gates its *newer* binary that way and runs its bundled v146 archive keylessly,
+# which is exactly what our cloak driver smoke-tested (webdriver=False, 2.3 s).
+# Delete the ceiling only together with the license step in the docs,
+# `config.example.json` and `.github/dependabot.yml`'s ignore list.
 cloakbrowser>=0.5.3,<0.6
 
 # CAPTCHA solving (Playwright-based)
@@ -33,4 +50,4 @@ qrcode[pil]>=7.4.2
 # (called from paypal/orchestrator.py strategy selection).
 # Was previously undeclared while being imported at both sites, so the whole
 # fallback silently degraded to "not installed" on every fresh install.
-nodriver>=0.45
+nodriver>=0.50.99

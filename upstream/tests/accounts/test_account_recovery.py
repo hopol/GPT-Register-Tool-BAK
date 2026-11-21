@@ -3,7 +3,7 @@ from contextlib import contextmanager
 
 from sms_tool.accounts import account_recovery
 from sms_tool.accounts import recovery_batch
-from sms_tool import codex_oauth
+from sms_tool.codex import oauth as codex_oauth
 from sms_tool.mailbox.router import MailboxAccount
 from sms_tool.accounts.account_identity import create_registration_identity
 
@@ -59,7 +59,7 @@ def test_liveness_explicit_proxy_wins_over_configured_pool():
 
 
 def test_chatgpt_email_relogin_requires_saved_mailbox():
-    with patch("sms_tool.codex_oauth._mailbox_from_data", return_value=None):
+    with patch("sms_tool.codex.oauth._mailbox_from_data", return_value=None):
         result = account_recovery.relogin_chatgpt_email_account({"email": "ok@example.com"})
 
     assert result == {"ok": False, "mode": "chatgpt_email_otp", "error": "missing_mailbox"}
@@ -174,7 +174,7 @@ def test_refresh_local_quota_keeps_probe_health_when_persistence_fails():
 def test_refresh_local_quota_statuses_emits_terminal_event_per_account(monkeypatch):
     events = []
     monkeypatch.setenv("SMSWORKBENCH_EVENTS", "1")
-    monkeypatch.setattr("sms_tool.desktop_ipc.emit_event", lambda payload, enabled=None: events.append(payload) or True)
+    monkeypatch.setattr("sms_tool.desktop.ipc.emit_event", lambda payload, enabled=None: events.append(payload) or True)
     monkeypatch.setattr(
         account_recovery,
         "_local_quota_accounts",
@@ -1156,9 +1156,9 @@ def test_relogin_auto_persists_permanent_deactivation():
 def test_relogin_persists_only_after_http_200_probe():
     oauth_result = {"ok": True, "tokens": {"access_token": "new_at", "refresh_token": "rt_new"}}
     with (
-        patch("sms_tool.codex_oauth.refresh_codex_oauth_session", return_value=oauth_result),
+        patch("sms_tool.codex.oauth.refresh_codex_oauth_session", return_value=oauth_result),
         patch(
-            "sms_tool.codex_oauth._save_oauth_tokens",
+            "sms_tool.codex.oauth._save_oauth_tokens",
             return_value={"ok": True, "mode": "codex_oauth_pkce", "persisted": True},
         ) as save,
         patch.object(
@@ -1177,9 +1177,9 @@ def test_relogin_persists_only_after_http_200_probe():
 def test_codex_relogin_does_not_claim_saved_token_after_persistence_failure():
     oauth_result = {"ok": True, "tokens": {"access_token": "new_at", "refresh_token": "rt_new"}}
     with (
-        patch("sms_tool.codex_oauth.refresh_codex_oauth_session", return_value=oauth_result),
+        patch("sms_tool.codex.oauth.refresh_codex_oauth_session", return_value=oauth_result),
         patch(
-            "sms_tool.codex_oauth._save_oauth_tokens",
+            "sms_tool.codex.oauth._save_oauth_tokens",
             return_value={
                 "ok": True,
                 "mode": "codex_oauth_pkce",
@@ -1249,6 +1249,28 @@ def test_successful_relogin_replaces_stale_quota_401_metadata():
     assert "access_token" not in data["quota"]["last_result"]
 
 
+def test_successful_relogin_clears_transport_error_without_a_401_marker():
+    """A verified 200 retires the failure, whatever the error's wording.
+
+    Field report (2026-11-20): a ``web_session`` attempt killed by a dead exit
+    records ``web_session_access_token_probe_failed:unknown`` -- no ``401``, no
+    ``token_invalid`` -- so the old marker whitelist kept it through the OTP
+    relogin that followed. The account then read 失败 in the WPF 状态 column
+    while 账号测活 reported it 正常.
+    """
+    data = {
+        "status": "registered",
+        "error": "web_session_access_token_probe_failed:unknown",
+        "refresh_token_status": "no_rt",
+    }
+    probe = {"ok": True, "status": "active", "status_code": 200, "quota_status": "可用"}
+
+    account_recovery._mark_successful_relogin(data, probe, now=123)
+
+    assert "error" not in data
+    assert data["status"] == "registered"
+
+
 def test_successful_relogin_clears_stale_promotion_at_marker():
     data = {
         "status": "at_invalid",
@@ -1281,9 +1303,9 @@ def test_refresh_token_recovery_verifies_before_persisting():
         "account_scan": {"token_probe": {"status": "token_invalid", "status_code": 401}},
     }
     with (
-        patch("sms_tool.codex_export._openai_refresh_token", return_value="rt_old"),
+        patch("sms_tool.codex.export._openai_refresh_token", return_value="rt_old"),
         patch(
-            "sms_tool.codex_export._refresh_with_openai_oauth",
+            "sms_tool.codex.export._refresh_with_openai_oauth",
             return_value={
                 "ok": True,
                 "data": {"access_token": "new_at", "oauth_refresh_token": "rt_new"},
@@ -1294,7 +1316,7 @@ def test_refresh_token_recovery_verifies_before_persisting():
             "probe_account_liveness",
             return_value={"ok": True, "status": "active", "status_code": 200},
         ) as probe,
-        patch("sms_tool.session_refresh._save_refreshed", return_value="session.json") as save,
+        patch("sms_tool.session.refresh._save_refreshed", return_value="session.json") as save,
     ):
         result = account_recovery.relogin_refresh_token_account(account)
 
@@ -1312,9 +1334,9 @@ def test_refresh_token_recovery_verifies_before_persisting():
 def test_refresh_token_recovery_rejects_unverified_candidate():
     account = {"email": "ok@example.com", "oauth_refresh_token": "rt_old"}
     with (
-        patch("sms_tool.codex_export._openai_refresh_token", return_value="rt_old"),
+        patch("sms_tool.codex.export._openai_refresh_token", return_value="rt_old"),
         patch(
-            "sms_tool.codex_export._refresh_with_openai_oauth",
+            "sms_tool.codex.export._refresh_with_openai_oauth",
             return_value={
                 "ok": True,
                 "data": {"access_token": "new_at"},
@@ -1325,7 +1347,7 @@ def test_refresh_token_recovery_rejects_unverified_candidate():
             "probe_account_liveness",
             return_value={"ok": False, "status": "token_invalid", "status_code": 401},
         ),
-        patch("sms_tool.session_refresh._save_refreshed") as save,
+        patch("sms_tool.session.refresh._save_refreshed") as save,
     ):
         result = account_recovery.relogin_refresh_token_account(account)
 
@@ -1341,9 +1363,9 @@ def test_web_session_rejects_a_cookie_for_another_account():
         "auth_session": {"user": {"email": "other@example.com"}},
     }
     with (
-        patch("sms_tool.session_refresh._refresh_session_protocol", return_value={"ok": True, "data": candidate}),
+        patch("sms_tool.session.refresh._refresh_session_protocol", return_value={"ok": True, "data": candidate}),
         patch.object(account_recovery, "probe_account_liveness") as probe,
-        patch("sms_tool.session_refresh._save_refreshed") as save,
+        patch("sms_tool.session.refresh._save_refreshed") as save,
     ):
         result = account_recovery.relogin_web_session_account({"email": "ok@example.com"})
 
@@ -1471,7 +1493,7 @@ def test_liveness_transport_failure_retries_configured_pool(monkeypatch):
 
 def test_desktop_read_hides_stale_promotion_at_marker_after_verified_200():
     import json as json_mod
-    from sms_tool.desktop_read import _record_payload
+    from sms_tool.desktop.read import _record_payload
 
     stale_label = "AT" + chr(0x5931) + chr(0x6548)
 
@@ -1551,7 +1573,7 @@ def test_browser_recovery_uses_driver_from_browser_identity():
             "probe_account_liveness",
             return_value={"ok": True, "status": "active", "status_code": 200},
         ),
-        patch("sms_tool.session_refresh._save_refreshed", return_value="session.json"),
+        patch("sms_tool.session.refresh._save_refreshed", return_value="session.json"),
     ):
         result = account_recovery.relogin_browser_session_account(account)
 
@@ -1923,7 +1945,7 @@ def test_relogin_hands_the_stored_password_to_the_login_probe():
         return {"ok": False, "error": "existing_login_password_verify_failed:401"}
 
     with (
-        patch("sms_tool.codex_oauth._mailbox_from_data", return_value=Mock()),
+        patch("sms_tool.codex.oauth._mailbox_from_data", return_value=Mock()),
         patch("sms_tool.auth_headers.select_auth_fingerprint"),
         patch("sms_tool.sentinel_tokens._set_oai_did_cookie"),
         patch("sms_tool.http_client.request_with_retry", return_value=Mock(status_code=200)),
@@ -1951,7 +1973,7 @@ def _capturing_relogin(account: dict, stored_password: str):
         return {"ok": False, "error": "existing_login_password_verify_failed:401"}
 
     with (
-        patch("sms_tool.codex_oauth._mailbox_from_data", return_value=Mock()),
+        patch("sms_tool.codex.oauth._mailbox_from_data", return_value=Mock()),
         patch("sms_tool.auth_headers.select_auth_fingerprint"),
         patch("sms_tool.sentinel_tokens._set_oai_did_cookie"),
         patch("sms_tool.http_client.request_with_retry", return_value=Mock(status_code=200)),

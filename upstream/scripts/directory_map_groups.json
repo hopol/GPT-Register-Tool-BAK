@@ -45,14 +45,11 @@
       "sms_tool/mail_otp.py",
       "sms_tool/smsbower.py",
       "sms_tool/nexsms.py",
-      "sms_tool/phone_reuse.py",
-      "sms_tool/phone_config.py",
-      "sms_tool/phone_pool.py",
-      "sms_tool/phone_provider_lifecycle.py",
       "sms_tool/phone_proxy.py",
       "sms_tool/sms_provider_adapter.py",
       "sms_tool/sms_providers.py",
-      "sms_tool/mailbox/*.py"
+      "sms_tool/mailbox/*.py",
+      "sms_tool/phone/*.py"
     ],
     "Mailbox facades and polling primitives": [
       "sms_tool/outlook_imap.py",
@@ -61,9 +58,8 @@
     "Browser registration drivers": [
       "sms_tool/registration_drivers/*.py",
       "sms_tool/registration_drivers/**/*.py",
-      "sms_tool/browser_pool.py",
-      "sms_tool/browser_fingerprint_pool.py",
-      "sms_tool/fingerprint_pool.py"
+      "sms_tool/fingerprint_pool.py",
+      "sms_tool/browser/*.py"
     ],
     "Registration state and policy": [
       "sms_tool/telemetry.py",
@@ -80,7 +76,7 @@
       "sms_tool/chatgpt_bootstrap.py",
       "sms_tool/humanize.py",
       "sms_tool/page_truth.py",
-      "sms_tool/browser_profile_reclaim.py"
+      "sms_tool/browser/*.py"
     ],
     "Sentinel issuance": [
       "sms_tool/sentinel/__init__.py",
@@ -91,12 +87,11 @@
       "sms_tool/sentinel/surface.py"
     ],
     "OAuth and auth HTTP helpers": [
-      "sms_tool/codex_oauth.py",
-      "sms_tool/http_utils.py"
+      "sms_tool/http_utils.py",
+      "sms_tool/codex/*.py"
     ],
     "Registration/auth": [
       "sms_tool/cross_process_gate.py",
-      "sms_tool/session_builder.py",
       "sms_tool/accounts/account_2fa.py",
       "sms_tool/auth_flow/__init__.py",
       "sms_tool/auth_flow/deps.py",
@@ -115,16 +110,15 @@
       "sms_tool/otp_strategy.py",
       "sms_tool/auth_state.py",
       "sms_tool/error_classification.py",
-      "sms_tool/codex_sentinel.py",
-      "sms_tool/codex_phone.py",
-      "sms_tool/phone_registration.py",
-      "sms_tool/session_refresh.py",
       "sms_tool/registration/*.py",
-      "sms_tool/tls_fingerprint.py"
+      "sms_tool/tls_fingerprint.py",
+      "sms_tool/codex/*.py",
+      "sms_tool/session/*.py",
+      "sms_tool/phone/*.py"
     ],
     "Agent Identity / explicit import": [
       "sms_tool/agent_identity.py",
-      "sms_tool/sub2api_import.py"
+      "sms_tool/importers/sub2api.py"
     ],
     "Workspace compatibility": [
       "sms_tool/k12_client.py",
@@ -155,13 +149,10 @@
       "sms_tool/checkout_contract.py",
       "sms_tool/capability_browser.py",
       "sms_tool/gen_pp_link.py",
-      "sms_tool/wallet_provider.py",
-      "sms_tool/wallet_transport.py",
-      "sms_tool/gcash_provider.py",
-      "sms_tool/gcash_transport.py",
       "sms_tool/regional_payment_adapter.py",
       "sms_tool/paypal/*.py",
-      "sms_tool/payment/*.py"
+      "sms_tool/payment/*.py",
+      "sms_tool/wallet/*.py"
     ],
     "Payment-link state machine": [
       "sms_tool/pay_link/*.py",
@@ -181,8 +172,8 @@
     ],
     "Payment execution and reconciliation": [
       "sms_tool/paypal/*.py",
-      "sms_tool/nodriver_paypal.py",
-      "sms_tool/omakse_client.py"
+      "sms_tool/omakse_client.py",
+      "sms_tool/browser/*.py"
     ],
     "Payment SMS helpers": [
       "sms_tool/sms_utils.py"
@@ -190,11 +181,10 @@
     "Account data/import/export": [
       "sms_tool/account_seed.py",
       "sms_tool/storage.py",
-      "sms_tool/codex_export.py",
-      "sms_tool/cpa_import.py",
-      "sms_tool/sub2api_import.py",
-      "sms_tool/session_converter.py",
-      "sms_tool/import_targets.py"
+      "sms_tool/importers/sub2api.py",
+      "sms_tool/importers/*.py",
+      "sms_tool/codex/*.py",
+      "sms_tool/session/*.py"
     ],
     "Email change workflow": [
       "sms_tool/accounts/account_email_change.py",
@@ -202,12 +192,11 @@
       "sms_tool/storage.py"
     ],
     "Desktop read transport": [
-      "sms_tool/desktop_read.py",
-      "sms_tool/desktop_serve.py",
-      "SmsWorkbench/Interop/DesktopReadClient.cs"
+      "SmsWorkbench/Interop/DesktopReadClient.cs",
+      "sms_tool/desktop/*.py"
     ],
     "Desktop event transport": [
-      "sms_tool/desktop_ipc.py"
+      "sms_tool/desktop/*.py"
     ],
     "Mailbox credential writeback": [
       "sms_tool/mailbox/*.py"
@@ -223,7 +212,8 @@
       "sms_tool/accounts/account_events.py",
       "sms_tool/accounts/account_health.py",
       "sms_tool/accounts/account_health_queue.py",
-      "sms_tool/accounts/account_lifecycle.py"
+      "sms_tool/accounts/account_lifecycle.py",
+      "sms_tool/accounts/account_import.py"
     ],
     "Payment contracts, catalog and stage gates": [
       "sms_tool/operation_journal.py",
@@ -239,8 +229,7 @@
     "Shared utilities": [
       "sms_tool/endpoints.py",
       "sms_tool/http_client.py",
-      "sms_tool/captcha_solver.py",
-      "sms_tool/nodriver_captcha.py",
+      "sms_tool/http_backend.py",
       "sms_tool/promotion_states.py",
       "sms_tool/doctor.py",
       "sms_tool/utils.py",
@@ -248,7 +237,8 @@
       "sms_tool/driver_env.py",
       "sms_tool/operator_output.py",
       "sms_tool/stdout_mirror.py",
-      "sms_tool/proxy/*.py"
+      "sms_tool/proxy/*.py",
+      "sms_tool/browser/*.py"
     ],
     "Transport retry primitives": [
       "sms_tool/backoff.py"

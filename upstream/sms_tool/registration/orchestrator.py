@@ -124,8 +124,8 @@ _MODULE_EXPORTS: dict[str, tuple[str, str]] = {
     "curl_requests": ("curl_cffi", "requests"),
     "current_auth_fingerprint": ("sms_tool.auth_headers", "current_auth_fingerprint"),
     "ensure_not_cancelled": ("sms_tool.registration.cancel", "ensure_not_cancelled"),
-    "import_cookie_header": ("sms_tool.codex_sentinel", "import_cookie_header"),
-    "load_cached_sentinel": ("sms_tool.codex_sentinel", "load_cached_sentinel"),
+    "import_cookie_header": ("sms_tool.codex.sentinel", "import_cookie_header"),
+    "load_cached_sentinel": ("sms_tool.codex.sentinel", "load_cached_sentinel"),
     "normalize_proxy_url": ("sms_tool.phone_proxy", "normalize_proxy_url"),
     "poll_email_otp": ("sms_tool.mailbox.router", "poll_email_otp"),
     "prepare_registration_context": ("sms_tool.registration.state", "prepare_registration_context"),
@@ -133,7 +133,7 @@ _MODULE_EXPORTS: dict[str, tuple[str, str]] = {
     "registration_cancel_requested": ("sms_tool.registration.cancel", "registration_cancel_requested"),
     "request_registration_cancel": ("sms_tool.registration.cancel", "request_registration_cancel"),
     "runtime_file": ("sms_tool.kernel.paths", "runtime_file"),
-    "with_sentinel": ("sms_tool.codex_sentinel", "with_sentinel"),
+    "with_sentinel": ("sms_tool.codex.sentinel", "with_sentinel"),
 }
 
 if TYPE_CHECKING:  # pragma: no cover - static checkers only
@@ -166,7 +166,7 @@ if TYPE_CHECKING:  # pragma: no cover - static checkers only
         curl_cffi_capabilities,
         current_auth_fingerprint,
     )
-    from sms_tool.codex_sentinel import (  # noqa: F401
+    from sms_tool.codex.sentinel import (  # noqa: F401
         import_cookie_header,
         load_cached_sentinel,
         with_sentinel,
@@ -271,7 +271,7 @@ from sms_tool.otp_strategy import (
     _poll_registration_email_otp,
     send_registration_email_otp as _send_registration_email_otp,
 )
-from sms_tool.phone_registration import run_phone_register as _run_phone_register_impl
+from sms_tool.phone.registration import run_phone_register as _run_phone_register_impl
 from sms_tool.registration.operations import (
     RegistrationOperations,
     RegistrationOtpPollingOperations,
@@ -306,7 +306,7 @@ from sms_tool.sentinel_tokens import (
     _set_oai_did_cookie,
     assert_sentinel_device_id,
 )
-from sms_tool.session_builder import build_session_file
+from sms_tool.session.builder import build_session_file
 from sms_tool.utils import (
     _generate_password,
     _print_timings,

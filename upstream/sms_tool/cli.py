@@ -9,7 +9,7 @@ from typing import Any
 
 from .config import CFG, ConfigError, default_config_dir, initialize_config_shards, initialize_runtime_config
 from .diagnostics import install_safe_stdio, safe_print
-from .desktop_ipc import emit_result
+from .desktop.ipc import emit_result
 from .kernel.paths import output_dir, runtime_file
 from .registration_drivers.base import driver_choices
 from .kernel.sanitizer import sanitize_text
@@ -666,7 +666,7 @@ def _main_early_commands(args) -> bool:
     body.
     """
     if getattr(args, "desktop_serve", False):
-        from .desktop_serve import serve_forever
+        from .desktop.serve import serve_forever
 
         raise SystemExit(serve_forever())
     if getattr(args, "proxy_list", False) or getattr(args, "proxy_test", False) or getattr(args, "proxy_screen", False):
@@ -695,7 +695,7 @@ def _main_early_commands(args) -> bool:
             print_doctor_report(report)
         raise SystemExit(0 if getattr(args, "desktop_ipc", False) else report["failed"])
     if args.desktop_read:
-        from .desktop_read import (
+        from .desktop.read import (
             create_account_file,
             create_mailbox_file,
             create_payment_url_file,
@@ -730,6 +730,12 @@ def _main_early_commands(args) -> bool:
         # --desktop-ipc` emitted the result frame, then ran the registration
         # preflight, printed error frames and exited 2).  The docstring above
         # already promised this contract.
+        return True
+    if getattr(args, "import_account_json", None):
+        # Handled here, not in the dispatcher: importing an export needs neither
+        # the config-heavy startup nor the registration pipeline, and `main`'s
+        # length is pinned by scripts/function_length_ratchet.py.
+        _import_account_json(args)
         return True
     return False
 
@@ -1078,6 +1084,10 @@ def _import_cpa(args):
     return account_commands.import_cpa(args, _account_command_context())
 
 
+def _import_account_json(args):
+    return account_commands.import_account_json(args)
+
+
 def _check_promotion(args):
     return account_commands.check_promotion(args, _account_command_context())
 
@@ -1191,7 +1201,7 @@ def _one_click_scan(args):
 
 
 def _persist_one_click_sms_failure(data, json_path, email, result):
-    from .codex_oauth import persist_one_click_sms_failure
+    from .codex.oauth import persist_one_click_sms_failure
 
     _load_storage_deps()
     return persist_one_click_sms_failure(data, json_path, email, result, upsert=upsert_account)

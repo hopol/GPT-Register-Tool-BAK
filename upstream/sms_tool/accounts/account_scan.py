@@ -14,8 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..codex_export import _openai_refresh_token, _refresh_with_openai_oauth
-from ..codex_oauth import collect_codex_oauth_tokens
+from ..codex.export import _openai_refresh_token, _refresh_with_openai_oauth
+from ..codex.oauth import collect_codex_oauth_tokens
 from .account_terminal import text_has_account_deactivated
 from .account_liveness import probe_account_liveness
 from .account_recovery import (
@@ -24,7 +24,7 @@ from .account_recovery import (
 )
 from .recovery_batch import refresh_local_quota_statuses
 from ..http_client import is_transient_transport_error
-from ..session_refresh import _load_seed_session
+from ..session.refresh import _load_seed_session
 from ..storage import upsert_account
 from ..workspace_scan import inspect_workspace, parse_workspace_fallback_ids
 from ..kernel.error_classification import classify_error
@@ -520,7 +520,18 @@ def _persist_scan(data: dict[str, Any] | None, json_path: str, result: dict[str,
             updated["status"] = "registered"
     elif result.get("ok"):
         updated["success"] = True
-        if str(updated.get("error") or "").strip().lower() in {
+        # An active token probe *is* the liveness verdict, so every earlier
+        # failure recorded in ``error`` is stale -- the same rule
+        # ``store.markers.mark_quota_status`` applies on a verified 200. Keeping
+        # the old whitelist meant an arbitrary transient shape
+        # (``web_session_access_token_probe_failed:unknown``) survived a later
+        # alive scan and the WPF 状态 column rendered 失败 for a healthy account
+        # (measured 2026-11-20: 测活 printed 正常 2，掉号 0，其他失败 0 while both
+        # rows showed 失败). An inconclusive probe keeps the error: there the
+        # scan learned nothing that supersedes it.
+        if _token_probe_is_active((result or {}).get("token_probe") or {}):
+            updated.pop("error", None)
+        elif str(updated.get("error") or "").strip().lower() in {
             "account_deactivated",
             "add_phone_required",
             "secondary_phone_verification_required:add_phone_required",

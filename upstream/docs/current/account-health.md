@@ -56,6 +56,30 @@ account.
   counted there. `正常 2/2，AT失效 2` is therefore a correct line (both healthy
   now, both entered the batch with a dead AT) — read `success` for health and
   `at_invalid` for "how many needed recovery".
+- **A verdict is written back to the row, in both directions.** A probe that
+  answers HTTP 200 retires the row's recorded `error` and turns a stored
+  `at_invalid` back into `registered`; a definitive 401 (or the `token_invalid`
+  label the probe produces) turns the row into `at_invalid`. One writer
+  (`store.markers.mark_quota_status`) and one definition of “definitive”
+  (`store.normalize._probe_is_token_invalid`): a transport failure
+  (`status: unknown`, `status_code: 0`) is neither, so a blocked exit never
+  marks an account dead, and a confirmed deactivation
+  (`account_deactivated` / `token_revoked`) is never downgraded by a later probe.
+  Both halves were missing until 2026-11-20 — the store only wrote
+  `quota_status`, which no grid column reads — so a batch could print
+  `正常 2，掉号 0，其他失败 0` while both rows showed `失败` (a stale
+  `web_session_access_token_probe_failed:unknown` left by a dead exit), and a
+  row whose AT had been revoked kept displaying `已注册`.
+- **`at_probe_status_code` is derived, not stored.** The row payload ranks the
+  probe records by timestamp (`desktop.read._access_token_probe_status_code`:
+  `account_scan.token_probe` → `token_probe` → `scan.token_probe` →
+  `quota.last_result`), so the AT badge always follows the newest observation.
+  Nothing reads a stored copy, and `mark_quota_status` no longer writes one:
+  the 2026-09-04 drift left five rows claiming 401 long after a scan had
+  verified the same token with a 200. `scripts/repair_stale_probe_markers.py`
+  (dry-run by default) retires such copies from `raw_json` and the session JSON
+  and refuses any row whose derived verdict would change — the cleanup may not
+  move a single badge.
 
 Promotion checks (`--check-promotion`) inspect the account plan and trial offer
 only. They never create Checkout and never enumerate payment methods; the
@@ -130,6 +154,16 @@ delegates Stripe init / custom-checkout read / elements back to the protocol
 transport. Build it with `browser_fallback_transport()`, which returns `None`
 when Playwright is unavailable; the result's `fallback_used` records whether it
 ran.
+
+**Reachability (2026-11-20).** Until this date nothing passed that transport:
+the seam was documented here and had zero production readers
+(`docs/audits/scans/scan-2026-11-02-unused-module-inventory.md` measured
+"0 production / 1 test"). `pay_link/core.py` now fills it from an explicit
+opt-in switch — `PP_CAPABILITY_BROWSER_FALLBACK=1` — and the import is lazy, so
+a default probe neither pays for Playwright nor loads the browser driver stack.
+Default `off` means the network shape of a normal probe is unchanged; turning it
+on is a behaviour change (one real browser session per risk-blocked create) and
+belongs to whoever runs the canary.
 
 The probe classifies only known, non-sensitive response signals: HTTP 400
 `checkout_risk_blocked`, HTTP 429 `checkout_creation_rate_limited`, or a generic

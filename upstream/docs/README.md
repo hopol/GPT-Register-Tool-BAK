@@ -63,6 +63,10 @@ Directory layout (since 2026-09-06):
 
 ## Release notes（docs/releases/，一个发布标签一份，不回写）
 
+- [v2026.11.20 发布说明](releases/release-v2026.11.20.md) - 测活的两处状态不更新
+  （摘要说正常 / AT失效仍显示已注册）连带清掉 160 份重复机器字段，
+  协议传输可选后端与 curl_cffi 0.17.0 档位、Sentinel 版本对齐 + 可选刷新、
+  CPA 导出回导，以及发布改由 tag 触发。
 - [v2026.11.12 发布说明](releases/release-v2026.11.12.md) - requirements token 与真实
   `sdk.js` 逐槽对齐（随机环境探针、平台门控、页面时钟、Safari 编码），
   以及一次 10 账号线上验证（10/10 成功、AT 200、2FA、查优惠）。
@@ -194,9 +198,9 @@ Directory layout (since 2026-09-06):
     `registration/concurrency.py`、`registration/cancel.py`；结果装配统一走
     `registration.result.build_registration_result`。
   - 邮箱逻辑仍在 `mailbox/router.py`、`providers/`、`mailbox/service.py` 等模块；
-    `k12_*`、`agent_identity.py`、`sub2api_import.py` 保持原有归属。
+    `k12_*`、`agent_identity.py`、`importers/sub2api.py` 保持原有归属。
 - 新增 Agent Identity、SUB2API、导入导出逻辑时，在 `agent_identity.py`、
-  `sub2api_import.py`、`session_converter.py` 中落实现，不侵入注册或支付模块。
+  `importers/sub2api.py`、`session/converter.py` 中落实现，不侵入注册或支付模块。
 
 当前专题：[注册架构](current/registration-architecture.md)、
 [协议注册契约](current/protocol-registration.md)、

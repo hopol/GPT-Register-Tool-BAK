@@ -426,7 +426,7 @@ def resolve_access_token(args: Any, *, stderr: Any = None) -> tuple[str, Any]:
     if not email and not session_file:
         return "", None
 
-    from ..session_refresh import _load_seed_session
+    from ..session.refresh import _load_seed_session
 
     with contextlib.redirect_stdout(stderr or sys.stderr):
         data, _ = _load_seed_session(email=email, session_file=session_file)
@@ -601,7 +601,7 @@ def test_payment_proxies(args: Any, context: PaymentCommandContext) -> None:
     payload = {"ok": ok, "payment_method": method, "stages": stages}
     desktop_ipc = bool(getattr(args, "desktop_ipc", False))
     if desktop_ipc:
-        from ..desktop_ipc import emit_result
+        from ..desktop.ipc import emit_result
 
         emit_result(payload, enabled=True)
     print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -642,7 +642,7 @@ def check_payment_qualification(args: Any, context: PaymentCommandContext) -> No
     _print_payment_qualification_summary(result)
     desktop_ipc = bool(getattr(args, "desktop_ipc", False))
     if desktop_ipc:
-        from ..desktop_ipc import emit_result
+        from ..desktop.ipc import emit_result
 
         emit_result(result, enabled=True)
     else:
@@ -693,7 +693,7 @@ def _print_payment_qualification_summary(result: Mapping[str, Any]) -> None:
 
 def extract_payment_link(args: Any, context: PaymentCommandContext) -> None:
     """Extract a supported protocol payment link from an AT or saved account."""
-    from ..desktop_ipc import emit_event, emit_result
+    from ..desktop.ipc import emit_event, emit_result
     from ..payment.link_manager import generate_payment_link
 
     def output(payload: Any) -> None:

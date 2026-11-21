@@ -154,7 +154,7 @@
       "silent": 0
     },
     "sms_tool/auth_headers.py": {
-      "broad": 8,
+      "broad": 6,
       "silent": 2
     },
     "sms_tool/auth_state.py": {
@@ -165,11 +165,11 @@
       "broad": 19,
       "silent": 7
     },
-    "sms_tool/browser_fingerprint_pool.py": {
+    "sms_tool/browser/fingerprint_pool.py": {
       "broad": 2,
       "silent": 0
     },
-    "sms_tool/browser_pool.py": {
+    "sms_tool/browser/pool.py": {
       "broad": 10,
       "silent": 0
     },
@@ -177,7 +177,7 @@
       "broad": 5,
       "silent": 0
     },
-    "sms_tool/captcha_solver.py": {
+    "sms_tool/browser/captcha_solver.py": {
       "broad": 16,
       "silent": 13
     },
@@ -189,15 +189,15 @@
       "broad": 1,
       "silent": 0
     },
-    "sms_tool/codex_export.py": {
+    "sms_tool/codex/export.py": {
       "broad": 6,
       "silent": 0
     },
-    "sms_tool/codex_oauth.py": {
+    "sms_tool/codex/oauth.py": {
       "broad": 17,
       "silent": 0
     },
-    "sms_tool/codex_sentinel.py": {
+    "sms_tool/codex/sentinel.py": {
       "broad": 2,
       "silent": 1
     },
@@ -229,15 +229,15 @@
       "broad": 2,
       "silent": 1
     },
-    "sms_tool/cpa_import.py": {
+    "sms_tool/importers/cpa.py": {
       "broad": 9,
       "silent": 1
     },
-    "sms_tool/desktop_read.py": {
+    "sms_tool/desktop/read.py": {
       "broad": 2,
       "silent": 0
     },
-    "sms_tool/desktop_serve.py": {
+    "sms_tool/desktop/serve.py": {
       "broad": 2,
       "silent": 1
     },
@@ -253,11 +253,11 @@
       "broad": 5,
       "silent": 0
     },
-    "sms_tool/gcash_provider.py": {
+    "sms_tool/wallet/gcash_provider.py": {
       "broad": 4,
       "silent": 0
     },
-    "sms_tool/gcash_transport.py": {
+    "sms_tool/wallet/gcash_transport.py": {
       "broad": 6,
       "silent": 0
     },
@@ -325,11 +325,11 @@
       "broad": 3,
       "silent": 0
     },
-    "sms_tool/nodriver_captcha.py": {
+    "sms_tool/browser/nodriver_captcha.py": {
       "broad": 10,
       "silent": 1
     },
-    "sms_tool/nodriver_paypal.py": {
+    "sms_tool/browser/nodriver_paypal.py": {
       "broad": 7,
       "silent": 0
     },
@@ -449,27 +449,27 @@
       "broad": 3,
       "silent": 0
     },
-    "sms_tool/phone_config.py": {
+    "sms_tool/phone/config.py": {
       "broad": 1,
       "silent": 0
     },
-    "sms_tool/phone_pool.py": {
+    "sms_tool/phone/pool.py": {
       "broad": 2,
       "silent": 0
     },
-    "sms_tool/phone_provider_lifecycle.py": {
+    "sms_tool/phone/provider_lifecycle.py": {
       "broad": 3,
       "silent": 0
     },
     "sms_tool/phone_proxy.py": {
-      "broad": 9,
+      "broad": 8,
       "silent": 3
     },
-    "sms_tool/phone_registration.py": {
+    "sms_tool/phone/registration.py": {
       "broad": 7,
       "silent": 2
     },
-    "sms_tool/phone_reuse.py": {
+    "sms_tool/phone/reuse.py": {
       "broad": 6,
       "silent": 1
     },
@@ -534,7 +534,7 @@
       "silent": 1
     },
     "sms_tool/proxy/entry.py": {
-      "broad": 3,
+      "broad": 4,
       "silent": 0
     },
     "sms_tool/proxy/pool.py": {
@@ -685,11 +685,11 @@
       "broad": 13,
       "silent": 1
     },
-    "sms_tool/session_converter.py": {
+    "sms_tool/session/converter.py": {
       "broad": 6,
       "silent": 1
     },
-    "sms_tool/session_refresh.py": {
+    "sms_tool/session/refresh.py": {
       "broad": 6,
       "silent": 2
     },
@@ -717,7 +717,7 @@
       "broad": 5,
       "silent": 1
     },
-    "sms_tool/sub2api_import.py": {
+    "sms_tool/importers/sub2api.py": {
       "broad": 8,
       "silent": 1
     },
@@ -773,11 +773,11 @@
       "broad": 2,
       "silent": 0
     },
-    "sms_tool/wallet_provider.py": {
+    "sms_tool/wallet/provider.py": {
       "broad": 2,
       "silent": 0
     },
-    "sms_tool/wallet_transport.py": {
+    "sms_tool/wallet/transport.py": {
       "broad": 5,
       "silent": 0
     },
@@ -808,20 +808,20 @@
         "reason": "The protocol lane is where a swallowed exception is indistinguishable from a protocol failure: it lands in the funnel as 'unknown' while the batch keeps spending mailboxes. Silent handlers are 0 here and the broad count may only shrink."
       }
     },
-    "max_broad": 971,
+    "max_broad": 969,
     "max_silent": 158
   },
   "totals": {
-    "broad": 971,
+    "broad": 969,
     "silent": 158
   },
   "whitelist": {
-    "sms_tool/browser_pool.py": {
+    "sms_tool/browser/pool.py": {
       "broad": 10,
       "reason": "Browser/process teardown shared by four drivers: killing a wedged child, closing a context, or recycling a slot is best effort by definition.",
       "silent": 0
     },
-    "sms_tool/desktop_serve.py": {
+    "sms_tool/desktop/serve.py": {
       "broad": 2,
       "reason": "Request isolation in the resident desktop-read server: one malformed request must answer with an error code, not kill the process the shell depends on.",
       "silent": 1

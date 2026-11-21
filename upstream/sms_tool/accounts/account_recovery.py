@@ -27,6 +27,7 @@ from ..proxy.routing import proxy_pool_for
 from ..kernel.paths import runtime_file
 from ..registration.state import _stored_registration_password
 from ..storage import (
+    _probe_is_token_invalid,
     clear_stale_promotion_at_marker,
     get_account_record,
     list_paypal_accounts,
@@ -55,7 +56,7 @@ def relogin_web_session_account(
     if not email:
         return {"ok": False, "mode": "web_session", "error": "missing_email"}
     try:
-        from ..session_refresh import _refresh_session_protocol
+        from ..session.refresh import _refresh_session_protocol
 
         data = dict(account)
         data["email"] = email
@@ -97,7 +98,7 @@ def relogin_refresh_token_account(
     email = str(account.get("email") or "").strip().lower()
     if not email:
         return {"ok": False, "mode": "oauth_refresh_token", "error": "missing_email"}
-    from ..codex_export import _openai_refresh_token, _refresh_with_openai_oauth
+    from ..codex.export import _openai_refresh_token, _refresh_with_openai_oauth
 
     _raw_auth_session: object = account.get("auth_session")
     auth_session: dict = _raw_auth_session if isinstance(_raw_auth_session, dict) else {}
@@ -171,11 +172,11 @@ def relogin_chatgpt_email_account(
         from ..account_creation import _auth_session_access_token, _fetch_auth_session
         from ..auth_flow import _json_or_raw
         from ..auth_headers import auth_impersonate, openai_auth_headers, select_auth_fingerprint
-        from ..codex_oauth import _mailbox_from_data
+        from ..codex.oauth import _mailbox_from_data
         from ..http_client import request_with_retry
         from ..registration.orchestrator import _login_existing_account_with_email_otp
         from ..sentinel_tokens import _set_oai_did_cookie
-        from ..session_refresh import _auth_session_email
+        from ..session.refresh import _auth_session_email
 
         mailbox = _mailbox_from_data(account)
         if mailbox is None:
@@ -444,7 +445,7 @@ def relogin_local_codex_account(
             "skipped": True,
         }
     try:
-        from ..codex_oauth import _save_oauth_tokens, refresh_codex_oauth_session
+        from ..codex.oauth import _save_oauth_tokens, refresh_codex_oauth_session
 
         data = dict(account)
         data["email"] = email
@@ -637,7 +638,7 @@ def _verify_and_persist_candidate(
     verified.update(candidate)
     verified["email"] = email
     if mode == "web_session":
-        from ..session_refresh import _auth_session_email
+        from ..session.refresh import _auth_session_email
 
         _raw_auth_session: object = verified.get("auth_session")
         auth_session: dict = _raw_auth_session if isinstance(_raw_auth_session, dict) else {}
@@ -667,7 +668,7 @@ def _verify_and_persist_candidate(
     json_path = str(verified.get("json_path") or account.get("json_path") or "").strip()
     saved_path = json_path
     if persist:
-        from ..session_refresh import _save_refreshed
+        from ..session.refresh import _save_refreshed
 
         saved_path = _save_refreshed(verified, json_path)
     return {
@@ -717,19 +718,17 @@ def _mark_successful_relogin(data: dict[str, Any], probe: dict[str, Any], *, now
         "token_invalidated",
     }:
         data["status"] = "registered"
-    error = str(data.get("error") or "").strip().lower()
-    if any(
-        marker in error
-        for marker in (
-            "401",
-            "unauthorized",
-            "token_invalid",
-            "token_expired",
-            "could not validate your token",
-            "oauth_refresh_http_401",
-        )
-    ):
-        data.pop("error", None)
+    # Both callers gate on a verified HTTP 200 for the token just acquired, so
+    # whatever ``error`` the record still carries describes an attempt that is
+    # over. Matching a 401-worded whitelist (the old rule) missed the transport
+    # shapes: a ``web_session`` attempt killed by a dead exit records
+    # ``web_session_access_token_probe_failed:unknown`` -- no ``401``, no
+    # ``token_invalid`` -- and survived the OTP relogin that later succeeded.
+    # The account then kept ``status='registered'`` (``store.normalize._status``
+    # derives it from the AT alone) with a non-empty error, which the WPF 状态
+    # column renders as 失败: measured 2026-11-20, a 2-account 账号测活 round
+    # printed 正常 2，掉号 0，其他失败 0 while both rows showed 失败.
+    data.pop("error", None)
     # A previous promotion probe can persist an auth-failure marker. A verified
     # replacement AT makes that marker stale; keep its detailed result for
     # later inspection but stop surfacing the authentication failure in the
@@ -1057,16 +1056,6 @@ def _redact_recovery_error(value: Any) -> str:
 
 def _looks_account_deactivated(value: Any) -> bool:
     return text_has_account_deactivated(json.dumps(value or {}, ensure_ascii=False))
-
-
-def _probe_is_token_invalid(value: Any) -> bool:
-    if not isinstance(value, dict):
-        return False
-    try:
-        status_code = int(value.get("status_code") or 0)
-    except (TypeError, ValueError):
-        status_code = 0
-    return status_code == 401 or str(value.get("status") or "").strip().lower() == "token_invalid"
 
 
 def _item_is_account_deactivated(value: Any) -> bool:

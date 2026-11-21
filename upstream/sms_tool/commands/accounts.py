@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .helpers import read_email_file, unique_emails
-from ..desktop_ipc import emit_result
+from ..desktop.ipc import emit_result
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ def import_sessions_kwargs(args: Any, *, include_workers: bool = True) -> dict[s
 
 
 def import_registered_accounts(args: Any, emails: list[str]) -> None:
-    from ..import_targets import import_account_sessions
+    from ..importers.targets import import_account_sessions
 
     emails = [str(email or "").strip() for email in emails if str(email or "").strip()]
     if not emails:
@@ -106,7 +106,7 @@ def open_paypal_link(email: str, ctx: AccountCommandContext) -> None:
 
 
 def refresh_session(args: Any) -> None:
-    from ..session_refresh import refresh_session as refresh_auth_session
+    from ..session.refresh import refresh_session as refresh_auth_session
 
     result = refresh_auth_session(
         email=args.email or "",
@@ -118,7 +118,7 @@ def refresh_session(args: Any) -> None:
 
 
 def export_codex_json(args: Any, ctx: AccountCommandContext) -> None:
-    from ..codex_export import export_codex_session, export_codex_sessions
+    from ..codex.export import export_codex_session, export_codex_sessions
 
     emails = read_email_file(args.email_file)
     if args.email:
@@ -171,7 +171,7 @@ def importable_account_rows(ctx: AccountCommandContext) -> list[dict[str, Any]]:
 
 
 def import_cpa(args: Any, ctx: AccountCommandContext) -> None:
-    from ..import_targets import import_account_session, import_account_sessions
+    from ..importers.targets import import_account_session, import_account_sessions
 
     emails = read_email_file(args.email_file)
     if args.email:
@@ -200,7 +200,7 @@ def import_cpa(args: Any, ctx: AccountCommandContext) -> None:
     if not result.get("ok"):
         raise SystemExit(3)
     try:
-        from ..cpa_import import refresh_cpa_quota_statuses
+        from ..importers.cpa import refresh_cpa_quota_statuses
 
         quota_emails = (
             emails
@@ -221,6 +221,41 @@ def import_cpa(args: Any, ctx: AccountCommandContext) -> None:
             print(json.dumps(quota_result, ensure_ascii=False, indent=2))
     except Exception as exc:
         print(f"[*] CPA quota refresh after import skipped: {exc}")
+
+
+def import_account_json(args: Any) -> None:
+    """Import exported ``account-cpa-*.json`` file(s) into the local store.
+
+    Offline by design: no provider is called, so the only things that can fail
+    are the document (``AccountImportError``) and an individual account (which
+    is reported, not raised). Exit 3 on any failure so a wrapper script can gate.
+    """
+    from ..accounts.account_import import DEFAULT_FILENAME_PATTERN, AccountImportError
+    from ..accounts.account_import import import_account_json as run_import
+    from ..diagnostics import safe_print
+
+    paths = [str(item).strip() for item in (getattr(args, "import_account_json", None) or []) if str(item).strip()]
+    if not paths:
+        safe_print("[Error] --import-account-json needs at least one file", file=sys.stderr)
+        raise SystemExit(2)
+    pattern = DEFAULT_FILENAME_PATTERN
+    reports: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            reports.append(run_import(path, filename_pattern=pattern))
+        except AccountImportError as exc:
+            reports.append({"ok": False, "source": path, "error": str(exc), "imported": 0, "skipped": [], "failed": []})
+    summary = {
+        "ok": all(report.get("ok") for report in reports),
+        "files": len(reports),
+        "total": sum(int(report.get("total") or 0) for report in reports),
+        "imported": sum(int(report.get("imported") or 0) for report in reports),
+        "db_saved": sum(int(report.get("db_saved") or 0) for report in reports),
+        "reports": reports,
+    }
+    safe_print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if not summary["ok"]:
+        raise SystemExit(3)
 
 
 def check_promotion(args: Any, ctx: AccountCommandContext) -> None:
@@ -256,7 +291,7 @@ def check_promotion(args: Any, ctx: AccountCommandContext) -> None:
 
 def refresh_cpa_quota(args: Any, ctx: AccountCommandContext) -> None:
     from ..accounts.recovery_batch import refresh_local_quota_statuses
-    from ..cpa_import import refresh_cpa_quota_statuses
+    from ..importers.cpa import refresh_cpa_quota_statuses
 
     if bool(getattr(args, "mailbox_pool_repaired", False)):
         from ..mailbox.quarantine import mark_mailbox_pool_repaired
@@ -511,7 +546,7 @@ def quota_usage(args: Any) -> None:
 
 
 def convert_session_json(args: Any) -> None:
-    from ..session_converter import convert_json_file
+    from ..session.converter import convert_json_file
 
     result = convert_json_file(args.convert_session_json, fmt=args.convert_format)
     output_text = result.get("outputText") or ""

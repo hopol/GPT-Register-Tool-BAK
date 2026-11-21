@@ -54,18 +54,13 @@ namespace SmsWorkbench
         {
             if (row == null) return false;
             if (string.IsNullOrWhiteSpace(row.Identifier)) return false;
-            if (row.HasAccessToken) return true;
-            // The status/payment labels are localized display copy, so the
-            // decision goes through the language-agnostic matcher instead of a
-            // hand-maintained pair of literal lists. The hand-written English
-            // half that used to live here is what the matcher now derives from
-            // the same catalog, so the two can no longer drift.
+            // Machine state first: an AT, a `registration_status`, or a payment
+            // qualification verdict. The label matcher below survives only for
+            // legacy rows written before those fields existed, and it still
+            // answers in every shipped language.
+            if (AccountMachineState.CanExport(row)) return true;
             string status = (row.Status + " " + row.PayPalStatus).Trim();
-            return Loc.DisplayContains(status, "已注册")
-                || Loc.DisplayContains(status, "待支付")
-                || Loc.DisplayContains(status, "支付完成")
-                || Loc.DisplayContains(status, "PM已创建")
-                || Loc.DisplayContains(status, "已导入");
+            return Loc.DisplayContains(status, "待支付") || Loc.DisplayContains(status, "PM已创建");
         }
 
         public static string FormatLabel(string format)
@@ -85,13 +80,13 @@ namespace SmsWorkbench
         public static string FormatDescription(string format)
         {
             string value = (format ?? "").Trim().ToLowerInvariant();
-            if (value == "sub2api") return Loc.T("由 session_converter.py 生成的 Sub2API accounts 文档");
-            if (value == "cockpit") return Loc.T("由 session_converter.py 生成的 Cockpit/Codex 导入结构");
-            if (value == "9router") return Loc.T("由 session_converter.py 生成的 9router provider 结构");
-            if (value == "codex") return Loc.T("由 session_converter.py 生成的 Codex auth.json 结构");
-            if (value == "axonhub") return Loc.T("由 session_converter.py 生成的 AxonHub 结构；缺少 RT 时会写入占位提示");
-            if (value == "codexmanager") return Loc.T("由 session_converter.py 生成的 Codex-Manager 结构");
-            return Loc.T("由 session_converter.py 生成的 CPA JSON；缺少 id_token 时会合成兼容字段");
+            if (value == "sub2api") return Loc.T("由 session/converter.py 生成的 Sub2API accounts 文档");
+            if (value == "cockpit") return Loc.T("由 session/converter.py 生成的 Cockpit/Codex 导入结构");
+            if (value == "9router") return Loc.T("由 session/converter.py 生成的 9router provider 结构");
+            if (value == "codex") return Loc.T("由 session/converter.py 生成的 Codex auth.json 结构");
+            if (value == "axonhub") return Loc.T("由 session/converter.py 生成的 AxonHub 结构；缺少 RT 时会写入占位提示");
+            if (value == "codexmanager") return Loc.T("由 session/converter.py 生成的 Codex-Manager 结构");
+            return Loc.T("由 session/converter.py 生成的 CPA JSON；缺少 id_token 时会合成兼容字段");
         }
 
         public static string FormatDirectProbeSummary(

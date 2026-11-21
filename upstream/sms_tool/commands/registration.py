@@ -252,7 +252,7 @@ def registration_phone_pool(args: Any):
     if getattr(args, "no_phone_reuse", False) or getattr(args, "registration_at_only", False):
         return None
 
-    from ..phone_reuse import create_phone_pool, has_phone_reuse_config, print_phone_pool_status
+    from ..phone.reuse import create_phone_pool, has_phone_reuse_config, print_phone_pool_status
 
     explicit = bool(getattr(args, "phone_reuse", False))
     auto_enable = has_phone_reuse_config()
@@ -1023,7 +1023,7 @@ def run_target_at200(args, base_dir, ctx: RegistrationCommandContext):
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     report["report_path"] = str(report_path)
-    from ..desktop_ipc import emit_result
+    from ..desktop.ipc import emit_result
 
     emit_result(report, enabled=bool(getattr(args, "desktop_ipc", False)))
     if not report["ok"]:

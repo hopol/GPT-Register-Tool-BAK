@@ -30,7 +30,7 @@ export remain separate workflows.
 | `mailbox/service.py`, `mailbox/strategies.py`, `providers/` | Mailbox routing, capability resolution, polling policy and provider transport | Registration success |
 | `registration/result.py` | Shared result assembly | Success decisions |
 | `store/` | Persistence and domain facts | Provider side effects |
-| `accounts/account_recovery.py`, `codex_oauth.py` | Existing-account recovery and OAuth | Automatic new signup |
+| `accounts/account_recovery.py`, `codex/oauth.py` | Existing-account recovery and OAuth | Automatic new signup |
 | `payment_*`, `pay_link/`, `paypal/` | Payment planning and explicit execution | Mailbox purchasing or account signup |
 | `pay_link/` vs `paypal_link/` + `upi_link/` | `pay_link/` is the **registry** and the shared extraction state machine: a new payment method goes there, and `scripts/payment_legacy_manifest.py` fails the build if a file is added under either legacy lane. `paypal_link/` and `upi_link/` are frozen legacy lanes that still take bug fixes. A method that lives in a legacy lane bypasses the registry, `payment_catalog` and the desktop method picker -- the exact drift the manifest gate exists to stop. | A new method implemented in a legacy lane |
 
@@ -208,13 +208,13 @@ above.
 <!-- ratchet-numbers:begin architecture -->
 | Measure | Value |
 | --- | --- |
-| Module-level cross-directory edges | 493 |
-| Directory pairs | 78 |
-| Mutual pairs / minority-direction edges | 17 / 46 |
-| Delayed cross-directory edges | 311 |
-| Delayed imports in the package | 484 (baseline 484) |
+| Module-level cross-directory edges | 572 |
+| Directory pairs | 120 |
+| Mutual pairs / minority-direction edges | 24 / 49 |
+| Delayed cross-directory edges | 362 |
+| Delayed imports in the package | 519 (baseline 519) |
 | Functions at or above 150 lines | 64 (frozen, `scripts/function_length_ratchet.py`) |
-| Claimed tracked `sms_tool` modules | 337 of 337 (0 unclaimed, 41 directory-map groups) |
+| Claimed tracked `sms_tool` modules | 346 of 346 (0 unclaimed, 41 directory-map groups) |
 <!-- ratchet-numbers:end architecture -->
 
 `tests/config/test_pilens_scope_config.py` pins the scope and the formatting
@@ -248,7 +248,17 @@ imports `auth_headers` (layer 5), so that move would be an upward import — and
 is not a `proxy/` concern (no proxy-string parsing). A future `tls/` package would
 be the home if a second module joins it; until then the root set carries it
 exactly like `auth_headers.py`, `fingerprint_pool.py` and
-`browser_fingerprint_pool.py`.
+`browser/fingerprint_pool.py`.
+
+**2026-11-19 — `http_backend.py` accepted as a root module.** It answers one
+cross-layer question — *which transport is this process using, and can it run
+this profile?* — for the same reason `auth_headers.py` and `tls_fingerprint.py`
+are root peers: `registration/preflight.py`, `registration/protocol_helpers.py`
+and `auth_headers.py` all need the answer, and each of those lives in a different
+layer. Putting it in `proxy/` would misplace it (no proxy-string parsing) and in
+`kernel/` would invert the layer (it reads `auth_headers`, layer 5). Every
+ordinary consumer edge is function-local, so the module-level `registration ->
+sms_tool` pair count does not grow; see `scripts/delayed_import_ratchet.py`.
 
 ## Boundary Rules
 
@@ -295,7 +305,7 @@ no file behind it.
 | 6 | PayPal execution must not regenerate links: no `gen_pp_link` import inside `sms_tool/paypal/` | [`rule-06-paypal-execution-regenerate-links.md`](rules/rule-06-paypal-execution-regenerate-links.md) |
 | 7 | One liveness owner | [`rule-07-liveness-owner.md`](rules/rule-07-liveness-owner.md) |
 | 8 | Agent Identity is explicit-import only; the registration pipeline must not reach it | [`rule-08-agent-identity-explicit-import.md`](rules/rule-08-agent-identity-explicit-import.md) |
-| 9 | One IPC writer: `sms_tool/desktop_ipc.py` is the sole writer of the `@@SMSWORKBENCH_V2@@` envelope | [`rule-09-ipc-writer-sms-tool.md`](rules/rule-09-ipc-writer-sms-tool.md) |
+| 9 | One IPC writer: `sms_tool/desktop/ipc.py` is the sole writer of the `@@SMSWORKBENCH_V2@@` envelope | [`rule-09-ipc-writer-sms-tool.md`](rules/rule-09-ipc-writer-sms-tool.md) |
 | 10 | `services/protocol-payment/` is a process boundary with zero import-level coupling to `sms_tool`; the only permitted reference is the documented lazy import in `kakao/kakao_extract.py` | [`rule-10-services-protocol-payment-process.md`](rules/rule-10-services-protocol-payment-process.md) |
 | 11 | Progress and concurrency are separate | [`rule-11-progress-concurrency-separate.md`](rules/rule-11-progress-concurrency-separate.md) |
 | 12 | Command adapters call public workflow functions; they must not import private provider helpers or write SQLite/session files | [`rule-12-command-adapters-call-public.md`](rules/rule-12-command-adapters-call-public.md) |

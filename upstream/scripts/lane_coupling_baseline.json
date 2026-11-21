@@ -3,16 +3,8 @@
   "registration_to_payment": [],
   "payment_to_registration": [
     [
-      "sms_tool.gcash_transport",
-      "sms_tool.phone_proxy"
-    ],
-    [
       "sms_tool.pay_link.adapters",
       "sms_tool.sentinel"
-    ],
-    [
-      "sms_tool.payment.qualification",
-      "sms_tool.phone_proxy"
     ],
     [
       "sms_tool.payment.wire",
@@ -24,31 +16,7 @@
     ],
     [
       "sms_tool.paypal.extract",
-      "sms_tool.phone_proxy"
-    ],
-    [
-      "sms_tool.paypal.extract",
       "sms_tool.sentinel"
-    ],
-    [
-      "sms_tool.paypal.proxy",
-      "sms_tool.phone_proxy"
-    ],
-    [
-      "sms_tool.paypal_link.gen_link",
-      "sms_tool.phone_proxy"
-    ],
-    [
-      "sms_tool.pp_link_helpers",
-      "sms_tool.phone_proxy"
-    ],
-    [
-      "sms_tool.upi_link.dump",
-      "sms_tool.phone_proxy"
-    ],
-    [
-      "sms_tool.upi_link.pipeline",
-      "sms_tool.phone_proxy"
     ],
     [
       "sms_tool.upi_link.sentinel",
@@ -75,12 +43,16 @@
     "sms_tool.commands.payment",
     "sms_tool.commands.payment_links",
     "sms_tool.config.schema",
-    "sms_tool.desktop_read",
+    "sms_tool.desktop.read",
     "sms_tool.fingerprint_pool",
     "sms_tool.operation_journal",
     "sms_tool.proxy.registry",
     "sms_tool.store.markers",
-    "sms_tool.store.normalize"
+    "sms_tool.store.normalize",
+    "sms_tool.wallet.gcash_provider",
+    "sms_tool.wallet.gcash_transport",
+    "sms_tool.wallet.provider",
+    "sms_tool.wallet.transport"
   ],
   "root_to_adapter_layers": [
     [
@@ -156,7 +128,8 @@
     "sms_tool.auth_headers",
     "sms_tool.auth_state",
     "sms_tool.batch_runner",
-    "sms_tool.codex_sentinel",
+    "sms_tool.codex",
+    "sms_tool.codex.sentinel",
     "sms_tool.config",
     "sms_tool.http_client",
     "sms_tool.http_utils",
@@ -167,8 +140,9 @@
     "sms_tool.mailbox",
     "sms_tool.mailbox.router",
     "sms_tool.otp_strategy",
+    "sms_tool.phone",
+    "sms_tool.phone.registration",
     "sms_tool.phone_proxy",
-    "sms_tool.phone_registration",
     "sms_tool.registration",
     "sms_tool.registration.cancel",
     "sms_tool.registration.handlers",
@@ -181,7 +155,8 @@
     "sms_tool.registration_drivers.base",
     "sms_tool.registration_drivers.playwright",
     "sms_tool.sentinel_tokens",
-    "sms_tool.session_builder",
+    "sms_tool.session",
+    "sms_tool.session.builder",
     "sms_tool.utils"
   ]
 }

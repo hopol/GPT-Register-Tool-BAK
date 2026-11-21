@@ -89,7 +89,85 @@ sms_tool.config.schema.ConfigError: chatgpt must be an object
 把「读者看到半个分片集」的窗口从两次 `fsync` 压到三次 rename。彻底消除需要跨进程锁，
 所以**测试侧隔离才是主修复** —— 不要因为写入侧变窄了就把这条隔离去掉。
 
+## 覆盖率下限（2026-11-20 起的门禁）
+
+CI 的并行分片跑 `--cov=sms_tool --cov=services`，并且带 `--cov-fail-under=70`。
+
+**为什么要加**：在 2026-11-20 之前覆盖率只被**测量**、从不被**比较**——72% 和 41%
+都是绿色，`term-missing` 那段输出没有人读。这与进程内的其余门禁（棘轮、契约测试）
+形成反差：那些数字都被钉住了，只有这一个可以一路下滑而无人发现。
+
+**下限怎么定**：实测 `57721 statements / 16107 missing = 72%`（2026-11-20，全量
+`-n 4 --dist loadfile`）。下限取 **70**，留两点缓冲吸收重构期的抖动；上调时必须在
+同一提交里给出新的实测值，并同步本节与
+`tests/governance/test_coverage_gate.py`（它钉住 CI 参数与本节的数字一致）。
+
+**它不替代什么**：覆盖率是"有没有执行过"的信号，不是"行为对不对"的判据。本仓的
+行为证据仍然是各泳道的契约测试与回放差分（`stage2_replay_selfcheck`、
+`extractor_parity_report`、`lane_coupling_ratchet` 等）。下限的作用只有一个：阻止
+新增的大块未执行代码静默进来。
+
+**本地怎么复现**：
+
+```bash
+python -m pytest -q -n 4 --dist loadfile --cov=sms_tool --cov=services --cov-report=term-missing --cov-fail-under=70
+```
+
+## 静默异常：为什么冻结而不清零（2026-11-20 复核）
+
+`scripts/broad_except_ratchet.py` 冻结的是「每个文件的 broad handler 数」与
+「静默（body 只有 `pass`/`...`）数」，加上 `whitelist`（每条必须带 reason）与全局预算
+`max_broad` / `max_silent`。2026-11-20 的复核对 6 个静默最多的文件（41 个静默 handler）
+逐处读了 try 体，结论是：
+
+| 类别 | 例 | 数量 |
+| --- | --- | ---: |
+| 拆除/清理（`close` / `write_eof` / 幂等 `close` 后再删 profile） | `proxy/pool.py` 的 pipe teardown、`external_sessions/managed.py` 的关窗 | 主导 |
+| JS/DOM 探测回退（元素不存在即跳过） | `paypal/dom_fields.py`、`browser_flow/page_state.py` | 次之 |
+| **吞掉逻辑错误** | — | **0** |
+
+因此这条不按「清零」处理：拆除路径里抛异常本身是错的，DOM 探测回退是判定语义的
+一部分。门禁的职责只有两条 —— ①**不许增长**（新静默点必须落在该文件的冻结额度内，
+或让文件进 `whitelist` 并写明 reason）；②一旦某个静默点被证明确实吞掉了逻辑错误，
+把它改成显式分类（`kernel/error_classification`）并**同步下调**该文件额度。
+
+`external_sessions/managed.py` 是这个形状的正面例：`close` 保持静默（幂等），而
+`delete` 三次重试后仍然失败时 `logger.warning` 留痕，因为孤儿 profile 会占满额度。
+
+## 测试风格：`unittest` 只减不增（2026-11-20）
+
+套件里两种风格并存：**175 个文件**声明 `unittest.TestCase`，261 个用 pytest 函数。
+pytest 两种都跑，所以没有任何门禁看见这个分裂——代价只在失败时显现：
+`unittest` 类**拿不到 pytest fixture**（`monkeypatch` / `tmp_path` / `caplog` /
+`request.addfinalizer` 全无），共享 setUp 只能手写，而且 `setUp` 自己抛错时 teardown
+**不会执行**；`self.assertEqual` 也不享受 pytest 的断言重写。
+
+一次性转换 175 个文件是本仓明确视为「不可验证」的那类改动：一个丢掉 `setUp` 的
+codemod 会让测试**空转通过**。所以 `scripts/unittest_style_ratchet.py` 把**每个目录**
+的数量冻结，只允许下降；每个目录各自迁移。
+
+**迁移配方**（以 `tests/config/test_logging_crash_hooks.py` 为样板，2026-11-20）：
+
+1. 类的 `setUp` + `addCleanup` → 一个 `@pytest.fixture`，用 `try/finally`（或 `yield`）
+   把恢复路径写在 `finally` 里，这样**测试失败时也会恢复**全局状态；
+2. `self.assertX(...)` → 裸 `assert`（pytest 会重写它，失败时打印中间值）；
+3. `assertRaises` → `pytest.raises`；`params` 化的用例 → `@pytest.mark.parametrize`；
+4. 原类继承共享基类的情况：基类里的状态放进 fixture，子类退化成同文件里的两组测试；
+5. **测试数必须不变**（迁移前后跑同一个文件，数量对得上才算完成）。
+
+迁移完一个目录，跑 `python scripts/unittest_style_ratchet.py --update-baseline` 把该目录
+的数字下调（`--detail` 看逐目录表）。新增目录没有基线条目会直接失败。
+
 ## 门禁脚本
+
+**新门禁从 `scripts/_baseline.py` 起手**（2026-11-20）：`read_json` / `write_json`
+（LF、2 空格、`ensure_ascii=False`、保留调用方键序）、`add_update_flag` /
+`update_requested`、`print_failures`（ASCII 安全，cp1252 控制台不会在报错时再抛
+`UnicodeEncodeError`）。二十多个门禁各自重写过这四件事，副本已经漂移（有的写 CRLF、
+有的转义中文键、有的漏尾换行），所以共享版自带 `tests/governance/test_baseline_helpers.py`
+作为钉子。**旧门禁不要为“统一”而专项重构**：它们的失败文案被各自测试逐字钉住，
+adoption 只在因为别的原因碰到该文件时顺带做。
+
 
 前三套 ratchet 共用一套做法（先冻结、再加预算或逐条白名单化、只许降不许升）；第四套不冻结计数，而是要求每个开关带一个决定：
 
