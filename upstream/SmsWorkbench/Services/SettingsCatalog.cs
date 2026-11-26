@@ -1,10 +1,6 @@
-// Opted into nullable reference checking file-by-file - see the note in
-// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
-#nullable enable
-
 using SmsWorkbench.Localization;
 
-namespace SmsWorkbench
+namespace SmsWorkbench.Services
 {
     public sealed record SettingsSectionDefinition(string Title, IReadOnlyList<SettingDefinition> Fields);
     public sealed record SettingsCategoryDefinition(string Title, IReadOnlyList<SettingsSectionDefinition> Sections);
@@ -65,6 +61,8 @@ namespace SmsWorkbench
                 Section(Loc.T("注册驱动"),
                     Options("registration_driver", Loc.T("注册驱动"), "registration.driver", "protocol",
                         "protocol", "playwright", "roxy", "cloak", "camoufox"),
+                    Options("protocol_http_backend", Loc.T("协议 HTTP 引擎"), "email_registration.protocol_http_backend", "curl_cffi",
+                        "curl_cffi", "wreq"),
                     Boolean("registration_browser_headless", Loc.T("浏览器无头模式"), "registration.browser_headless", true),
                     Integer("registration_browser_timeout", Loc.T("浏览器超时秒"), "registration.browser_timeout_seconds", "90"),
                     Text("registration_browser_locale", Loc.T("浏览器语言"), "registration.browser_locale", "en-US"),
@@ -144,8 +142,15 @@ namespace SmsWorkbench
                     Integer("browser_pool_max_concurrent", Loc.T("最大并发浏览器"), "registration.browser_process_pool.max_concurrent", "4"),
                     Integer("browser_pool_max_uses", Loc.T("单进程最大复用次数"), "registration.browser_process_pool.max_uses_per_process", "10"),
                     Boolean("browser_pool_recycle_on_error", Loc.T("出错即回收进程"), "registration.browser_process_pool.recycle_on_error", true)),
+                Section(Loc.T("浏览器省流"),
+                    Boolean("browser_data_saver_enabled", Loc.T("启用浏览器省流"), "registration.browser_data_saver.enabled", false),
+                    Boolean("browser_data_saver_asset_cache", Loc.T("启用静态资源缓存"), "registration.browser_data_saver.asset_cache_enabled", true),
+                    Integer("browser_data_saver_cache_max_age", Loc.T("缓存有效期秒"), "registration.browser_data_saver.asset_cache_max_age_seconds", "86400"),
+                    Integer("browser_data_saver_proxy_retries", Loc.T("代理建连重试次数"), "registration.browser_data_saver.proxy_connect_retries", "3")),
                 Section("Sentinel",
                     Text("sentinel_version", Loc.T("Sentinel版本"), "email_registration.sentinel_version"),
+                    Boolean("sentinel_sdk_auto_update", Loc.T("自动更新 Sentinel SDK"), "email_registration.sentinel_sdk_auto_update", false),
+                    Integer("sentinel_sdk_refresh_seconds", Loc.T("SDK 刷新周期秒"), "email_registration.sentinel_sdk_refresh_seconds", "86400"),
                     Integer("sentinel_max_concurrency", Loc.T("提取并发"), "email_registration.sentinel_max_concurrency", "2"),
                     Integer("sentinel_prewarm_window", Loc.T("一对一预热窗口"), "email_registration.sentinel_prewarm_window", "4"),
                     Integer("sentinel_circuit_failures", Loc.T("熔断失败次数"), "email_registration.sentinel_circuit_failures", "3"),
@@ -182,11 +187,18 @@ namespace SmsWorkbench
                     Multiline("browser_registration_proxy_pool", Loc.T("浏览器注册代理池（留空跟随注册池）"), ""),
                     Multiline("payment_qualification_proxy_pool", Loc.T("支付资格专用代理池（Stripe 可达）"), "")),
                 Section(Loc.T("协议管理"),
-                    Text("protocol_enabled_methods", Loc.T("启用方式"), "", "paypal,gopay,gcash,grabpay,upi,ideal,pix,kakao,blik,twint,direct_card,momo"),
-                    Text("protocol_reference_root", Loc.T("提链器目录"), "protocol_payments.reference_root", "services/protocol-payment"),
+                    Text("protocol_enabled_methods", Loc.T("启用方式"), "", "paypal,gopay,gcash,grabpay,upi,ideal,pix,kakao,blik,twint,direct_card,momo,team_trial"),
                     Text("protocol_state_file", Loc.T("状态文件"), "protocol_payments.state_file", "runtime/payment_link_runs.jsonl"),
                     Integer("protocol_timeout_seconds", Loc.T("协议超时秒"), "protocol_payments.timeout_seconds", "900")),
-                Section(Loc.T("正式批量支付"),
+                Section(Loc.T("提链服务器"),
+                    Boolean("extract_server_enabled", Loc.T("启用提链服务器"), "protocol_payments.extract_link_server.enabled", true),
+                    Text("extract_server_api_base", Loc.T("服务器地址"), "protocol_payments.extract_link_server.api_base", ""),
+                    Secret("extract_server_cdk", Loc.T("提链 CDK"), "protocol_payments.extract_link_server.cdk"),
+                    Text("extract_server_endpoint", Loc.T("提链路径"), "protocol_payments.extract_link_server.endpoint", "/api/v1/extract"),
+                    Integer("extract_server_timeout_seconds", Loc.T("提链超时秒"), "protocol_payments.extract_link_server.timeout_seconds", "60"),
+                    Boolean("extract_server_pass_proxy", Loc.T("透传代理到提链服务器"), "protocol_payments.extract_link_server.pass_proxy", true),
+                    Boolean("extract_server_verify_tls", Loc.T("校验证书 (TLS)"), "protocol_payments.extract_link_server.verify_tls", true)),
+                Section(Loc.T("支付链接提取"),
                     Integer("protocol_batch_momo_workers", Loc.T("MoMo并发"), "protocol_payments.batch.method_workers.momo", "2"),
                     Integer("protocol_batch_kakao_workers", Loc.T("Kakao并发"), "protocol_payments.batch.method_workers.kakao", "2"),
                     Integer("protocol_batch_gopay_workers", Loc.T("GoPay并发"), "protocol_payments.batch.method_workers.gopay", "2"),
@@ -197,8 +209,7 @@ namespace SmsWorkbench
                     Multiline("protocol_payment_matrix", Loc.T("地区资格矩阵 JSON"), "")),
                 Section("PayPal",
                     Multiline("paypal_proxy", Loc.T("PayPal代理池"), ""),
-                    Options("paypal_billing_region", Loc.T("订单生成地区"), "", "DE", "JP", "US", "AU", "DE", "FR", "GB", "IN", "BR"),
-                    Options("paypal_link_generation_type", Loc.T("PayPal直链生成模式"), "paypal.link_generation_type", "hosted_long_url", "hosted_long_url", "paypal_direct", "paypal_direct_zero_due"))),
+                    Options("paypal_billing_region", Loc.T("订单生成地区"), "", "DE", "JP", "US", "AU", "DE", "FR", "GB", "IN", "BR"))),
 
             Category(Loc.T("数据与文件"),
                 Section(Loc.T("运行环境"),

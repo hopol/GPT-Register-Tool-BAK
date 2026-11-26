@@ -619,7 +619,7 @@ def check_payment_qualification(args: Any, context: PaymentCommandContext) -> No
     freezes which modules may import it. Success means "the probe answered"
     (including a conclusive 无可用); ``eligible`` is counted separately.
     """
-    from ..diagnostics import safe_print
+    from ..observability.diagnostics import safe_print
     from ..payment.qualification_batch import refresh_payment_qualification
     from ..storage import list_paypal_accounts
 
@@ -657,7 +657,7 @@ def _print_payment_qualification_summary(result: Mapping[str, Any]) -> None:
     A failed account shows the badge *and* the raw reason, because 检测失败 alone
     cannot tell an operator whether to rotate the exit or refresh the token.
     """
-    from ..diagnostics import safe_print
+    from ..observability.diagnostics import safe_print
 
     _raw_results: object = result.get("results")
     rows = [item for item in (_raw_results if isinstance(_raw_results, list) else []) if isinstance(item, dict)]
@@ -689,6 +689,14 @@ def _print_payment_qualification_summary(result: Mapping[str, Any]) -> None:
         reason = str(probe.get("error") or probe.get("error_code") or item.get("error") or "")
         detail = f" ({reason[:120]})" if reason else ""
         safe_print(f"[!] {item.get('email') or ''}: {badge}{detail}")
+
+
+def _apply_team_trial_options(args: Any, method: str, target: dict[str, Any]) -> None:
+    if method != "team_trial":
+        return
+    target["workspace_name"] = str(getattr(args, "team_workspace_name", None) or "MyTeam").strip()
+    target["seat_quantity"] = _safe_int(getattr(args, "team_seat_quantity", 5), 5)
+    target["verify_eligibility"] = not bool(getattr(args, "skip_team_eligibility_check", False))
 
 
 def extract_payment_link(args: Any, context: PaymentCommandContext) -> None:
@@ -727,12 +735,8 @@ def extract_payment_link(args: Any, context: PaymentCommandContext) -> None:
     email_file = str(getattr(args, "email_file", None) or "").strip()
     if email_file:
         if method == "blik" and not getattr(args, "payment_probe_only", False):
-            output(
-                {
-                    "ok": False,
-                    "error": "BLIK is single-account only; use --email or --session-file with --blik-code",
-                }
-            )
+            err = "BLIK is single-account only; use --email or --session-file with --blik-code"
+            output({"ok": False, "error": err})
             raise SystemExit(2)
 
         from ..payment.batch import run_payment_batch
@@ -770,6 +774,7 @@ def extract_payment_link(args: Any, context: PaymentCommandContext) -> None:
             "checkout_country": route["checkout_country"],
             "require_zero": not getattr(args, "no_require_zero", False),
         }
+        _apply_team_trial_options(args, method, payment_kwargs)
         try:
             report = run_payment_batch(
                 emails,
@@ -872,6 +877,7 @@ def extract_payment_link(args: Any, context: PaymentCommandContext) -> None:
         kwargs["qr_path"] = getattr(args, "qr_path", None)
     if method == "blik":
         kwargs["blik_code"] = getattr(args, "blik_code", None)
+    _apply_team_trial_options(args, method, kwargs)
 
     result = generate_payment_link(
         access_token=at,

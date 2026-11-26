@@ -1,10 +1,6 @@
-// Opted into nullable reference checking file-by-file - see the note in
-// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
-#nullable enable
-
 using SmsWorkbench.Localization;
 
-namespace SmsWorkbench
+namespace SmsWorkbench.Views
 {
     public partial class MainWindow
     {
@@ -97,6 +93,21 @@ namespace SmsWorkbench
 
         private void CtxCheckAccountAlive()
             => RunUiTask(() => CtxCheckAccountAliveAsync(_lifetimeCts.Token));
+
+        private void CtxInspectAccount()
+        {
+            if (accountGridControl.SelectedRow is not PoolRow row || string.IsNullOrWhiteSpace(row.Identifier))
+            {
+                NotifyWarning(Loc.T("请先选择一个账号。"));
+                return;
+            }
+            var plan = BackendCommandPlanner.CreateAccountInspection(
+                new[] { row.Identifier.Trim() },
+                SessionFileFor(row),
+                workers: 1,
+                GetLivenessProxyPool());
+            RunAccountBatchBackend(plan, "account_scan", 1);
+        }
 
         private async Task CtxCheckAccountAliveAsync(CancellationToken ct = default)
         {

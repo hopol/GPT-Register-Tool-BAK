@@ -1,5 +1,5 @@
-commit=c6a16c151dc1ac9b7d980367bd59126741465e6a
-timestamp=2026-11-21T09:06:03Z
+commit=303bc6a27d94b0c2b1032a9b0a7882487bab329f
+timestamp=2026-11-26T10:21:17Z
 upstream_url=https://github.com/2951461586/GPT-Register-Tool
 upstream_branch=main
-source_ref=v2026.11.20-1-gc6a16c1
+source_ref=v2026.11.25-1-g303bc6a2

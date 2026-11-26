@@ -63,7 +63,7 @@ elif os.environ.get(_CONFIG_DIR_OWNER_ENV) == "1" and os.environ.get("PYTEST_XDI
     # One directory per process makes the migration single-process again.
     os.environ[_CONFIG_DIR_ENV] = str(_seed_test_config_dir())
 
-from sms_tool import logging_setup
+from sms_tool.observability import logging_setup
 
 
 @pytest.fixture(autouse=True)
@@ -111,22 +111,6 @@ def _reset_logging_configured():
     """
     yield
     logging_setup._CONFIGURED = False
-
-
-@pytest.fixture(autouse=True)
-def _reset_upi_sentinel_mint_cache():
-    """Clear the UPI Sentinel mint cache around every test.
-
-    ``sms_tool.upi_link.sentinel._MINT_CACHE`` is module-level and keyed by
-    ``(flow, device_id, proxy, cookie, page_url, fingerprint)``.  A leaked entry
-    makes a later test read a previous test's mocked token instead of its own --
-    the same green-alone, red-in-full-run shape as the logging flag above.
-    """
-    from sms_tool.upi_link import sentinel as upi_sentinel
-
-    upi_sentinel._MINT_CACHE.clear()
-    yield
-    upi_sentinel._MINT_CACHE.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -429,7 +413,7 @@ def isolated_payment_operations(tmp_path, monkeypatch):
 
     Yields the isolated root.
     """
-    from sms_tool.payment.operation import PaymentOperationStore
+    from sms_tool.operation_journal import PaymentOperationStore
 
     root = tmp_path / "payment_operations"
 

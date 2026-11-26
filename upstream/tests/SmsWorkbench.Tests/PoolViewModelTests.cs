@@ -99,6 +99,19 @@ namespace SmsWorkbench.Tests
         }
 
         [Fact]
+        public void ScopeFilter_RegisteredKeepsOnlyRegisteredRows()
+        {
+            var pool = WithRows(3);
+            pool.AllRows[1].Status = "邮箱可用";
+
+            pool.ScopeFilter = "registered";
+
+            Assert.Equal(
+                new[] { "user001@example.com", "user003@example.com" },
+                pool.PagedRows.Select(r => r.Identifier));
+        }
+
+        [Fact]
         public void SortBy_OrdersTheFilteredRowsAndResetsThePage()
         {
             var pool = WithRows(15);
@@ -274,6 +287,18 @@ namespace SmsWorkbench.Tests
                 DatabasePath);
 
             Assert.Single(pool.AllRows);
+        }
+
+        [Fact]
+        public void ReplaceAll_ReplacesStagedRowsAndCachesScopeOptionsPerLanguage()
+        {
+            var pool = new PoolViewModel();
+            pool.ReplaceAll(new[] { DbRow("1", "a@example.test"), DbRow("2", "b@example.test") });
+            Assert.Equal(2, pool.AllRows.Count);
+
+            var first = pool.ScopeOptions;
+            var second = pool.ScopeOptions;
+            Assert.Same(first, second);
         }
     }
 }

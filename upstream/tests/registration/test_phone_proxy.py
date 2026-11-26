@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from sms_tool import phone_proxy
+from sms_tool.phone import phone_proxy
 from sms_tool.phone.reuse import PhonePool, PhoneSlot, complete_phone_verification_with_reuse
 
 
@@ -161,7 +161,7 @@ class PhoneReuseProxyGateTests(unittest.TestCase):
         session = Mock()
         with (
             patch("sms_tool.phone.provider_lifecycle._acquire_smsbower_number") as acquire,
-            patch("sms_tool.phone_proxy.select_phone_proxy", return_value={"ok": False, "error": "forbidden ip"}),
+            patch("sms_tool.phone.phone_proxy.select_phone_proxy", return_value={"ok": False, "error": "forbidden ip"}),
         ):
             result = complete_phone_verification_with_reuse(
                 session, "did", "https://auth.openai.com/add-phone", pool, proxy="http://bad.proxy:8080"
@@ -169,6 +169,31 @@ class PhoneReuseProxyGateTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "phone_proxy_unavailable")
         acquire.assert_not_called()
+
+    def test_probe_proxy_cache_persists_hashed_keys_and_redacted_proxy(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_file = Path(tmp) / "phone_proxy_probe_cache.json"
+            secret_proxy = "http://alice:PHONESECRET@gw.example:8080"
+            with (
+                patch.object(phone_proxy, "_cache_path", return_value=cache_file),
+                patch.object(phone_proxy, "_TRANSIENT_CACHE", {}),
+                patch.object(phone_proxy, "_probe_proxy_live", side_effect=RuntimeError(f"dial {secret_proxy} failed")),
+            ):
+                res = phone_proxy.probe_proxy(secret_proxy, "US", use_cache=True)
+                cached = phone_proxy.probe_proxy(secret_proxy, "US", use_cache=True)
+            self.assertFalse(res["ok"])
+            self.assertNotIn("PHONESECRET", res["error"])
+            self.assertTrue(cached["cache"])
+            self.assertEqual(cached["proxy"], secret_proxy)
+            on_disk = cache_file.read_text(encoding="utf-8")
+            self.assertNotIn("PHONESECRET", on_disk)
+            self.assertNotIn("alice", on_disk)
+            parsed = json.loads(on_disk)
+            self.assertEqual(len(parsed), 1)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,11 @@
-// Opted into nullable reference checking file-by-file - see the note in
-// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
-#nullable enable
-
-namespace SmsWorkbench
+namespace SmsWorkbench.Views
 {
     public partial class SettingsWindow : Window
     {
         public SettingsWindow(SettingsViewModel viewModel)
         {
             InitializeComponent();
+            WindowThemeService.Attach(this);
             DataContext = viewModel;
             viewModel.CloseRequested += (_, _) => Close();
         }

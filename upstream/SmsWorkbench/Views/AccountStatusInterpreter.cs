@@ -1,13 +1,6 @@
-// Opted into nullable reference checking file-by-file - see the note in
-// PaymentBatchService.cs. Worth doing here in particular: this class is the one
-// business-rule implementation for account status and had no test coverage at
-// all, so "dictionary may not contain this key" is exactly the class of bug that
-// goes unnoticed in it.
-#nullable enable
-
 using SmsWorkbench.Localization;
 
-namespace SmsWorkbench
+namespace SmsWorkbench.Views
 {
     /// <summary>
     /// Window-independent interpretation of backend account JSON: plan type,
@@ -293,6 +286,7 @@ namespace SmsWorkbench
             return value
                 .Replace("检测失败", Loc.T("检测失败"))
                 .Replace("可试用Plus", Loc.T("可试用Plus"))
+                .Replace("可试用Team(5席)", Loc.T("可试用Team(5席)"))
                 .Replace("已订阅", Loc.T("已订阅"))
                 .Replace("无优惠", Loc.T("无优惠"));
         }

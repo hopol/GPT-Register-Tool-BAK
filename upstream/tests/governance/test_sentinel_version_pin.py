@@ -54,6 +54,11 @@ def test_example_auto_update_is_off_and_typed() -> None:
 
 
 def test_pin_covers_the_runtime_asset_that_is_actually_shipped() -> None:
-    """``DEFAULT_SENTINEL_VERSION`` and the pinned digest describe one file."""
-    assert bundle.SDK_PATH.is_file()
-    assert bundle._digest(bundle.SDK_PATH) == bundle.SDK_SHA256
+    """``DEFAULT_SENTINEL_VERSION`` and the pinned native VM digest describe the shipped runtime."""
+    assert bundle.NATIVE_LIB_PATH.is_file()
+    assert bundle._binary_digest(bundle.NATIVE_LIB_PATH) == bundle.NATIVE_LIB_SHA256
+
+
+def test_upi_sentinel_uses_unified_sentinel_client() -> None:
+    """``upi_link`` must not ship a duplicate vendored Node Sentinel bridge."""
+    assert not (ROOT / "sms_tool" / "upi_link" / "_vendor").exists()

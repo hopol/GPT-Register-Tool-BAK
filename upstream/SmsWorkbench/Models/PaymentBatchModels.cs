@@ -1,10 +1,6 @@
-// Opted into nullable reference checking file-by-file - see the note in
-// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
-#nullable enable
-
 using CommunityToolkit.Mvvm.ComponentModel;
 
-namespace SmsWorkbench
+namespace SmsWorkbench.Models
 {
     public sealed record PaymentBatchAccount(string Email, bool HasAccessToken, string AccessToken = "");
 
@@ -91,6 +87,18 @@ namespace SmsWorkbench
         public int Attempts { get; init; }
     }
 
+    /// <summary>
+    /// Configuration for the external Paylink Extraction Server used by the
+    /// unified ``extract_server`` adapter (``protocol_payments.extract_link_server``).
+    /// </summary>
+    public sealed record ExtractLinkServerConfiguration(
+        string ApiBase = "",
+        string Cdk = "",
+        string Endpoint = "/api/v1/extract",
+        int TimeoutSeconds = 60,
+        bool PassProxy = true,
+        bool VerifyTls = true);
+
     public sealed record PaymentBatchRequest(
         IReadOnlyList<PaymentBatchAccount> Accounts,
         string PaymentMethod,
@@ -109,5 +117,6 @@ namespace SmsWorkbench
         IReadOnlyList<PaymentMatrixRow> MatrixRows)
     {
         public bool ResumeCheckpoint { get; init; }
+        public ExtractLinkServerConfiguration? ExtractServer { get; init; }
     }
 }

@@ -2,21 +2,51 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
+import os
+import sys
 import time
-from typing import Any, Mapping
+from pathlib import Path
+from typing import Any, Callable, Mapping
 from urllib.parse import unquote, urlsplit
 
-from .. import endpoints
+from ..transport import endpoints
 from ..browser.profile_reclaim import describe_contention
-from ..phone_proxy import normalize_proxy_url
+from ..proxy.entry import normalize_proxy_url
 from .browser_flow.decisions import DEFAULT_VIEWPORT_HEIGHT, DEFAULT_VIEWPORT_WIDTH
+from .data_saver import BrowserDataSaverConfig, BrowserDataSaverHandle, install_playwright_data_saver
 from .stealth import apply_playwright_stealth
 
 _LOGGER = logging.getLogger(__name__)
 
 
+def _load_native_playwright_proxy() -> Any | None:
+    mode = str(os.environ.get("RUST_ANYTHING_MODE") or "").strip().lower()
+    unit_mode = str(os.environ.get("RUST_ANYTHING_UNIT_PLAYWRIGHT_PROXY") or "").strip().lower()
+    if mode in {"old", "original"} or unit_mode in {"old", "original"}:
+        return None
+    pkg_dir = Path(__file__).resolve().parents[2] / "rust" / "playwright-proxy-rs" / "python"
+    if pkg_dir.is_dir():
+        pkg_str = str(pkg_dir)
+        if pkg_str not in sys.path:
+            sys.path.insert(0, pkg_str)
+    try:
+        return importlib.import_module("playwright_proxy_rs")
+    except (ImportError, OSError):
+        if mode in {"new", "rust"} or unit_mode in {"new", "rust"}:
+            raise
+        return None
+
+
+_NATIVE_PLAYWRIGHT_PROXY_MOD = _load_native_playwright_proxy()
+_NATIVE_PLAYWRIGHT_PROXY = getattr(_NATIVE_PLAYWRIGHT_PROXY_MOD, "_playwright_proxy", None)
+_NATIVE_SCALAR_TYPES = (str, type(None), bool, int, float)
+
+
 def _playwright_proxy(proxy: str | None) -> dict[str, str] | None:
+    if _NATIVE_PLAYWRIGHT_PROXY is not None and isinstance(proxy, _NATIVE_SCALAR_TYPES):
+        return _NATIVE_PLAYWRIGHT_PROXY(proxy)
     value = normalize_proxy_url(proxy)
     if not value:
         return None
@@ -51,6 +81,7 @@ class PlaywrightBrowserSession:
         timezone_id: str = "America/New_York",
         user_data_dir: str = "",
         viewport: tuple[int, int] | None = None,
+        data_saver_config: BrowserDataSaverConfig | Mapping[str, Any] | None = None,
     ) -> None:
         self.proxy = proxy
         self.headless = bool(headless)
@@ -58,6 +89,11 @@ class PlaywrightBrowserSession:
         self.locale = str(locale or "en-US")
         self.timezone_id = str(timezone_id or "America/New_York")
         self.user_data_dir = str(user_data_dir or "").strip()
+        if isinstance(data_saver_config, BrowserDataSaverConfig):
+            self.data_saver_config = data_saver_config
+        else:
+            self.data_saver_config = BrowserDataSaverConfig.from_config(data_saver_config)
+        self._data_saver_handle: BrowserDataSaverHandle | None = None
         # Rotated screen profile (browser fingerprint pool).  Defaults to the
         # shared constants so the fallback is defined in exactly one place
         # (P2-10: was hardcoded 1440x900 duplicated from decisions.py).
@@ -69,6 +105,7 @@ class PlaywrightBrowserSession:
         else:
             self.viewport = {"width": DEFAULT_VIEWPORT_WIDTH, "height": DEFAULT_VIEWPORT_HEIGHT}
         self._persistent = bool(self.user_data_dir)
+        self._proxy_closer: Callable[[], None] | None = None
         self._playwright = None
         self.browser = None
         self.context = None
@@ -82,7 +119,12 @@ class PlaywrightBrowserSession:
             raise RuntimeError("browser_dependency_missing:playwright") from exc
         try:
             self._playwright = sync_playwright().start()
-            browser_proxy = _playwright_proxy(self.proxy)
+            effective_proxy = self.proxy
+            if self.proxy and (os.environ.get("GPT_PROXY_CHAIN_HOP") or os.environ.get("PROXY_CHAIN_HOP")):
+                from ..proxy.bridge import open_browser_proxy_bridge
+
+                effective_proxy, self._proxy_closer, _bridge = open_browser_proxy_bridge(self.proxy)
+            browser_proxy = _playwright_proxy(effective_proxy)
             if self.user_data_dir:
                 import pathlib
 
@@ -119,6 +161,7 @@ class PlaywrightBrowserSession:
                 label="playwright",
                 provider_prefix="playwright",
             )
+            self._attach_data_saver()
             return self
         except Exception:
             self.close()
@@ -142,7 +185,22 @@ class PlaywrightBrowserSession:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
+    def _attach_data_saver(self, *, bridge: Any = None) -> None:
+        self._data_saver_handle = install_playwright_data_saver(
+            self.context,
+            self.data_saver_config,
+            bridge=bridge,
+        )
+
+    def data_saver_snapshot(self) -> dict[str, Any] | None:
+        if self._data_saver_handle is None:
+            return None
+        return self._data_saver_handle.snapshot()
+
     def close(self) -> None:
+        if self._data_saver_handle is not None:
+            _LOGGER.info("%s", self._data_saver_handle.summary_line())
+            self._data_saver_handle = None
         for item in (self.context, self.browser, self._playwright):
             if item is None:
                 continue
@@ -160,6 +218,12 @@ class PlaywrightBrowserSession:
         self.browser = None
         self._playwright = None
         self.stealth_status = {"playwright_stealth": False}
+        closer, self._proxy_closer = self._proxy_closer, None
+        if closer is not None:
+            try:
+                closer()
+            except (OSError, RuntimeError):
+                _LOGGER.debug("failed to close local proxy bridge", exc_info=True)
 
     def release_account_context(self) -> None:
         """Close only the per-account context, keeping the browser process alive.
@@ -214,6 +278,7 @@ class PlaywrightBrowserSession:
             label="playwright",
             provider_prefix="playwright",
         )
+        self._attach_data_saver()
         return self
 
     def cookie_header(self) -> str:

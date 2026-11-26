@@ -17,11 +17,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .. import sms_providers
+from ..phone import sms_providers
 from ..config import CFG, ConfigInput, RuntimeConfig, resolve_runtime_config
 from ..mailbox.parsers import parse_mailbox_pool_line
 from ..kernel.paths import PROJECT_ROOT, config_dir, resolve_config_file
-from ..promotion_states import promotion_marker_is_stale
+from ..payment.promotion_states import promotion_marker_is_stale
 from ..registration.retry_guard import RegistrationRetryGuard, mailbox_registration_status
 from ..kernel.sanitizer import sanitize
 from ..storage import (
@@ -222,6 +222,14 @@ def _record_payload(record: dict[str, Any], *, include_session: bool = True) -> 
                 result["promotion_state"] = promotion_state
             if promotion_status:
                 result["promotion_display"] = promotion_status
+            _raw_promo_obj: object = session.get("promotion")
+            _promo_last = _raw_promo_obj.get("last_result") if isinstance(_raw_promo_obj, dict) else None
+            if isinstance(_promo_last, dict) and (
+                "team_trial_eligible" in _promo_last or _promo_last.get("team_trial_state")
+            ):
+                result["team_trial_eligible"] = bool(_promo_last.get("team_trial_eligible"))
+                if _promo_last.get("team_trial_state"):
+                    result["team_trial_state"] = str(_promo_last.get("team_trial_state") or "")
             qualification, qualification_state = _payment_qualification_presentation(session)
             if qualification:
                 result["payment_qualification_display"] = qualification

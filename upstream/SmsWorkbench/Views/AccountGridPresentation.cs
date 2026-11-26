@@ -1,11 +1,7 @@
-// Opted into nullable reference checking file-by-file - see the note in
-// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
-#nullable enable
-
 using System.Linq.Expressions;
 using Expr = System.Linq.Expressions.Expression;
 
-namespace SmsWorkbench
+namespace SmsWorkbench.Views
 {
     public sealed class StatusSeverityConverter : IValueConverter
     {
@@ -172,7 +168,7 @@ namespace SmsWorkbench
     public static class PromotionStatusPresentation
     {
         // Machine promotion state emitted by the Python backend
-        // (sms_tool/promotion_states.py). The Chinese label is display copy:
+        // (sms_tool/payment/promotion_states.py). The Chinese label is display copy:
         // filtering and sorting key off the code so a label reword cannot
         // change behaviour. Rows recorded before the field existed fall back
         // to the legacy substring rule.
@@ -190,8 +186,11 @@ namespace SmsWorkbench
             string value = (status ?? "").Trim();
             if (value.Length == 0) return false;
             return (value.Contains("可试用", StringComparison.OrdinalIgnoreCase)
-                    || value.Contains("plus trial", StringComparison.OrdinalIgnoreCase))
-                && value.Contains("plus", StringComparison.OrdinalIgnoreCase);
+                    && (value.Contains("plus", StringComparison.OrdinalIgnoreCase)
+                        || value.Contains("team", StringComparison.OrdinalIgnoreCase)))
+                || value.Contains("plus trial", StringComparison.OrdinalIgnoreCase)
+                || value.Contains("team trial", StringComparison.OrdinalIgnoreCase)
+                || value.Contains("team (5 seats) trial", StringComparison.OrdinalIgnoreCase);
         }
 
         public static int SortRank(string status, string? state = null)

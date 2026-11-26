@@ -1,8 +1,8 @@
-<Window x:Class="SmsWorkbench.SettingsWindow"
+<Window x:Class="SmsWorkbench.Views.SettingsWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:loc="clr-namespace:SmsWorkbench.Localization"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:local="clr-namespace:SmsWorkbench"
+        xmlns:local="clr-namespace:SmsWorkbench.Views"
         Title="{loc:Tr Key='设置'}"
         Width="1100"
         Height="780"
@@ -119,7 +119,8 @@
                TextWrapping="NoWrap"
                VerticalScrollBarVisibility="Auto"
                HorizontalScrollBarVisibility="Auto"
-               FontFamily="Consolas"
+               FontFamily="{StaticResource Font.Mono}"
+               FontSize="{StaticResource Type.Mono.Size}"
                Style="{StaticResource SettingsMultilineEditorStyle}">
         <TextBox.Resources>
           <Style TargetType="{x:Type ScrollViewer}" BasedOn="{StaticResource SettingsScrollViewerStyle}"/>
@@ -201,27 +202,37 @@
             </ListBox.ItemTemplate>
             <ListBox.ItemContainerStyle>
               <Style TargetType="ListBoxItem">
-                <Setter Property="Height" Value="36"/>
-                <Setter Property="Padding" Value="10,0"/>
-                <Setter Property="Margin" Value="0,0,0,6"/>
+                <Setter Property="Height" Value="34"/>
+                <Setter Property="Padding" Value="12,0"/>
+                <Setter Property="Margin" Value="0,0,0,3"/>
                 <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
                 <Setter Property="VerticalContentAlignment" Value="Center"/>
                 <Setter Property="Background" Value="Transparent"/>
-                <Setter Property="BorderBrush" Value="{DynamicResource Line}"/>
-                <Setter Property="BorderThickness" Value="1"/>
-                <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+                <Setter Property="BorderBrush" Value="Transparent"/>
+                <Setter Property="BorderThickness" Value="0"/>
+                <Setter Property="Cursor" Value="Hand"/>
+                <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRingStyle}"/>
                 <Setter Property="Template">
                   <Setter.Value>
                     <ControlTemplate TargetType="ListBoxItem">
-                      <Border x:Name="ItemChrome"
-                              Background="{TemplateBinding Background}"
-                              BorderBrush="{TemplateBinding BorderBrush}"
-                              BorderThickness="{TemplateBinding BorderThickness}"
-                              CornerRadius="{StaticResource Corner.Sm}"
-                              Padding="{TemplateBinding Padding}">
-                        <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
-                                          VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
-                      </Border>
+                      <Grid>
+                        <Border x:Name="ItemChrome"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="{StaticResource Corner.Md}"
+                                Padding="{TemplateBinding Padding}">
+                          <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                            VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+                        </Border>
+                        <Border x:Name="SelectedIndicator"
+                                Width="3"
+                                Margin="0,7"
+                                HorizontalAlignment="Left"
+                                CornerRadius="{StaticResource Corner.Hairline}"
+                                Background="{DynamicResource AccentIndicator}"
+                                Visibility="Collapsed"/>
+                      </Grid>
                       <ControlTemplate.Triggers>
                         <Trigger Property="IsMouseOver" Value="True">
                           <Setter TargetName="ItemChrome" Property="Background" Value="{DynamicResource PanelHover}"/>
@@ -229,6 +240,9 @@
                         <Trigger Property="IsSelected" Value="True">
                           <Setter TargetName="ItemChrome" Property="Background" Value="{DynamicResource SettingsSelectionBg}"/>
                           <Setter TargetName="ItemChrome" Property="BorderBrush" Value="{DynamicResource SettingsSelectionBorder}"/>
+                          <Setter TargetName="ItemChrome" Property="BorderThickness" Value="1"/>
+                          <Setter TargetName="SelectedIndicator" Property="Visibility" Value="Visible"/>
+                          <Setter Property="FontWeight" Value="SemiBold"/>
                         </Trigger>
                         <Trigger Property="IsEnabled" Value="False">
                           <Setter Property="Opacity" Value="0.45"/>
@@ -277,8 +291,8 @@
       <TextBlock Text="{Binding Status}" Foreground="{DynamicResource Danger}" VerticalAlignment="Center" TextWrapping="Wrap" Margin="0,0,12,0"/>
       <StackPanel Grid.Column="1" Orientation="Horizontal">
         <Button Content="{loc:Tr Key='打开配置文件'}" Command="{Binding OpenConfigCommand}" MinWidth="120" Margin="0,0,8,0"/>
-        <Button Content="{loc:Tr Key='保存'}" Command="{Binding SaveCommand}" Style="{StaticResource PrimaryButton}" MinWidth="72" Margin="0,0,8,0"/>
-        <Button Content="{loc:Tr Key='取消'}" IsCancel="True" MinWidth="72"/>
+        <Button Content="{loc:Tr Key='取消'}" IsCancel="True" MinWidth="72" Margin="0,0,8,0"/>
+        <Button Content="{loc:Tr Key='保存'}" Command="{Binding SaveCommand}" Style="{StaticResource PrimaryButton}" MinWidth="72"/>
       </StackPanel>
     </Grid>
   </Grid>

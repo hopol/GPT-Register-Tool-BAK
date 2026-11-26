@@ -11,12 +11,10 @@ import urllib.parse
 import uuid
 from datetime import timezone, datetime
 
-from curl_cffi import requests as curl_requests
-
 from ..config import CFG
-from .. import endpoints
-from ..endpoints import AUTH_BASE
-from ..operator_output import emit as _emit
+from ..transport import endpoints
+from ..transport.endpoints import AUTH_BASE
+from ..observability.operator_output import emit as _emit
 from .phone import complete_phone_verification
 from .sentinel import (
     attach_sentinel,
@@ -25,9 +23,16 @@ from .sentinel import (
     load_cached_sentinel,
     with_sentinel,
 )
-from ..auth_headers import auth_impersonate, openai_auth_headers_lower, select_auth_fingerprint
-from ..http_client import request_with_retry
-from ..http_utils import _absolute_url
+from ..transport.auth_headers import (
+    auth_impersonate,
+    openai_auth_headers_lower,
+    select_auth_fingerprint,
+    set_fingerprint_device,
+)
+from ..transport.http_backend import new_session as _new_protocol_session
+from ..transport.http_client import request_with_retry
+from ..transport.http_utils import _absolute_url
+from ..transport.tls_fingerprint import apply_to_session as _apply_tls_fingerprint
 from ..mailbox.router import MailboxAccount, MailboxTokenExpiredError, poll_email_otp, mailbox_has_inbox_credentials
 from ..providers import mailbox_gmail
 from ..kernel.sanitizer import sanitize_text
@@ -39,8 +44,9 @@ from ..storage import upsert_account
 # ``error.redirect_uri``, and ``issue_sentinel_flow`` is the only supported way
 # to mint an ``oauth_create_account`` token (the recovery lane's cached sentinel
 # is bound to a different flow).
-from ..account_creation import _create_account_continue_url, _is_user_already_exists
-from ..sentinel.client import issue_sentinel_flow
+from ..registration.account_creation import _create_account_continue_url, _is_user_already_exists
+from ..sentinel.client import EMAIL_OTP_VALIDATE_FLOW, SentinelIssueError, issue_sentinel_flow
+from ..sentinel.runner import SentinelRunnerError
 from ..utils import atomic_write_text
 from ..utils import _random_birthdate, _random_name
 from typing import Any
@@ -53,8 +59,30 @@ TOKEN_URL = endpoints.AUTH_BASE + "/oauth/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 REDIRECT_URI = "http://localhost:1455/auth/callback"
 SCOPE = "openid profile email offline_access"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/110.0.0.0 Safari/537.36"
 LOGIN_EMAIL_OTP_SUBJECT_KEYWORD = "login code"
+
+
+def _new_codex_session(proxy=None, device_id=""):
+    """Build a protocol-backend-aware session with per-account TLS permutation."""
+    did = str(device_id or "").strip()
+    if did:
+        set_fingerprint_device(did)
+    session = _new_protocol_session(proxy=str(proxy or ""))
+    _apply_tls_fingerprint(session, CFG)
+    return session
+
+
+def _codex_sentinel(session, did, flow="authorize_continue", proxy=None):
+    """Mint a fresh per-flow Sentinel pair, falling back to cache on runner error."""
+    try:
+        issued = issue_sentinel_flow(flow=flow, device_id=did, session=session, proxy=proxy)
+        token = str(getattr(issued, "token", "") or "").strip()
+        so_token = str(getattr(issued, "so_token", "") or "").strip()
+        if token:
+            return {"sentinel_token": token, "sentinel_so_token": so_token}
+    except (SentinelIssueError, SentinelRunnerError, RuntimeError, OSError, ValueError) as exc:
+        _LOGGER.debug("codex sentinel mint failed for %s (%s); falling back to cached sentinel", flow, exc)
+    return load_cached_sentinel()
 
 
 def refresh_codex_oauth_session(
@@ -113,9 +141,7 @@ def collect_codex_oauth_tokens(
         return {"ok": False, "mode": "codex_oauth_pkce", "error": "missing_email"}
     oauth = _new_oauth_request()
     if session is None:
-        session = curl_requests.Session()
-        if proxy:
-            session.proxies = {"http": proxy, "https": proxy}
+        session = _new_codex_session(proxy=proxy, device_id=data.get("device_id", ""))
         import_cookie_header(session, data.get("cookie_header", ""), "chatgpt.com")
         import_cached_auth_cookies(session)
     elif proxy:
@@ -180,9 +206,10 @@ def _login_and_exchange(
     max_restarts = 2
     for restart_attempt in range(max_restarts + 1):
         did = str(data.get("device_id") or "").strip() or _cookie_value(session, "oai-did") or secrets.token_hex(16)
+        set_fingerprint_device(did)
         with contextlib.suppress(Exception):
             session.cookies.set("oai-did", did, domain="auth.openai.com", path="/")
-        sentinel = load_cached_sentinel()
+        sentinel = _codex_sentinel(session, did, flow="authorize_continue", proxy=proxy)
         headers = _oai_headers(did, {"Referer": current_url or AUTH_URL, "content-type": "application/json"})
         attach_sentinel(headers, sentinel)
         start_resp = session.post(
@@ -328,7 +355,7 @@ def _run_protocol_login_stages(
         )
         return email_otp_result
     elif stage == "password":
-        password_result = _password_login_and_exchange(
+        return _handle_password_stage_login(
             session=session,
             oauth=oauth,
             data=data,
@@ -336,35 +363,11 @@ def _run_protocol_login_stages(
             current_url=current_url,
             proxy=proxy,
             timeout=timeout,
+            allow_takeover=allow_takeover,
             phone_pool=phone_pool,
             phone_probe_only=phone_probe_only,
             browser_headless=browser_headless,
         )
-        if password_result.get("ok"):
-            password_result.setdefault("protocol_stage", "password")
-            return password_result
-        if not allow_takeover:
-            return password_result
-        email_otp_result = _passwordless_login_and_exchange(
-            session=session,
-            oauth=oauth,
-            data=data,
-            did=did,
-            current_url=current_url,
-            proxy=proxy,
-            timeout=timeout,
-            reason="password_login_failed",
-            phone_pool=phone_pool,
-            phone_probe_only=phone_probe_only,
-            browser_headless=browser_headless,
-        )
-        if email_otp_result.get("ok"):
-            email_otp_result.setdefault("protocol_stage", "email_otp")
-            return email_otp_result
-        email_otp_result.setdefault("protocol_stage", "email_otp")
-        email_otp_result.setdefault("fallback_from", "password_login_failed")
-        email_otp_result["password_attempt"] = password_result
-        return email_otp_result
     elif stage == "add_phone":
         final = _finish_authorization(
             session, oauth, did, current_url, proxy=proxy, phone_pool=phone_pool, phone_probe_only=phone_probe_only
@@ -404,6 +407,125 @@ def _run_protocol_login_stages(
         "phone_attempt": final.get("phone_attempt"),
         "protocol_stage": stage,
     }
+
+
+def _handle_password_stage_login(
+    *,
+    session,
+    oauth,
+    data,
+    did,
+    current_url,
+    proxy,
+    timeout,
+    allow_takeover: bool,
+    phone_pool,
+    phone_probe_only,
+    browser_headless: bool | None,
+):
+    password_result = _password_login_and_exchange(
+        session=session,
+        oauth=oauth,
+        data=data,
+        did=did,
+        current_url=current_url,
+        proxy=proxy,
+        timeout=timeout,
+        phone_pool=phone_pool,
+        phone_probe_only=phone_probe_only,
+        browser_headless=browser_headless,
+    )
+    if password_result.get("ok"):
+        password_result.setdefault("protocol_stage", "password")
+        return password_result
+    if not allow_takeover:
+        return password_result
+    email_otp_result = _passwordless_login_and_exchange(
+        session=session,
+        oauth=oauth,
+        data=data,
+        did=did,
+        current_url=current_url,
+        proxy=proxy,
+        timeout=timeout,
+        reason="password_login_failed",
+        phone_pool=phone_pool,
+        phone_probe_only=phone_probe_only,
+        browser_headless=browser_headless,
+    )
+    if email_otp_result.get("ok"):
+        email_otp_result.setdefault("protocol_stage", "email_otp")
+        return email_otp_result
+    email_otp_result.setdefault("protocol_stage", "email_otp")
+    email_otp_result.setdefault("fallback_from", "password_login_failed")
+    email_otp_result["password_attempt"] = password_result
+    return email_otp_result
+
+
+def _resolve_post_otp_validate_redirect(
+    session,
+    oauth,
+    did,
+    current_url: str,
+    *,
+    reason: str,
+    proxy=None,
+    phone_pool=None,
+    phone_probe_only: bool = False,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+    about_attempt = None
+    if current_url.endswith("/about-you"):
+        about_attempt = _complete_about_you(session, did, current_url, proxy=proxy)
+        if about_attempt.get("ok"):
+            current_url = about_attempt.get("url") or current_url
+        elif about_attempt.get("error"):
+            return (
+                {
+                    "ok": False,
+                    "mode": "codex_oauth_pkce",
+                    "error": about_attempt.get("error") or "passwordless_about_you_required",
+                    "fallback_from": reason,
+                    "last_url": _safe_url(current_url),
+                    "about_you": about_attempt,
+                },
+                about_attempt,
+                current_url,
+            )
+    final = _finish_authorization(
+        session, oauth, did, current_url, proxy=proxy, phone_pool=phone_pool, phone_probe_only=phone_probe_only
+    )
+    if final.get("ok"):
+        final["login_method"] = "passwordless_email_otp"
+        final["fallback_from"] = reason
+        if about_attempt and about_attempt.get("ok"):
+            final["completed_about_you"] = True
+        return final, about_attempt, current_url
+    if final.get("phone_attempt"):
+        phone_error = (final.get("phone_attempt") or {}).get("error", "phone_verification_failed")
+        return (
+            {
+                "ok": False,
+                "mode": "codex_oauth_pkce",
+                "error": phone_error,
+                "fallback_from": reason,
+                "last_url": final.get("last_url") or _safe_url(current_url),
+                "phone_attempt": final.get("phone_attempt"),
+            },
+            about_attempt,
+            current_url,
+        )
+    if current_url.endswith("/about-you"):
+        failure: dict[str, Any] = {
+            "ok": False,
+            "mode": "codex_oauth_pkce",
+            "error": "passwordless_about_you_required",
+            "fallback_from": reason,
+            "last_url": _safe_url(current_url),
+        }
+        if about_attempt:
+            failure["about_you"] = about_attempt
+        return failure, about_attempt, current_url
+    return None, about_attempt, current_url
 
 
 def _passwordless_login_and_exchange(
@@ -495,7 +617,7 @@ def _passwordless_login_and_exchange(
                 _oai_headers(
                     did, {"Referer": endpoints.AUTH_BASE + "/email-verification", "content-type": "application/json"}
                 ),
-                load_cached_sentinel(),
+                _codex_sentinel(session, did, flow=EMAIL_OTP_VALIDATE_FLOW, proxy=proxy),
             ),
             json={"code": code},
             timeout=30,
@@ -529,65 +651,18 @@ def _passwordless_login_and_exchange(
             continue
         next_url = _next_url(validate)
         _, current_url = _follow_redirects(session, next_url, proxy=proxy)
-        # ``/about-you`` is the profile step for an account that exists but was
-        # never finished.  It used to end the attempt outright with a bare
-        # ``passwordless_about_you_required``, which made the account
-        # permanently unusable while each retry burned another OTP.  The attempt
-        # below reports *why* the page cannot be passed, and stops when the
-        # answer is the known closed loop.
-        about_attempt = None
-        if current_url.endswith("/about-you"):
-            about_attempt = _complete_about_you(session, did, current_url, proxy=proxy)
-            if about_attempt.get("ok"):
-                current_url = about_attempt.get("url") or current_url
-            elif about_attempt.get("error"):
-                # The page states *why* the account cannot be finished (an
-                # existing address the server refuses to re-create).  Report
-                # that reason and stop, instead of degrading it into a generic
-                # "about-you required" and letting the caller spend another OTP
-                # walking the same loop.  ``terminal`` is intentionally absent:
-                # the chain reserves it for deactivated accounts.
-                return {
-                    "ok": False,
-                    "mode": "codex_oauth_pkce",
-                    "error": about_attempt.get("error") or "passwordless_about_you_required",
-                    "fallback_from": reason,
-                    "last_url": _safe_url(current_url),
-                    "about_you": about_attempt,
-                }
-        final = _finish_authorization(
-            session, oauth, did, current_url, proxy=proxy, phone_pool=phone_pool, phone_probe_only=phone_probe_only
+        terminal_result, about_attempt, current_url = _resolve_post_otp_validate_redirect(
+            session,
+            oauth,
+            did,
+            current_url,
+            reason=reason,
+            proxy=proxy,
+            phone_pool=phone_pool,
+            phone_probe_only=phone_probe_only,
         )
-        if final.get("ok"):
-            final["login_method"] = "passwordless_email_otp"
-            final["fallback_from"] = reason
-            if about_attempt and about_attempt.get("ok"):
-                final["completed_about_you"] = True
-            return final
-        if final.get("phone_attempt"):
-            phone_error = (final.get("phone_attempt") or {}).get("error", "phone_verification_failed")
-            return {
-                "ok": False,
-                "mode": "codex_oauth_pkce",
-                "error": phone_error,
-                "fallback_from": reason,
-                "last_url": final.get("last_url") or _safe_url(current_url),
-                "phone_attempt": final.get("phone_attempt"),
-            }
-        if current_url.endswith("/about-you"):
-            # Reachable only when ``_complete_about_you`` reported success yet
-            # authorization still could not resume from where it landed.  The
-            # dead-end cases return earlier, from inside the attempt itself.
-            failure = {
-                "ok": False,
-                "mode": "codex_oauth_pkce",
-                "error": "passwordless_about_you_required",
-                "fallback_from": reason,
-                "last_url": _safe_url(current_url),
-            }
-            if about_attempt:
-                failure["about_you"] = about_attempt
-            return failure
+        if terminal_result is not None:
+            return terminal_result
     return {
         "ok": False,
         "mode": "codex_oauth_pkce",
@@ -625,7 +700,7 @@ def _password_login_and_exchange(
         endpoints.AUTH_BASE + "/api/accounts/password/verify",
         headers=with_sentinel(
             _oai_headers(did, {"Referer": current_url, "content-type": "application/json"}),
-            load_cached_sentinel(),
+            _codex_sentinel(session, did, flow="authorize_continue", proxy=proxy),
         ),
         json={"password": password},
         timeout=30,
@@ -648,13 +723,14 @@ def _password_login_and_exchange(
     except Exception:
         verify_body = {}
     if _auth_totp._is_mfa_challenge_payload(verify_body):
+        mfa_sentinel = _codex_sentinel(session, did, flow="authorize_continue", proxy=proxy)
         mfa = _auth_totp._complete_existing_login_totp(
             session,
             AUTH_BASE,
             {},
             verify_body,
             did=did,
-            sentinel_token=str(load_cached_sentinel().get("sentinel_token") or ""),
+            sentinel_token=str(mfa_sentinel.get("sentinel_token") or ""),
             totp_secret=str(data.get("totp_secret") or ""),
         )
         if not mfa.get("ok"):
@@ -824,8 +900,8 @@ def _send_passwordless_otp(session, did, current_url, proxy=None):
     return {"ok": False, "error": "passwordless_send_unavailable"}
 
 
-def _resend_email_otp(session, did, current_url):
-    sentinel = load_cached_sentinel()
+def _resend_email_otp(session, did, current_url, proxy=None):
+    sentinel = _codex_sentinel(session, did, flow="authorize_continue", proxy=proxy)
     try:
         response = session.post(
             endpoints.AUTH_BASE + "/api/accounts/email-otp/resend",
@@ -1086,7 +1162,7 @@ def _complete_email_otp(session, data, did, current_url, proxy=None, timeout=180
             _oai_headers(
                 did, {"Referer": endpoints.AUTH_BASE + "/email-verification", "content-type": "application/json"}
             ),
-            load_cached_sentinel(),
+            _codex_sentinel(session, did, flow=EMAIL_OTP_VALIDATE_FLOW, proxy=proxy),
         ),
         json={"code": code},
         timeout=30,
@@ -1132,7 +1208,7 @@ def _select_workspace(session, did, referer, workspace_id, proxy=None, timeout=3
         _oai_headers(
             did, {"Referer": referer or endpoints.AUTH_BASE + "/workspace", "content-type": "application/json"}
         ),
-        load_cached_sentinel(),
+        _codex_sentinel(session, did, flow="authorize_continue", proxy=proxy),
     )
     if isinstance(extra_headers, dict):
         headers.update(extra_headers)
@@ -1166,20 +1242,23 @@ def select_workspace_by_cookie(
     cookie_header = str(cookie_header or "").strip()
     if not cookie_header:
         return {"ok": False, "workspace_id": str(workspace_id or "").strip(), "error": "missing_cookie_header"}
-    session = curl_requests.Session()
-    if proxy:
-        session.proxies = {"http": proxy, "https": proxy}
-    # curl_cffi accepts explicit Cookie headers more reliably than importing a
-    # mixed-domain cookie jar from a serialized browser cookie string.
-    return _select_workspace(
-        session,
-        device_id or "scan",
-        referer,
-        workspace_id,
-        proxy=proxy,
-        timeout=timeout,
-        extra_headers={"cookie": cookie_header},
-    )
+    session = _new_codex_session(proxy=proxy, device_id=device_id or "scan")
+    try:
+        # curl_cffi / wreq accept explicit Cookie headers more reliably than
+        # importing a mixed-domain cookie jar from a serialized cookie string.
+        return _select_workspace(
+            session,
+            device_id or "scan",
+            referer,
+            workspace_id,
+            proxy=proxy,
+            timeout=timeout,
+            extra_headers={"cookie": cookie_header},
+        )
+    finally:
+        close_fn = getattr(session, "close", None)
+        if callable(close_fn):
+            close_fn()
 
 
 def _new_oauth_request():
@@ -1214,24 +1293,29 @@ def _exchange_callback(callback_url, oauth, proxy=None):
         raise RuntimeError("oauth_callback_missing_code")
     if state != oauth["state"]:
         raise RuntimeError("oauth_state_mismatch")
-    response = request_with_retry(
-        curl_requests,
-        "post",
-        TOKEN_URL,
-        label="OAuth token exchange",
-        attempts=5,
-        retry_delay=5,
-        data={
-            "grant_type": "authorization_code",
-            "client_id": CLIENT_ID,
-            "code": code,
-            "redirect_uri": oauth["redirect_uri"],
-            "code_verifier": oauth["code_verifier"],
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
-        proxies={"http": proxy, "https": proxy} if proxy else None,
-        impersonate=auth_impersonate(),
-    )
+    session = _new_codex_session(proxy=proxy)
+    try:
+        response = request_with_retry(
+            session,
+            "post",
+            TOKEN_URL,
+            label="OAuth token exchange",
+            attempts=5,
+            retry_delay=5,
+            data={
+                "grant_type": "authorization_code",
+                "client_id": CLIENT_ID,
+                "code": code,
+                "redirect_uri": oauth["redirect_uri"],
+                "code_verifier": oauth["code_verifier"],
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            impersonate=auth_impersonate(),
+        )
+    finally:
+        close_fn = getattr(session, "close", None)
+        if callable(close_fn):
+            close_fn()
     if response.status_code != 200:
         raise RuntimeError(f"oauth_token_exchange_failed:{response.status_code}:{response.text[:300]}")
     body = response.json()

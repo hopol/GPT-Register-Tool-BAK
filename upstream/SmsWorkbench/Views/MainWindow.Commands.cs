@@ -1,8 +1,4 @@
-// Opted into nullable reference checking file-by-file - see the note in
-// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
-#nullable enable
-
-namespace SmsWorkbench
+namespace SmsWorkbench.Views
 {
     public partial class MainWindow
     {
@@ -33,6 +29,9 @@ namespace SmsWorkbench
 
         private RelayCommand? ctxCheckAccountAliveCommand;
         public RelayCommand CtxCheckAccountAliveCommand => ctxCheckAccountAliveCommand ??= new RelayCommand(CtxCheckAccountAlive);
+
+        private RelayCommand? ctxInspectAccountCommand;
+        public RelayCommand CtxInspectAccountCommand => ctxInspectAccountCommand ??= new RelayCommand(CtxInspectAccount);
 
         private RelayCommand? ctxBatchProtocolPaymentCommand;
         public RelayCommand CtxBatchProtocolPaymentCommand => ctxBatchProtocolPaymentCommand ??= new RelayCommand(BatchProtocolPayment);

@@ -47,7 +47,7 @@ ALIAS_TO_RUNG = {
     "PanelBg": "Surface.Card",
     "PanelBg2": "Surface.Block",
     "SidebarBg": "Surface.Chrome",
-    "LogBg": "Surface.Inset",
+    "LogBg": "Surface.Terminal",
 }
 
 #: The ladder, outermost first. Light alternates and dark climbs, so only the
@@ -57,6 +57,7 @@ LADDER = ("Surface.Page", "Surface.Card", "Surface.Block", "Surface.Inset")
 XAML_BRUSH = re.compile(r'<SolidColorBrush\s+x:Key="(?P<key>[^"]+)"\s+Color="(?P<color>#[0-9A-Fa-f]{6,8})"')
 XAML_KEY = re.compile(r'x:Key="([^"]+)"')
 DYNAMIC_RESOURCE = re.compile(r"\{DynamicResource\s+([A-Za-z0-9_.]+)\}")
+STATIC_RESOURCE = re.compile(r"\{StaticResource\s+([A-Za-z0-9_.]+)\}")
 
 
 def _normalise(value):
@@ -178,6 +179,21 @@ class SurfaceLadderTests(unittest.TestCase):
             else:
                 self.assertGreater(chrome, page, "dark: chrome sits above the page")
 
+    def test_terminal_surface_is_recessed_in_dark_and_crisp_in_light(self):
+        """Log terminal well stays deep obsidian in dark mode rather than washed-out Surface.Inset."""
+        light = _brushes(LIGHT_XAML)
+        dark = _brushes(DARK_XAML)
+        self.assertGreater(
+            _luminance(light["Surface.Terminal"]),
+            _luminance(light["Surface.Block"]),
+            "light: terminal well should stay brighter than muted blocks",
+        )
+        self.assertLess(
+            _luminance(dark["Surface.Terminal"]),
+            _luminance(dark["Surface.Card"]),
+            "dark: terminal well should stay darker than cards (deep obsidian)",
+        )
+
     def test_legacy_aliases_still_resolve_to_their_rung(self):
         """Phase 0 folded the old semantic names onto the ladder, by name.
 
@@ -209,6 +225,20 @@ class SurfaceLadderTests(unittest.TestCase):
             values = [brushes["TextMain"], brushes["TextSub"], brushes["TextMuted"]]
             self.assertEqual(len(set(values)), 3, "%s collapsed a text level" % _relative(path))
 
+    def test_sidebar_hover_is_distinct_from_chrome_and_page(self):
+        """Light sidebar rows used to paint Surface.Block (#F3F3F3) onto AppBg (#F3F3F3)."""
+        for path in (LIGHT_XAML, DARK_XAML):
+            brushes = _brushes(path)
+            hover = brushes["SidebarHover"]
+            self.assertNotEqual(hover, brushes["Surface.Chrome"], "%s: SidebarHover equals chrome" % _relative(path))
+            self.assertNotEqual(hover, brushes["Surface.Page"], "%s: SidebarHover equals page" % _relative(path))
+            self.assertNotEqual(
+                brushes["Primary"], brushes["OnPrimary"], "%s: Primary equals OnPrimary" % _relative(path)
+            )
+            self.assertNotEqual(
+                brushes["PrimaryHover"], brushes["OnPrimary"], "%s: PrimaryHover equals OnPrimary" % _relative(path)
+            )
+
 
 class DynamicResourceResolutionTests(unittest.TestCase):
     """Every ``{DynamicResource X}`` a view asks for must be declared somewhere."""
@@ -226,6 +256,30 @@ class DynamicResourceResolutionTests(unittest.TestCase):
             missing,
             {},
             "DynamicResource targets that no dictionary declares (renders with a WPF default brush, silently)",
+        )
+
+
+class StaticResourceResolutionTests(unittest.TestCase):
+    """Every ``{StaticResource X}`` must resolve to a declared key.
+
+    A missing StaticResource is worse than a missing DynamicResource: WPF throws
+    ``XamlParseException`` at runtime when the template instantiates (e.g.
+    ``FocusRingStyle`` referencing ``Radius.Sm`` crashed SettingsWindow on ESC).
+    """
+
+    def test_every_static_resource_target_is_declared(self):
+        declared = set()
+        for path in _xaml_files():
+            declared.update(_declared_keys(path))
+        missing = {}
+        for path in _xaml_files():
+            for key in STATIC_RESOURCE.findall(path.read_text(encoding="utf-8-sig")):
+                if key not in declared:
+                    missing.setdefault(key, set()).add(_relative(path))
+        self.assertEqual(
+            missing,
+            {},
+            "StaticResource targets that no dictionary declares (throws XamlParseException at runtime)",
         )
 
 

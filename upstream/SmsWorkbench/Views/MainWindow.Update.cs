@@ -1,10 +1,6 @@
-// Opted into nullable reference checking file-by-file - see the note in
-// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
-#nullable enable
-
 using SmsWorkbench.Localization;
 
-namespace SmsWorkbench
+namespace SmsWorkbench.Views
 {
     /// <summary>
     /// Version label in the title bar plus the one automatic update check.
@@ -210,7 +206,7 @@ namespace SmsWorkbench
 
             if (relation > 0)
             {
-                NotifyInfo(Loc.F("发现新版本 {0}，点击顶部版本号旁的提示打开下载页", latestTag));
+                NotifyInfo(Loc.F("发现新版本 {0}，点击左上角 Logo 处的新版本提示打开下载页", latestTag));
             }
             else if (relation == 0)
             {

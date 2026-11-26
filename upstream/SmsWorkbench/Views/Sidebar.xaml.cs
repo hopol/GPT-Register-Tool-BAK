@@ -1,8 +1,4 @@
-// Opted into nullable reference checking file-by-file - see the note in
-// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
-#nullable enable
-
-namespace SmsWorkbench
+namespace SmsWorkbench.Views
 {
     /// <summary>
     /// Sidebar visuals (brand, navigation, collapse button).
@@ -64,5 +60,10 @@ namespace SmsWorkbench
 
         private void Toggle_Click(object sender, RoutedEventArgs e)
             => RaiseEvent(new RoutedEventArgs(ToggleRequestedEvent, this));
+
+        private void BrandLogoButton_Click(object sender, RoutedEventArgs e)
+        {
+            VersionPopup.IsOpen = true;
+        }
     }
 }

@@ -1,4 +1,4 @@
-"""Pin the protocol transport seam (``sms_tool.http_backend``).
+"""Pin the protocol transport seam (``sms_tool.transport.http_backend``).
 
 Three promises are worth a gate here, and each of them has already been a bug
 shape elsewhere in this repository:
@@ -24,7 +24,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from sms_tool import http_backend
+from sms_tool.transport import http_backend
 
 
 class _FakeTimeout(Exception):
@@ -209,9 +209,12 @@ def test_wreq_rejects_a_profile_it_cannot_run(monkeypatch) -> None:
 
 
 def test_safari_tokens_expand_to_wreq_spellings() -> None:
-    assert http_backend._safari_candidates("18_0") == ("safari18",)
-    assert http_backend._safari_candidates("184") == ("safari18_4", "safari18")
-    assert http_backend._safari_candidates("260") == ("safari26",)
+    assert http_backend._safari_candidates("17_0") == ("safari17_0", "safari17")
+    assert http_backend._safari_candidates("17_2_ios") == ("safariios17_2",)
+    assert http_backend._safari_candidates("18_0") == ("safari18_0", "safari18")
+    assert http_backend._safari_candidates("18_0_ios") == ("safariios18_0", "safariios18")
+    assert http_backend._safari_candidates("184") == ("safari18_4",)
+    assert http_backend._safari_candidates("260") == ("safari26_0", "safari26")
 
 
 def test_chrome_tokens_are_exact_only() -> None:
@@ -255,6 +258,32 @@ def test_an_unsupported_kwarg_raises_instead_of_being_dropped(monkeypatch) -> No
     session, _module = _session(monkeypatch)
     with pytest.raises(TypeError, match="verify"):
         session.get("https://auth.openai.com/", verify=False)
+
+
+def test_matching_impersonate_kwarg_is_accepted_and_none_headers_dropped(monkeypatch) -> None:
+    session, _module = _session(monkeypatch, impersonate="chrome152")
+    session.post(
+        "https://auth.openai.com/api/accounts/passwordless/send-otp",
+        headers={"Accept": "*/*", "Content-Type": None},
+        impersonate="chrome152",
+    )
+    _method, _url, options = session._client.calls[-1]
+    assert options["headers"] == {"Accept": "*/*"}
+    with pytest.raises(http_backend.ProtocolBackendError, match="impersonate_mismatch"):
+        session.get("https://auth.openai.com/", impersonate="firefox144")
+
+
+def test_real_wreq_safari_does_not_alias_ios_or_minor_versions(monkeypatch) -> None:
+    pytest.importorskip("wreq")
+    assert http_backend.wreq_profile("safari17_0") is not None
+    assert http_backend.wreq_profile("safari17_2_ios") is not None
+    assert http_backend.wreq_profile("safari18_0_ios") is None
+    assert http_backend.wreq_profile("safari184") is None
+    monkeypatch.setenv(http_backend.BACKEND_ENV, "wreq")
+    from sms_tool.transport.fingerprint_pool import FingerprintPool
+
+    pool = FingerprintPool()
+    assert all(http_backend.wreq_profile(p.impersonate) is not None for p in pool._profiles)
 
 
 def test_response_maps_onto_the_requests_shape(monkeypatch) -> None:
@@ -331,13 +360,13 @@ def test_the_registration_factory_uses_the_seam() -> None:
 
     sentinel = Mock(name="session")  # a real object: the factory still installs TLS options
     factory = Mock(return_value=sentinel)
-    with patch("sms_tool.http_backend.new_session", factory):
+    with patch("sms_tool.transport.http_backend.new_session", factory):
         assert protocol_helpers._new_registration_session(proxy="http://p:1") is sentinel
     assert factory.call_args.kwargs == {"proxy": "http://p:1"}
 
 
 def test_tls_permutation_reports_that_it_cannot_apply_to_wreq() -> None:
-    from sms_tool import tls_fingerprint
+    from sms_tool.transport import tls_fingerprint
 
     class _WreqLike:
         _sms_http_backend = "wreq"
@@ -358,7 +387,7 @@ def test_curl_backend_lists_only_installed_profiles(monkeypatch) -> None:
     monkeypatch.delenv(http_backend.BACKEND_ENV, raising=False)
     with patch.object(http_backend, "_section", lambda: {}):
         supported = http_backend.supported_impersonations()
-    from sms_tool.auth_headers import AUTH_FINGERPRINT_PROFILES
+    from sms_tool.transport.auth_headers import AUTH_FINGERPRINT_PROFILES
 
     assert supported <= set(AUTH_FINGERPRINT_PROFILES)
     assert "firefox144" in supported, "the default profile must always be usable"

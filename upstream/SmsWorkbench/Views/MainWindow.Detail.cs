@@ -1,10 +1,6 @@
-// Opted into nullable reference checking file-by-file - see the note in
-// PaymentBatchService.cs for why the project-wide switch stays `annotations`.
-#nullable enable
-
 using SmsWorkbench.Localization;
 
-namespace SmsWorkbench
+namespace SmsWorkbench.Views
 {
     public partial class MainWindow
     {
@@ -37,28 +33,16 @@ namespace SmsWorkbench
         /// </remarks>
         private async Task<AccountDetailView> BuildDetailViewAsync(PoolRow row, CancellationToken ct)
         {
-            string detail = await accountDetail.BuildDetailAsync(row, ct);
             string accessToken = await accountDetail.ResolveAccessTokenAsync(row, ct);
             var items = new List<AccountDetailSummaryItem>
             {
                 new(Loc.T("邮箱"), row.Identifier),
                 new(Loc.T("类型"), row.AccountType ?? ""),
                 new(Loc.T("状态"), row.Status ?? ""),
-                new(Loc.T("支付状态"), row.PayPalStatus ?? ""),
-                new(Loc.T("支付金额"), row.PayPalAmount ?? ""),
                 new("Refresh Token", row.RefreshTokenStatus ?? ""),
                 new(Loc.T("创建时间"), row.CreatedAt ?? ""),
                 new(Loc.T("更新时间"), row.CompletedAt ?? ""),
             };
-            if (row.IdentityBound)
-            {
-                if (!string.IsNullOrWhiteSpace(row.EgressEndpoint))
-                    items.Add(new(Loc.T("出口"), row.EgressEndpoint));
-                if (!string.IsNullOrWhiteSpace(row.EgressCountry))
-                    items.Add(new(Loc.T("出口国家"), row.EgressCountry));
-            }
-            if (!string.IsNullOrWhiteSpace(row.FingerprintProfile))
-                items.Add(new(Loc.T("指纹"), row.FingerprintProfile));
 
             return new AccountDetailView
             {
@@ -69,8 +53,10 @@ namespace SmsWorkbench
                         item.Label,
                         string.IsNullOrWhiteSpace(item.Value) ? "—" : item.Value))
                     .ToArray(),
+                EgressEndpoint = row.IdentityBound ? (row.EgressEndpoint ?? "").Trim() : "",
+                EgressCountry = row.IdentityBound ? (row.EgressCountry ?? "").Trim() : "",
+                FingerprintProfile = (row.FingerprintProfile ?? "").Trim(),
                 PayPalUrl = row.PayPalUrl ?? "",
-                DetailText = detail,
                 AccessToken = accessToken,
             };
         }
@@ -103,7 +89,7 @@ namespace SmsWorkbench
             string path = await accountDetail.ResolveJsonPathAsync(row, ct);
             if (string.IsNullOrWhiteSpace(path))
             {
-                MessageBox.Show(Loc.T("未找到该账号对应的 JSON 文件。"), Loc.T("打开源文件"), MessageBoxButton.OK, MessageBoxImage.Information);
+                ShowThemedInfoDialog(Loc.T("打开源文件"), Loc.T("未找到该账号对应的 JSON 文件。"));
                 return;
             }
             OpenPath(path);

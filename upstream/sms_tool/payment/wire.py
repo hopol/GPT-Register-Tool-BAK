@@ -26,16 +26,20 @@ r"""中性支付内核 —— Checkout 原语、会话工厂与共享失败词�
 """
 
 from __future__ import annotations
-from .. import endpoints
+from ..transport import endpoints
 
+import importlib
 import json
+import os
 import re
+import sys
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 import requests
 
-from ..auth_headers import AUTH_FINGERPRINT_PROFILES
+from ..transport.auth_headers import AUTH_FINGERPRINT_PROFILES
 
 from ..kernel.timeouts import CHATGPT_TIMEOUT
 
@@ -44,6 +48,30 @@ try:
     from curl_cffi import requests as curl_requests
 except ImportError:
     curl_requests = None
+
+
+def _load_native_payment_wire() -> Any | None:
+    mode = str(os.environ.get("RUST_ANYTHING_MODE") or "").strip().lower()
+    unit_mode = str(os.environ.get("RUST_ANYTHING_UNIT_PAYMENT_WIRE") or "").strip().lower()
+    if mode in {"old", "original"} or unit_mode in {"old", "original"}:
+        return None
+    pkg_dir = Path(__file__).resolve().parents[2] / "rust" / "payment-wire-rs" / "python"
+    if pkg_dir.is_dir():
+        pkg_str = str(pkg_dir)
+        if pkg_str not in sys.path:
+            sys.path.insert(0, pkg_str)
+    try:
+        return importlib.import_module("payment_wire_rs")
+    except (ImportError, OSError):
+        if mode in {"new", "rust"} or unit_mode in {"new", "rust"}:
+            raise
+        return None
+
+
+_NATIVE_PAYMENT_WIRE = _load_native_payment_wire()
+_NATIVE_EXTRACT_WEB_DEPLOYMENT_ATTESTATION = getattr(_NATIVE_PAYMENT_WIRE, "extract_web_deployment_attestation", None)
+_NATIVE_COMPACT_DIAGNOSTIC = getattr(_NATIVE_PAYMENT_WIRE, "_compact_diagnostic", None)
+_NATIVE_SCALAR_TYPES = (str, type(None), bool, int, float)
 
 
 # The cross-lane kernel's surface, and it is exactly the ownership list
@@ -69,6 +97,7 @@ __all__ = [
     "PayPalHttpError",
     "PaymentOutcomeUnknownError",
     "_PROVIDER_STAGES",
+    "_checkout_attestation_headers",
     "_checkout_device_id",
     "_checkout_get",
     "_checkout_headers",
@@ -77,6 +106,9 @@ __all__ = [
     "_compact_diagnostic",
     "_is_checkout_create_url",
     "_new_session",
+    "env_web_deployment_attestation",
+    "extract_web_deployment_attestation",
+    "fetch_web_deployment_attestation",
 ]
 
 
@@ -313,6 +345,105 @@ def _checkout_sentinel_headers(cookie_header, extra_headers, proxy):
         return {}
 
 
+_ATTESTATION_ENV_KEYS = (
+    "OAI_WEB_DEPLOYMENT_ATTESTATION",
+    "MIN_OAICS_ATTESTATION",
+    "MIN_GCASH_ATTESTATION",
+)
+_ATTESTATION_FETCH_ENV_KEYS = ("GPT_ATTESTATION_FETCH", "TURB_ATTESTATION_FETCH")
+_ATTESTATION_JSON_RE = re.compile(r'\\?"webDeploymentAttestation\\?"\s*:\s*\\?"([^"\\]+)\\?"')
+_ATTESTATION_ALT_RE = re.compile(r"[^A-Za-z0-9]webDeploymentAttestation[=:]\s*[\"']?([A-Za-z0-9._-]+)")
+
+
+def env_web_deployment_attestation() -> str:
+    """Return an explicitly injected ``oai-web-deployment-attestation`` (~1h TTL)."""
+    for key in _ATTESTATION_ENV_KEYS:
+        value = str(os.environ.get(key) or "").strip()
+        if value and "." in value:
+            return value
+    return ""
+
+
+def extract_web_deployment_attestation(html: str) -> str:
+    """Extract ``webDeploymentAttestation`` from a ChatGPT HTML/RSC page body."""
+    if _NATIVE_EXTRACT_WEB_DEPLOYMENT_ATTESTATION is not None and isinstance(html, _NATIVE_SCALAR_TYPES):
+        return str(_NATIVE_EXTRACT_WEB_DEPLOYMENT_ATTESTATION(html))
+    text = str(html or "")
+    for pattern in (_ATTESTATION_JSON_RE, _ATTESTATION_ALT_RE):
+        match = pattern.search(text)
+        if match:
+            value = match.group(1).strip()
+            if value and "." in value:
+                return value
+    return ""
+
+
+def _html_attestation_fetch_enabled(allow_html_fetch: bool | None) -> bool:
+    if allow_html_fetch is not None:
+        return bool(allow_html_fetch)
+    for key in _ATTESTATION_FETCH_ENV_KEYS:
+        token = str(os.environ.get(key) or "").strip().lower()
+        if token in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
+def fetch_web_deployment_attestation(
+    proxy: str = "",
+    cookie_header: str = "",
+    *,
+    allow_html_fetch: bool | None = None,
+    timeout: int = CHATGPT_TIMEOUT,
+) -> str:
+    """Resolve ``oai-web-deployment-attestation`` (env override first, opt-in HTML fetch)."""
+    direct = env_web_deployment_attestation()
+    if direct:
+        return direct
+    if not _html_attestation_fetch_enabled(allow_html_fetch):
+        return ""
+    if curl_requests is None:
+        return ""
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": _CHECKOUT_FINGERPRINT["user_agent"],
+    }
+    if cookie_header:
+        headers["Cookie"] = str(cookie_header)
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        response = curl_requests.get(
+            endpoints.CHATGPT_ORIGIN,
+            headers=headers,
+            proxies=proxies,  # pyright: ignore[reportArgumentType]
+            timeout=timeout,
+            impersonate=_CHECKOUT_FINGERPRINT["impersonate"],
+        )
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    if int(getattr(response, "status_code", 0) or 0) != 200:
+        return ""
+    return extract_web_deployment_attestation(str(getattr(response, "text", "") or ""))
+
+
+def _checkout_attestation_headers(
+    cookie_header: str = "",
+    extra_headers: dict[str, Any] | None = None,
+    proxy: str = "",
+    *,
+    allow_html_fetch: bool | None = None,
+) -> dict[str, str]:
+    """Advisory ``oai-web-deployment-attestation`` header for OAICS checkout calls."""
+    for key, value in (extra_headers or {}).items():
+        if str(key).strip().lower() == "oai-web-deployment-attestation" and str(value or "").strip():
+            return {}
+    token = fetch_web_deployment_attestation(
+        proxy=proxy or "",
+        cookie_header=str(cookie_header or ""),
+        allow_html_fetch=allow_html_fetch,
+    )
+    return {"oai-web-deployment-attestation": token} if token else {}
+
+
 def _checkout_post(url, json_body, access_token, cookie_header="", proxy="", timeout=30, extra_headers=None):
     """Execute a ChatGPT checkout POST using the functional curl_cffi API.
 
@@ -327,6 +458,9 @@ def _checkout_post(url, json_body, access_token, cookie_header="", proxy="", tim
     headers = _checkout_headers(access_token, cookie_header, extra_headers)
     if _is_checkout_create_url(url):
         for name, value in _checkout_sentinel_headers(cookie_header, extra_headers, proxy).items():
+            headers.setdefault(name, value)
+    if _CHECKOUT_CREATE_PATH in str(url or ""):
+        for name, value in _checkout_attestation_headers(cookie_header, extra_headers, proxy).items():
             headers.setdefault(name, value)
     headers["Content-Type"] = "application/json"
     proxies = {"http": proxy, "https": proxy} if proxy else None
@@ -364,5 +498,11 @@ def _checkout_get(url, access_token, cookie_header="", proxy="", timeout=30, ext
 
 
 def _compact_diagnostic(value: Any, limit: int = 180) -> str:
+    if (
+        _NATIVE_COMPACT_DIAGNOSTIC is not None
+        and isinstance(value, _NATIVE_SCALAR_TYPES)
+        and isinstance(limit, (int, float))
+    ):
+        return str(_NATIVE_COMPACT_DIAGNOSTIC(value, limit))
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     return text if len(text) <= limit else text[: limit - 3] + "..."

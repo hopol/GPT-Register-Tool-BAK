@@ -1,10 +1,6 @@
-// Opted into nullable reference checking file-by-file - see the note in
-// PaymentBatchService.cs for why the project-wide switch stays `annotations`.
-#nullable enable
-
 using SmsWorkbench.Localization;
 
-namespace SmsWorkbench
+namespace SmsWorkbench.Dialogs
 {
     /// <summary>
     /// Account detail panel. XAML since 2026-11-20: the window partial used to
@@ -30,6 +26,7 @@ namespace SmsWorkbench
             this.actions = actions;
 
             InitializeComponent();
+            WindowThemeService.Attach(this);
             Owner = owner;
             DataContext = view;
             Title = Loc.F("账号详情 - {0}", view.Identifier);
@@ -51,7 +48,9 @@ namespace SmsWorkbench
 
         private void Close_Click(object sender, RoutedEventArgs e) => Close();
 
-        private async void CopyAccessToken_Click(object sender, RoutedEventArgs e)
+        private void CopyAccessToken_Click(object sender, RoutedEventArgs e) => _ = CopyAccessTokenAsync();
+
+        private async Task CopyAccessTokenAsync()
         {
             if (!view.HasAccessToken) return;
             try

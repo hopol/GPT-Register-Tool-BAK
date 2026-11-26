@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .helpers import unique_emails
-from ..batch_runner import ensure_batch_sentinel_readiness, filter_registered_mailboxes
+from ..registration.batch_runner import ensure_batch_sentinel_readiness, filter_registered_mailboxes
 from ..config import validate_registration_driver_config
 from ..operation_journal import PaymentOperationConflict, PaymentOperationStore
 from ..proxy.entry import parse_proxy
@@ -29,7 +29,7 @@ from ..registration.preflight import CLOUDFLARE_CHALLENGE_MARKER
 from ..registration.protocol_helpers import _safe_float, _safe_int
 from ..registration.funnel import combine_registration_funnels, summarize_registration_funnel
 from ..kernel.sanitizer import mask_account, sanitize_log_text
-from ..diagnostics import safe_print
+from ..observability.diagnostics import safe_print
 
 logger = logging.getLogger(__name__)
 
@@ -293,7 +293,15 @@ def check_registered_promotions(emails, workers=4, proxy=None, timeout=20, proxy
 
     targets = unique_emails(emails)
     if not targets:
-        report = {"ok": True, "total": 0, "success": 0, "failed": 0, "trial_eligible": 0, "results": []}
+        report = {
+            "ok": True,
+            "total": 0,
+            "success": 0,
+            "failed": 0,
+            "trial_eligible": 0,
+            "team_trial_eligible": 0,
+            "results": [],
+        }
         safe_print("[*] Promotion check: no saved successful account to probe.")
         logger.info("promotion check: no saved successful account to probe")
         return report
@@ -315,6 +323,7 @@ def check_registered_promotions(emails, workers=4, proxy=None, timeout=20, proxy
             "success": 0,
             "failed": len(targets),
             "trial_eligible": 0,
+            "team_trial_eligible": 0,
             "results": [],
             "error": str(sanitize(exc)),
         }
@@ -324,24 +333,21 @@ def check_registered_promotions(emails, workers=4, proxy=None, timeout=20, proxy
 
     _raw_results: object = report.get("results")
     results: list = _raw_results if isinstance(_raw_results, list) else []
-    # refresh_promotion_statuses owns this count now. It used to be recounted
-    # here, which left the other CLI entry point with no such key at all.
-    # Report values come from a promotion batch that may be partially failed and
-    # from journal records replayed across processes, so they are not trusted to be
-    # numeric. ``protocol_helpers._safe_int`` is the canonical tolerant cast (the
-    # same one the registration stages use) instead of a bare ``int()`` here.
     trial_eligible = _safe_int(report.get("trial_eligible"), 0)
+    team_trial_eligible = _safe_int(report.get("team_trial_eligible"), 0)
     report["trial_eligible"] = trial_eligible
+    report["team_trial_eligible"] = team_trial_eligible
     safe_print(
         "[*] Promotion check: "
         f"success={_safe_int(report.get('success'), 0)}/{_safe_int(report.get('total'), 0)} "
-        f"trial_eligible={trial_eligible}"
+        f"trial_eligible={trial_eligible} team_trial_eligible={team_trial_eligible}"
     )
     logger.info(
-        "promotion check finished: success=%s/%s trial_eligible=%s",
+        "promotion check finished: success=%s/%s trial_eligible=%s team_trial_eligible=%s",
         _safe_int(report.get("success"), 0),
         _safe_int(report.get("total"), 0),
         trial_eligible,
+        team_trial_eligible,
     )
     for item in results:
         if not isinstance(item, dict):
@@ -360,6 +366,7 @@ _PROMOTION_SUM_KEYS = (
     "transport_failed",
     "persist_failed",
     "trial_eligible",
+    "team_trial_eligible",
 )
 
 
@@ -737,6 +744,7 @@ def build_registration_batch_summary(
     promotion_report: Mapping[str, Any] | None,
     health_job_ids: Iterable[str],
     results: Iterable[Mapping[str, Any] | None],
+    target_success: int = 0,
 ) -> dict[str, Any]:
     """Assemble the batch summary that both the CLI and the desktop host read.
 
@@ -755,12 +763,14 @@ def build_registration_batch_summary(
     key set stable -- additive changes only; ``test_registration_batch_summary_contract.py``
     pins it.
     """
+    target = max(0, _safe_int(target_success, 0))
+    total = _safe_int(effective_count, 0)
     return {
-        "ok": success_count == effective_count,
+        "ok": (success_count >= target) if target > 0 else (success_count == effective_count),
         "batch_id": batch_id,
-        "total": _safe_int(effective_count, 0),
+        "total": total,
         "success": success_count,
-        "failed": max(0, _safe_int(effective_count, 0) - success_count),
+        "failed": max(0, total - success_count),
         "session_saved": saved_count,
         "db_saved": db_saved_count,
         "quality": quality,
@@ -861,8 +871,10 @@ def save_registration_results(
 
     if getattr(args, "import_cpa", False):
         ctx.import_registered_accounts(args, import_emails)
+    target_success = max(0, _safe_int(getattr(args, "target_success", 0) or 0, 0))
+    reported_total = len([r for r in results if r]) if target_success > 0 else effective_count
     return build_registration_batch_summary(
-        effective_count=effective_count,
+        effective_count=reported_total,
         success_count=success_count,
         batch_id=batch_id,
         saved_count=saved_count,
@@ -871,6 +883,7 @@ def save_registration_results(
         promotion_report=promotion_report,
         health_job_ids=health_job_ids,
         results=results,
+        target_success=target_success,
     )
 
 

@@ -52,25 +52,9 @@
 
 ## 命令行用法
 
-单次模式（`sms_tool/gen_pp_link.py`）：
+> **架构更新**：旧版内置源提链模块已退役，所有支付链接提取均通过主 CLI（`sms_tool/cli.py`）路由至 `sms_tool/pay_link/extract_server.py` 对接外部提链服务器。
 
-```bash
-python -m sms_tool.gen_pp_link <ACCESS_TOKEN> \
-  --checkout-proxy "<US 代理>" --provider-proxy "<US 代理>" --approve-proxy "<US 代理>" \
-  --promotion-proxy "<JP/TH/VN 代理>" \
-  --target US --checkout-country US --json
-```
-
-促销矩阵搜索（`PayPal 区 × promotion 区`，对齐参考实现的 zero-amount matrix，成功即停）：
-
-```bash
-python -m sms_tool.gen_pp_link <ACCESS_TOKEN> \
-  --proxy-template "user-region-XX-sid-XXXX-t-5:pass@gate:443" \
-  --target-countries US,DE,GB,AU,CA \
-  --promotion-countries JP,TH,VN --json
-```
-
-主 CLI（`sms_tool/cli.py`）生成 BA 链：
+主 CLI（`sms_tool/cli.py`）生成 PayPal BA 链：
 
 ```bash
 python -m sms_tool --generate-ba-link --at <ACCESS_TOKEN> \
@@ -78,9 +62,15 @@ python -m sms_tool --generate-ba-link --at <ACCESS_TOKEN> \
   --promotion-proxy <JP/TH/VN> --require-ba-token
 ```
 
+通用支付链接提取（支持全部 15 种目录方式）：
+
+```bash
+python -m sms_tool --generate-payment-link --payment-method paypal --at <ACCESS_TOKEN>
+```
+
 ## 返回结果
 
-`generate_pp_link` / `PPLinkExtractor.extract` 结果新增 `promotion_proxy` 字段；矩阵模式返回附带 `matrix`（每个 `paypal_region × promotion_region` 组合的 `amount`/`link_type`/`status`）。
+`PPLinkExtractor.extract` 结果新增 `promotion_proxy` 字段；矩阵模式返回附带 `matrix`（每个 `paypal_region × promotion_region` 组合的 `amount`/`link_type`/`status`）。
 
 ## 注意事项
 

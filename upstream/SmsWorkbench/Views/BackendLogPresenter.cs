@@ -1,8 +1,4 @@
-// Opted into nullable reference checking file-by-file - see the note in
-// PaymentBatchService.cs for why the project-wide switch used to stay `annotations`.
-#nullable enable
-
-namespace SmsWorkbench
+namespace SmsWorkbench.Views
 {
     /// <summary>
     /// Turns raw backend stdout into the operator-facing log panel story.
@@ -420,6 +416,11 @@ namespace SmsWorkbench
                     && trial.TryGetInt32(out int trialCount)
                     && trialCount > 0)
                     summary.Append(CultureInfo.InvariantCulture, $" · 可试优惠 {trialCount}");
+                if (root.TryGetProperty("team_trial_eligible", out JsonElement teamTrial)
+                    && teamTrial.ValueKind == JsonValueKind.Number
+                    && teamTrial.TryGetInt32(out int teamTrialCount)
+                    && teamTrialCount > 0)
+                    summary.Append(CultureInfo.InvariantCulture, $" · Team 5席试用 {teamTrialCount}");
                 summary.Append(CultureInfo.InvariantCulture, $"（{failures.Count} 项失败明细已折叠）");
                 return summary.ToString();
             }

@@ -146,10 +146,10 @@ def configured_qualification_country(config: Any = None) -> str:
 def configured_qualification_proxy_pool(config: Any = None) -> list[str]:
     """Dedicated egress for the qualification probe (empty = promotion fallback).
 
-    Accepted keys, in order:
+    Accepted keys, in order (matching ``SettingsService.cs`` and ``proxy.registry``):
 
-    * ``payment_qualification.proxy_pool``
     * ``proxy.lanes.payment_qualification``
+    * ``payment_qualification.proxy_pool``
 
     An explicitly configured pool wins over the desktop's registration-pool
     argument because a ChatGPT-only exit can reach ``chatgpt.com`` but still
@@ -159,10 +159,10 @@ def configured_qualification_proxy_pool(config: Any = None) -> list[str]:
     from ..proxy.routing import canonical_lane_pool, parse_lane_proxy_pool
 
     source = config if isinstance(config, Mapping) else CFG
-    dedicated = parse_lane_proxy_pool(_config_section(source).get("proxy_pool"))
-    if dedicated:
-        return dedicated
-    return canonical_lane_pool(source, "payment_qualification") or []
+    canonical = canonical_lane_pool(source, "payment_qualification")
+    if canonical:
+        return canonical
+    return parse_lane_proxy_pool(_config_section(source).get("proxy_pool"))
 
 
 def configured_max_proxy_attempts(config: Any = None) -> int:
@@ -213,7 +213,12 @@ def methods_for_country(country: str) -> list[str]:
     target = str(country or "").strip().upper()
     if not target:
         return []
-    local = [key for key, spec in PAYMENT_METHODS.items() if str(getattr(spec, "country", "")).upper() == target]
+    local = [
+        key
+        for key, spec in PAYMENT_METHODS.items()
+        if str(getattr(spec, "country", "")).upper() == target
+        and str(getattr(spec, "adapter", "") or "") != "team_trial_direct"
+    ]
     for method in COUNTRY_AGNOSTIC_METHODS:
         if method in PAYMENT_METHODS and method not in local:
             local.append(method)
@@ -360,7 +365,7 @@ def _contract_key(method: str, country: str) -> tuple[str, str, str]:
 
 def _probe_kwargs(method: str, country: str) -> dict[str, Any]:
     """Contract fields for one method, sourced from the canonical catalogues."""
-    from ..checkout_contract import browser_profile_for_country, PAYMENT_METHOD_PROFILES
+    from .checkout_contract import browser_profile_for_country, PAYMENT_METHOD_PROFILES
 
     spec = PAYMENT_METHOD_PROFILES[method]
     browser = browser_profile_for_country(country)

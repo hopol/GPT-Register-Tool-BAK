@@ -33,9 +33,9 @@ import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-from .. import endpoints
-from ..auth_headers import auth_impersonate, chatgpt_headers, nextauth_headers
-from ..operator_output import emit as _emit
+from ..transport import endpoints
+from ..transport.auth_headers import auth_impersonate, chatgpt_headers, nextauth_headers
+from ..observability.operator_output import emit as _emit
 from . import sentinel_stages as _sentinel_stages
 from .flags import registration_flag
 from .warmup import tz_offset_minutes
@@ -49,11 +49,10 @@ _LOGGER = logging.getLogger(__name__)
 LANE_KEY = "reference_lane"
 
 #: ``registration.<key>`` toggles the lane forces on.
-#: Each one is documented where it is read (``auth_flow.steps`` and the
-#: ``registration_*_stages`` modules); together they are the reference's request shapes.
+#: Note: ``signin_screen_hint_login_or_signup`` and ``signin_prompt_login`` were
+#: rejected in the 2026-10-08 experiment ledger (HTTP 400 Invalid screen_hint)
+#: and are intentionally excluded from the preset.
 LANE_FLAGS = (
-    "signin_screen_hint_login_or_signup",
-    "signin_prompt_login",
     "turb_signin_authorize_context",
     "prime_create_account_password",
     "prime_navigation_headers",
